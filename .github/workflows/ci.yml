@@ -20,3 +20,29 @@ jobs:
         run: node --check server.mjs && node --check test.mjs
       - name: Run test suite
         run: node test.mjs
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan for secrets
+        run: |
+          set -e
+          # Fail if any secret-like pattern appears in tracked files.
+          # .env and logs are gitignored and never present in CI checkout.
+          if grep -rInE \
+            "sk-[a-zA-Z0-9]{16,}|user_[a-zA-Z0-9]{16,}|ghp_[a-zA-Z0-9]{20,}|gho_[a-zA-Z0-9]{20,}|AIza[a-zA-Z0-9_-]{20,}|xox[baprs]-[a-zA-Z0-9-]{10,}|BEGIN (RSA|OPENSSH|EC|DSA) PRIVATE|AKIA[0-9A-Z]{16}" \
+            --exclude-dir=.git --exclude-dir=node_modules --exclude=.env .; then
+            echo "::error::Secret-like pattern found in tracked files. Check the output above."
+            exit 1
+          fi
+          echo "No secret-like patterns found."
+      - name: Verify .env.example has no real values
+        run: |
+          set -e
+          # .env.example must only contain empty placeholders (KEY= or KEY= with no value).
+          if grep -E '^[A-Z_]+=.+' .env.example; then
+            echo "::error::.env.example contains a non-empty value. It must be placeholders only."
+            exit 1
+          fi
+          echo ".env.example placeholders are clean."
