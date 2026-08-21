@@ -176,6 +176,8 @@
   .msg .role { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); margin-bottom: 4px; font-weight: 600; }
   .msg.user .role { color: rgba(10,10,10,.55); }
   .msg.reasoning { align-self: flex-start; background: var(--panel); border: 1px dashed var(--border); color: var(--muted); font-size: 12px; font-family: var(--mono); }
+  .msg.reasoning-hidden { align-self: flex-start; background: transparent; border: 1px dashed var(--border); color: var(--muted); font-size: 12px; padding: 4px 10px; opacity: 0.7; }
+  .rTok { color: var(--accent); font-size: 11px; margin-left: 4px; }
   .chat-input-row { display: flex; gap: 10px; align-items: flex-end; }
   .chat-input-row textarea { flex: 1; min-height: 60px; max-height: 160px; }
   .chat-controls { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; color: var(--muted); font-size: 13px; }
@@ -945,7 +947,8 @@ function renderHistory() {
     '<td class="mono ' + (e.status >= 400 ? "status-err" : "status-ok") + '" data-label="Status">' + e.status + "</td>" +
     '<td class="mono" data-label="Latency">' + (e.latencyMs != null ? Math.round(e.latencyMs) + "ms" : "-") + "</td>" +
     '<td class="mono" data-label="TTFT">' + (e.ttftMs != null ? Math.round(e.ttftMs) + "ms" : "-") + "</td>" +
-    '<td class="mono" data-label="Tokens">' + (e.promptTokens != null ? e.promptTokens + "/" + (e.completionTokens != null ? e.completionTokens : "?") : "-") + "</td>" +
+    '<td class="mono" data-label="Tokens">' + (e.promptTokens != null ? e.promptTokens + "/" + (e.completionTokens != null ? e.completionTokens : "?") : "-") +
+      (e.reasoningTokens > 0 ? ' <span class="rTok" title="reasoning tokens">🧠' + e.reasoningTokens + "</span>" : "") + "</td>" +
     '<td class="mono ' + (e.cacheHit == null ? "" : e.cacheHit ? "status-hit" : "status-miss") + '" data-label="Cache">' + (e.cacheHit == null ? "-" : e.cacheHit ? "hit" : "miss") + "</td>" +
     '<td data-label="Session">' + esc(e.session) + "</td>" +
     "</tr>"
@@ -1331,7 +1334,9 @@ function renderThread() {
     }
     const reasoning = m.reasoning && $("pgShowReasoning").checked
       ? '<div class="msg reasoning"><span class="role">Reasoning</span>' + fmtInline(m.reasoning) + "</div>"
-      : "";
+      : (m.reasoning
+        ? '<div class="msg reasoning-hidden"><span class="role">Reasoning</span><span class="hint">hidden - check "show reasoning" to display</span></div>'
+        : "");
     return reasoning + '<div class="msg assistant"><span class="role">Assistant</span>' + esc(m.content) + "</div>";
   }).join("");
   host.scrollTop = host.scrollHeight;
