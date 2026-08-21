@@ -2,7 +2,7 @@
 rem Switchblade launcher. Run at Windows logon via a scheduled task.
 rem Uses the full node path (scheduled tasks do not inherit the user PATH).
 set NODE=C:\Program Files\nodejs\node.exe
-set LOG="C:\dev\local-model-router\router.log"
+set LOG="%~dp0router.log"
 if not exist "%NODE%" (
   echo node not found at %NODE% >> %LOG%
   exit /b 1
@@ -13,5 +13,5 @@ if not errorlevel 1 (
   echo [%date% %time%] already running on 8787, skipping start >> %LOG%
   exit /b 0
 )
-cd /d "C:\dev\local-model-router"
+cd /d "%~dp0"
 "%NODE%" server.mjs >> router.log 2>&1

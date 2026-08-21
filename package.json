@@ -9,6 +9,6 @@
     "test": "node test.mjs"
   },
   "engines": {
-    "node": ">=25"
+    "node": ">=22"
   }
 }

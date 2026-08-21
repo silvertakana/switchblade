@@ -683,7 +683,7 @@ backends capture payloads):
     provider; success does NOT clear the manual cool (/health manual still
     true); uncool restores. Complements u/w with the model layer in between.
 
-Expected total after phase 1: 63 + 15 = 78 passing asserts (63 legacy names,
+Expected total after phase 1: 63 + 15 = 80 passing asserts (63 legacy names,
 y-block rewritten in place, plus z1..z15).
 
 ---
@@ -692,8 +692,7 @@ y-block rewritten in place, plus z1..z15).
 
 Fresh-context verification, NO knowledge of implementation effort. Read this
 document first, then verify. Report PASS / FAIL / UNCLEAR per item with
-evidence; never guess PASS. Working dir: `C:\dev\local-model-router` (MSYS:
-/c/dev/local-model-router, MSYS_NO_PATHCONV=1). Never echo API key values;
+evidence; never guess PASS. Never echo API key values;
 apiKeyEnv names only.
 
 1. Static: `node --check server.mjs` clean; `package.json` dependency fields

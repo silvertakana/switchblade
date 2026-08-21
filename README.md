@@ -189,7 +189,7 @@ conversation.
 npm test   # node test.mjs
 ```
 
-The suite (78 assertions) spins up mock backends and router instances on temp
+The suite (80 assertions) spins up mock backends and router instances on temp
 configs — no keys, no network. It covers health, streaming, session affinity,
 failover, weighted selection, sticky/timed manual cools, fallback exclusion,
 dialect handling, synthesis from both legacy eras, and the layered-params merge

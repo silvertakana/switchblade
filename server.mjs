@@ -1092,8 +1092,9 @@ async function main() {
   });
 
   // Always listen on localhost (existing consumers: OpenCode, dsh, local UI).
-  // When cfg.host is set (e.g. the Tailscale IP for `vastus:8787`), listen on
-  // that address too. Two server instances share the same request handler.
+  // When cfg.host is set (e.g. a Tailscale IP to expose the router on the
+  // tailnet), listen on that address too. Two server instances share the same
+  // request handler.
   const hosts = new Set(["127.0.0.1"]);
   if (cfg.host) hosts.add(String(cfg.host));
   for (const bindHost of hosts) {

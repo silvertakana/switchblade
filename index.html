@@ -641,6 +641,31 @@ function chatUrl() {
   return p.replace(/\/$/, "") + "/chat/completions";
 }
 
+// Some upstreams (Poolside Laguna family via CommandCode) do not understand
+// OpenAI's reasoning_effort knob - they expose only a thinking {type} control
+// (off/disabled vs low/medium/high/max). Detect the model's upstream by
+// looking at the preset's providers' upstream ids and flag those families so
+// the playground sends the right param shape. Pass an explicit model id, or
+// default to the currently selected playground model.
+function modelUsesThinkingControl(modelIdOverride) {
+  const modelId = modelIdOverride || $("pgModel").value;
+  if (!modelId) return false;
+  const cfg = state.cfg || {};
+  const presets = cfg.presets || {};
+  const models = cfg.models || {};
+  const p = presets[modelId];
+  const modelIds = p && Array.isArray(p.models)
+    ? p.models.map((m) => (typeof m === "string" ? m : (m && m.model != null ? m.model : null)))
+    : [modelId];
+  for (const mid of modelIds) {
+    if (!mid) continue;
+    const m = models[mid];
+    const providers = (m && Array.isArray(m.providers)) ? m.providers : [];
+    if (providers.some((pr) => pr && typeof pr.upstream === "string" && pr.upstream.startsWith("poolside/"))) return true;
+  }
+  return false;
+}
+
 // ---- change detection --------------------------------------------------------
 
 function sectionChanged(name, data) {
@@ -1436,10 +1461,17 @@ async function pgSend() {
   for (const m of pg.msgs) messages.push({ role: m.role, content: m.content });
 
   const body = { model, stream, messages, temperature: temp, max_tokens: maxTokens };
-  // "off" is sent as thinking disabled (CommandCode rejects reasoning_effort:"off"
-  // with 503; OpenAI-standard thinking:{type:"disabled"} is honored by DeepSeek).
-  if (reasoning === "off") body.thinking = { type: "disabled" };
-  else if (reasoning) body.reasoning_effort = reasoning;
+  // Reasoning control is dialect-dependent. "off" is sent as thinking disabled
+  // (CommandCode rejects reasoning_effort:"off" with 503; OpenAI-standard
+  // thinking:{type:"disabled"} is honored by DeepSeek). Poolside Laguna
+  // upstreams do not understand reasoning_effort at all - they expose only a
+  // thinking {type} control, so map the same selector to that shape.
+  if (modelUsesThinkingControl()) {
+    if (reasoning) body.thinking = { type: reasoning === "off" ? "disabled" : reasoning };
+  } else {
+    if (reasoning === "off") body.thinking = { type: "disabled" };
+    else if (reasoning) body.reasoning_effort = reasoning;
+  }
   if (!Number.isNaN(topPRaw) && topPRaw !== 1) body.top_p = topPRaw;
   if (!Number.isNaN(freqRaw) && freqRaw !== 0) body.frequency_penalty = freqRaw;
   if (!Number.isNaN(presRaw) && presRaw !== 0) body.presence_penalty = presRaw;
@@ -1484,6 +1516,7 @@ async function pgSend() {
       let usage = null;
       let reasoning = "";
       let sawDone = false;
+      const rawChunks = [];
       try {
         while (true) {
           const { done, value } = await reader.read();
@@ -1495,6 +1528,7 @@ async function pgSend() {
             const t = line.trim();
             if (!t.startsWith("data:")) continue;
             const payload = t.slice(5).trim();
+            rawChunks.push(payload);
             if (payload === "[DONE]") { sawDone = true; continue; }
             let chunk;
             try { chunk = JSON.parse(payload); } catch { continue; }
@@ -1526,6 +1560,14 @@ async function pgSend() {
       }
       if (!sawDone && pg.msgs[idx].content && !/\[stream interrupted/.test(pg.msgs[idx].content)) {
         pg.msgs[idx].content += "\n\n[stream ended without [DONE] - possibly truncated]";
+      }
+      // Raw view for streaming: rebuild the SSE payloads (skip the [DONE]
+      // sentinel and any heartbeat lines) so the raw panel shows the full
+      // wire transcript just like the non-stream branch does.
+      const rawJson = rawChunks.filter((c) => c !== "[DONE]").join("\n");
+      if (rawJson) {
+        pg.lastRaw = rawJson;
+        $("pgRaw").textContent = pg.lastRaw;
       }
       pg.lastUsage = usage;
       if (usage && usage.prompt_tokens != null) {
@@ -1666,8 +1708,12 @@ $("pgCompareRun").addEventListener("click", async () => {
     if (system) messages.push({ role: "system", content: system });
     messages.push({ role: "user", content: text });
     const body = { model, stream: false, messages, temperature: temp, max_tokens: maxTokens };
-    if (reasoning === "off") body.thinking = { type: "disabled" };
-    else if (reasoning) body.reasoning_effort = reasoning;
+    if (modelUsesThinkingControl(model)) {
+      if (reasoning) body.thinking = { type: reasoning === "off" ? "disabled" : reasoning };
+    } else {
+      if (reasoning === "off") body.thinking = { type: "disabled" };
+      else if (reasoning) body.reasoning_effort = reasoning;
+    }
     const headers = { "content-type": "application/json" };
     if (session) headers["x-session-affinity"] = session;
     const t0 = Date.now();
