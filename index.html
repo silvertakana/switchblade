@@ -1,0 +1,1791 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Local Model Router</title>
+<style>
+  :root {
+    --bg: #0a0a0a;
+    --panel: #141414;
+    --panel-2: #1c1c1c;
+    --border: #2a2a2a;
+    --text: #f2f2f2;
+    --muted: #9a9a9a;
+    --faint: #666;
+    --green: #4ade80;
+    --amber: #fbbf24;
+    --red: #f87171;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --radius: 8px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    padding: 24px;
+    max-width: 1150px;
+    margin: 0 auto;
+  }
+  header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 14px; }
+  h1 { font-size: 22px; letter-spacing: 0.2px; font-weight: 600; display: flex; align-items: center; gap: 10px; }
+  .subtitle { color: var(--muted); margin-top: 4px; }
+  .header-controls { display: flex; align-items: center; gap: 12px; }
+  .header-controls label { display: flex; align-items: center; gap: 6px; color: var(--muted); cursor: pointer; user-select: none; }
+  button {
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 6px 12px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  button:hover { border-color: var(--faint); }
+  button:disabled { opacity: 0.5; cursor: default; }
+  button.primary { background: #f2f2f2; color: #0a0a0a; border-color: #f2f2f2; font-weight: 600; }
+  button.primary:hover { background: #ffffff; }
+  button.primary:disabled { background: #666; border-color: #666; color: #ccc; }
+  button.danger { border-color: rgba(248, 113, 113, 0.4); color: var(--red); }
+  section { margin-bottom: 28px; }
+  h2 { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 1.2px; margin-bottom: 10px; font-weight: 600; }
+  h2 svg { width: 13px; height: 13px; margin-right: 6px; vertical-align: -2px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 14px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; }
+  .card h3 { font-size: 14px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-weight: 500; line-height: 1.35; }
+  .badge { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 10px; text-transform: uppercase; letter-spacing: 0.4px; }
+  .badge svg { width: 11px; height: 11px; }
+  .badge.healthy { background: rgba(74, 222, 128, 0.12); color: var(--green); }
+  .badge.cooling { background: rgba(251, 191, 36, 0.12); color: var(--amber); }
+  .badge.manual-badge { background: rgba(154, 154, 154, 0.15); color: var(--muted); }
+  .preset-label { font-size: 11px; color: var(--muted); font-weight: 400; margin-top: 2px; }
+  .row { display: flex; justify-content: space-between; gap: 10px; margin-top: 8px; font-size: 13px; color: var(--muted); }
+  .row b { color: var(--text); font-weight: 500; font-family: var(--mono); }
+  .errbox { margin-top: 8px; font-size: 12px; }
+  .errbox .errline { color: var(--muted); cursor: pointer; word-break: break-all; }
+  .errbox .errline:hover { color: var(--text); }
+  .card-actions { display: flex; gap: 8px; margin-top: 12px; }
+  .note { font-size: 12px; color: var(--amber); margin-top: 8px; }
+  .stats { display: flex; flex-direction: column; gap: 10px; }
+  .statbar { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; }
+  .statbar .top { display: flex; justify-content: space-between; gap: 12px; font-size: 13px; }
+  .statbar .top b { font-family: var(--mono); font-weight: 500; }
+  .statbar .meta { display: flex; flex-wrap: wrap; gap: 6px 16px; margin-top: 8px; font-size: 12px; color: var(--muted); }
+  .statbar .meta b { font-family: var(--mono); font-weight: 500; color: var(--text); }
+  .bar { height: 12px; background: var(--panel-2); border-radius: 6px; margin-top: 10px; overflow: hidden; }
+  .bar > div { position: relative; height: 100%; background: linear-gradient(90deg, #f2f2f2, #9a9a9a); border-radius: 5px; }
+  .bar-pct { position: absolute; top: 50%; right: 6px; transform: translateY(-50%); font-size: 9px; font-weight: 700; color: #0a0a0a; letter-spacing: 0.3px; line-height: 1; }
+  .stat-overview { display: flex; gap: 12px 28px; flex-wrap: wrap; margin-bottom: 12px; padding: 12px 16px; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); color: var(--muted); font-size: 13px; }
+  .stat-overview b { color: var(--text); font-family: var(--mono); font-weight: 500; }
+  table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 12px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; text-transform: uppercase; font-size: 11px; letter-spacing: 0.5px; background: var(--panel-2); position: sticky; top: 0; z-index: 2; }
+  tr:last-child td { border-bottom: none; }
+  td.mono, .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  .status-ok { color: var(--green); }
+  .status-err { color: var(--red); }
+  .test-panel { display: flex; flex-direction: column; gap: 10px; }
+  .test-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  select, textarea, input[type="text"], input[type="number"] {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 6px 10px; font-size: 13px; font-family: inherit;
+  }
+  textarea { width: 100%; min-height: 80px; resize: vertical; font-family: var(--mono); }
+  label.check { display: flex; align-items: center; gap: 6px; color: var(--muted); cursor: pointer; user-select: none; }
+
+  /* ---- custom checkboxes (appearance:none + drawn checkmark) ---- */
+  input[type="checkbox"] {
+    appearance: none;
+    -webkit-appearance: none;
+    width: 16px;
+    height: 16px;
+    min-width: 16px;
+    margin: 0;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--panel-2);
+    cursor: pointer;
+    position: relative;
+    display: inline-block;
+    vertical-align: -3px;
+    transition: background-color 150ms ease, border-color 150ms ease, box-shadow 150ms ease, transform 150ms ease;
+  }
+  input[type="checkbox"]:hover { border-color: var(--muted); }
+  input[type="checkbox"]:active { transform: scale(0.92); }
+  input[type="checkbox"]:checked { background: var(--text); border-color: var(--text); }
+  input[type="checkbox"]:checked::after {
+    content: "";
+    position: absolute;
+    left: 4px;
+    top: 1px;
+    width: 5px;
+    height: 9px;
+    border: solid var(--bg);
+    border-width: 0 2px 2px 0;
+    transform: rotate(45deg);
+  }
+  input[type="checkbox"]:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
+
+  /* ---- inline icons ---- */
+  button svg { width: 14px; height: 14px; margin-right: 6px; vertical-align: -2px; }
+  .linkbtn svg { margin-right: 5px; }
+  .tab svg { width: 14px; height: 14px; margin-right: 6px; vertical-align: -2px; }
+  .debug-cell .k { display: flex; align-items: center; gap: 5px; }
+  .debug-cell .k svg { width: 12px; height: 12px; flex-shrink: 0; }
+  pre {
+    background: #0d0d0d; border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 12px; overflow: auto; max-height: 340px; font-family: var(--mono); font-size: 12px; white-space: pre-wrap; word-break: break-all;
+  }
+  details { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); }
+  summary { cursor: pointer; padding: 10px 14px; color: var(--muted); font-size: 13px; user-select: none; }
+  details[open] summary { border-bottom: 1px solid var(--border); }
+  details pre { border: none; border-radius: 0; max-height: 400px; }
+  footer { margin-top: 24px; color: var(--muted); font-size: 12px; border-top: 1px solid var(--border); padding-top: 12px; }
+  footer code { font-family: var(--mono); color: var(--text); }
+  .unreachable { background: rgba(248, 113, 113, 0.08); border: 1px solid rgba(248, 113, 113, 0.4); color: var(--red); border-radius: var(--radius); padding: 14px; margin-bottom: 16px; }
+  .empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
+
+  /* ---- tabs ---- */
+  .kind { display: inline-flex; align-items: center; gap: 5px; font-family: var(--mono); font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.4px; padding: 1px 6px; border-radius: 4px; }
+  .kind.weekly { color: var(--amber); background: rgba(251,191,36,.12); }
+  .kind.rate { color: var(--amber); background: rgba(251,191,36,.12); }
+  .kind.auth { color: var(--red); background: rgba(248,113,113,.12); }
+  .kind.server { color: var(--red); background: rgba(248,113,113,.12); }
+  .kind.manual { color: var(--muted); background: rgba(154,154,154,.15); }
+  .kind.client { color: var(--muted); background: rgba(154,154,154,.15); }
+  .banner { display: flex; align-items: center; gap: 8px; background: rgba(248,113,113,.1); border: 1px solid rgba(248,113,113,.4); color: var(--red); border-radius: var(--radius); padding: 14px; margin-bottom: 16px; font-size: 13px; }
+  .banner svg { width: 16px; height: 16px; flex-shrink: 0; }
+  .banner button { margin-left: auto; }
+  .note.err { color: var(--red); }
+  .status-dot.down { background: var(--red); box-shadow: 0 0 0 0 rgba(248,113,113,.5); animation: pulse-red 2s ease-in-out infinite; }
+  @keyframes pulse-red { 0% { box-shadow: 0 0 0 0 rgba(248,113,113,.45); } 70% { box-shadow: 0 0 0 7px rgba(248,113,113,0); } 100% { box-shadow: 0 0 0 0 rgba(248,113,113,0); } }
+  .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 20px; }
+  .tab { padding: 8px 16px; font-size: 13px; color: var(--muted); cursor: pointer; border: none; background: none; border-bottom: 2px solid transparent; border-radius: 0; }
+  .tab:hover { color: var(--text); border-color: var(--faint); }
+  .tab.active { color: var(--text); border-bottom-color: var(--text); font-weight: 600; }
+  .view { display: none; }
+  .view.active { display: block; }
+
+  /* ---- playground ---- */
+  .chat { display: flex; flex-direction: column; gap: 12px; }
+  .chat-thread { display: flex; flex-direction: column; gap: 10px; max-height: 55vh; overflow-y: auto; padding: 4px; }
+  .msg { max-width: 85%; padding: 10px 14px; border-radius: var(--radius); font-size: 14px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
+  .msg.user { align-self: flex-end; background: #f2f2f2; color: #0a0a0a; padding: 12px 16px; }
+  .msg.assistant { align-self: flex-start; background: var(--panel); border: 1px solid rgba(42, 42, 42, 0.6); color: var(--text); }
+  .msg .role { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); margin-bottom: 4px; font-weight: 600; }
+  .msg.user .role { color: rgba(10,10,10,.55); }
+  .msg.reasoning { align-self: flex-start; background: var(--panel); border: 1px dashed var(--border); color: var(--muted); font-size: 12px; font-family: var(--mono); }
+  .chat-input-row { display: flex; gap: 10px; align-items: flex-end; }
+  .chat-input-row textarea { flex: 1; min-height: 60px; max-height: 160px; }
+  .chat-controls { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; color: var(--muted); font-size: 13px; }
+  .chat-controls label { display: flex; align-items: center; gap: 5px; cursor: pointer; }
+  .debug-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 12px; margin-top: 10px; }
+  .debug-cell { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; font-size: 13px; }
+  .debug-cell .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
+  .debug-cell .v { font-family: var(--mono); font-size: 13px; }
+  .debug-cell .v.ok { color: var(--green); }
+  .debug-cell .v.err { color: var(--red); }
+  .collapsed { display: none; }
+  .collapsed.open { display: block; }
+  .linkbtn { background: var(--panel-2); border: 1px solid var(--border); color: var(--muted); font-size: 12px; padding: 4px 10px; border-radius: var(--radius); text-decoration: none; cursor: pointer; }
+  .linkbtn:hover { color: var(--text); border-color: var(--muted); }
+
+  /* ---- playground: action bar (Send primary + grouped secondary) ---- */
+  .chat-actions { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+  .chat-actions-right { display: flex; gap: 8px; flex-wrap: wrap; }
+
+  /* ---- playground: compact debug panel ---- */
+  .debug-compact { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; }
+  .debug-row { display: flex; align-items: baseline; gap: 10px; font-size: 13px; }
+  .debug-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; min-width: 74px; display: inline-flex; align-items: center; gap: 5px; user-select: none; }
+  .debug-label svg { width: 12px; height: 12px; flex-shrink: 0; }
+  .debug-value { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  .debug-value.ok { color: var(--green); }
+  .debug-value.err { color: var(--red); }
+
+  /* ---- playground: model comparison ---- */
+  .compare-config { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 10px; padding: 12px 14px; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); }
+  .compare-hint { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-size: 12px; }
+  .compare-hint svg { width: 13px; height: 13px; }
+  .compare-models { display: flex; flex-wrap: wrap; gap: 6px 14px; }
+  .compare-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; margin-top: 10px; }
+  .compare-card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; }
+  .compare-card h4 { font-size: 13px; font-family: var(--mono); font-weight: 600; margin-bottom: 6px; }
+  .compare-meta { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+  .compare-meta b { font-family: var(--mono); color: var(--text); font-weight: 500; }
+  .compare-body { font-size: 13px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; max-height: 300px; overflow-y: auto; }
+  .compare-err { font-size: 12px; color: var(--red); font-family: var(--mono); white-space: pre-wrap; word-break: break-all; }
+
+  /* ---- request history: cache miss row tint ---- */
+  .status-miss { color: var(--faint); }
+  .status-hit { color: var(--green); font-weight: 600; }
+
+  /* ---- polish ---- */
+  :focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
+  button, select, textarea, input, summary, label.check { transition: border-color 160ms cubic-bezier(.4,0,.2,1), background-color 160ms cubic-bezier(.4,0,.2,1), color 160ms cubic-bezier(.4,0,.2,1), transform 160ms cubic-bezier(.4,0,.2,1), opacity 160ms ease, box-shadow 160ms cubic-bezier(.4,0,.2,1); }
+  button:not(.tab):hover { transform: translateY(-1px) scale(1.02); border-color: var(--muted); box-shadow: 0 3px 12px rgba(0,0,0,.45); }
+  button:not(.tab):active { transform: translateY(0) scale(0.97); }
+  .card { transition: border-color 200ms ease, box-shadow 200ms ease; }
+  .card:hover { border-color: var(--faint); box-shadow: 0 4px 16px rgba(0,0,0,.4); }
+  .badge { transition: background-color 250ms ease, color 250ms ease; }
+  .bar > div { transition: width 300ms ease-out; }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); display: inline-block; flex-shrink: 0; transition: background-color 250ms ease, box-shadow 250ms ease; }
+  .status-dot.cooling { background: var(--amber); box-shadow: 0 0 0 0 rgba(251,191,36,.5); animation: pulse 2s ease-in-out infinite; }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(251,191,36,.45); } 70% { box-shadow: 0 0 0 7px rgba(251,191,36,0); } 100% { box-shadow: 0 0 0 0 rgba(251,191,36,0); } }
+  @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+  .card, .statbar, .test-panel, details, table { animation: rise 300ms ease-out both; }
+  @keyframes shimmer { 0% { background-position: -200% 0; } 100% { background-position: 200% 0; } }
+  .skeleton { background: linear-gradient(90deg, var(--panel) 25%, var(--panel-2) 50%, var(--panel) 75%); background-size: 200% 100%; animation: shimmer 1.4s linear infinite; border-radius: var(--radius); height: 14px; margin: 6px 0; }
+
+  /* ---- scrollbars ---- */
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: var(--panel-2); border: 2px solid var(--bg); border-radius: 8px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--faint); }
+  * { scrollbar-width: thin; scrollbar-color: var(--panel-2) var(--bg); }
+
+  /* ---- JSON syntax highlighting (config viewer) ---- */
+  .jkey { color: var(--text); }
+  .jstr { color: var(--muted); }
+  .jnum { color: var(--green); }
+  .jbool { color: var(--amber); }
+  .jnull { color: var(--faint); font-style: italic; }
+
+  /* ---- focus polish ---- */
+  input:focus-visible, textarea:focus-visible, select:focus-visible { border-color: var(--muted); }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
+    .card, .statbar, .test-panel, details, table { animation: none; }
+    .status-dot.cooling { animation: none; box-shadow: none; }
+    .skeleton { animation: none; }
+  }
+  @media (max-width: 900px) {
+    .debug-grid { grid-template-columns: repeat(2, 1fr); }
+  }
+  @media (max-width: 640px) {
+    body { padding: 16px; }
+    h1 { font-size: 19px; }
+    .header-controls { width: 100%; justify-content: space-between; }
+    table { font-size: 12px; }
+    th, td { padding: 6px 8px; }
+    .msg { max-width: 95%; }
+    .debug-grid { grid-template-columns: 1fr; }
+    .cards { grid-template-columns: 1fr; }
+    .card-actions { flex-wrap: wrap; }
+    .compare-grid { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1><span id="statusDot" class="status-dot" role="img" aria-label="All backends healthy" title="All backends healthy"></span>Local Model Router</h1>
+    <p class="subtitle">Port <span id="port" class="mono">-</span> &middot; Uptime <span id="uptime">-</span></p>
+  </div>
+  <div class="header-controls">
+    <label><input type="checkbox" id="autoRefresh" checked> Auto-refresh</label>
+    <button id="resetHealth" data-icon="refresh">Reset health</button>
+  </div>
+</header>
+
+<div id="unreachable" class="unreachable" style="display:none">Router unreachable. Is <span class="mono">server.mjs</span> running on port 8787? Retrying...</div>
+<div id="allDown" class="banner" style="display:none" role="alert"></div>
+
+<nav class="tabs" role="tablist" aria-label="Views">
+  <button class="tab active" id="tab-dashboard" role="tab" aria-selected="true" data-view="dashboard" data-icon="grid">Dashboard</button>
+  <button class="tab" id="tab-playground" role="tab" aria-selected="false" data-view="playground" data-icon="chat">Playground</button>
+</nav>
+
+<main>
+  <div id="view-dashboard" class="view active" role="tabpanel" aria-labelledby="tab-dashboard">
+    <section>
+      <h2 data-icon="server">Backends</h2>
+      <div id="backends" class="cards"><div class="skeleton" style="grid-column:1/-1"></div></div>
+    </section>
+
+    <section>
+      <h2 data-icon="activity">Traffic stats</h2>
+      <div id="stats"><div class="skeleton"></div><div class="skeleton"></div></div>
+    </section>
+
+    <section>
+      <h2 data-icon="clock">Request history</h2>
+      <div style="overflow-x:auto">
+        <table>
+          <thead>
+            <tr><th scope="col">Time</th><th scope="col">Model</th><th scope="col">Backend</th><th scope="col">Stream</th><th scope="col">Status</th><th scope="col">Latency (ms)</th><th scope="col">TTFT (ms)</th><th scope="col">Tokens</th><th scope="col">Cache</th><th scope="col">Session</th></tr>
+          </thead>
+          <tbody id="historyBody"><tr><td colspan="10"><div class="skeleton"></div></td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2 data-icon="box">Presets</h2>
+      <div style="overflow-x:auto">
+        <table>
+          <thead><tr><th scope="col">Preset</th><th scope="col">Strategy</th><th scope="col">Models</th><th scope="col">Pool</th></tr></thead>
+          <tbody id="presetsBody"><tr><td colspan="4"><div class="skeleton"></div></td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2 data-icon="box">Models</h2>
+      <div style="overflow-x:auto">
+        <table>
+          <thead><tr><th scope="col">Model</th><th scope="col">Providers</th><th scope="col">Affinity</th><th scope="col">Params</th></tr></thead>
+          <tbody id="modelsBody"><tr><td colspan="4"><div class="skeleton"></div></td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <details id="configDetails">
+      <summary>Config viewer</summary>
+      <pre id="configView">Loading...</pre>
+    </details>
+  </div>
+
+  <div id="view-playground" class="view" role="tabpanel" aria-labelledby="tab-playground">
+    <section>
+      <h2>Playground</h2>
+      <div class="chat">
+        <div class="chat-controls">
+          <label>Model
+            <select id="pgModel"></select>
+          </label>
+          <label class="check"><input type="checkbox" id="pgStream" checked> stream</label>
+          <label class="check"><input type="checkbox" id="pgShowReasoning" checked> show reasoning</label>
+          <label>Session ID
+            <input type="text" id="pgSession" placeholder="(none)" style="width:140px" spellcheck="false">
+          </label>
+          <label>Template
+            <select id="pgTemplate" aria-label="Prompt template">
+              <option value="">(none)</option>
+              <option value="review">Code review</option>
+              <option value="bug">Bug analysis</option>
+              <option value="refactor">Refactoring</option>
+              <option value="test">Test generation</option>
+              <option value="docs">Documentation</option>
+            </select>
+          </label>
+          <button class="linkbtn" id="pgAdvancedToggle" data-icon="sliders">Advanced</button>
+        </div>
+        <div class="collapsed" id="pgAdvanced">
+          <div class="chat-controls">
+            <label>System prompt</label>
+          </div>
+          <textarea id="pgSystem" placeholder="Optional system prompt..." style="min-height:44px;margin-top:6px"></textarea>
+          <div class="chat-controls" style="margin-top:6px">
+            <label>Temperature <input type="number" id="pgTemp" value="0.7" min="0" max="2" step="0.1" style="width:64px"></label>
+            <label>Max tokens <input type="number" id="pgMaxTokens" value="1024" min="1" step="16" style="width:84px"></label>
+            <label>Reasoning
+              <select id="pgReasoning" aria-label="Reasoning effort">
+                <option value="off">off</option>
+                <option value="">default</option>
+                <option value="low">low</option>
+                <option value="medium">medium</option>
+                <option value="high">high</option>
+                <option value="max">max</option>
+              </select>
+            </label>
+            <label>Top-p <input type="number" id="pgTopP" value="1" min="0" max="1" step="0.1" style="width:64px"></label>
+            <label>Freq penalty <input type="number" id="pgFreqPenalty" value="0" min="-2" max="2" step="0.1" style="width:64px"></label>
+            <label>Presence penalty <input type="number" id="pgPresencePenalty" value="0" min="-2" max="2" step="0.1" style="width:64px"></label>
+          </div>
+        </div>
+        <div class="chat-thread" id="pgThread" aria-live="polite">
+          <p class="empty">Send a message to start chatting. Watch which backend serves each request in the debug panel below.</p>
+        </div>
+        <div class="chat-input-row">
+          <textarea id="pgInput" placeholder="Message the model... (Enter to send, Shift+Enter for newline)" spellcheck="false"></textarea>
+          <button class="primary" id="pgSend" data-icon="send">Send</button>
+        </div>
+        <div class="chat-actions">
+          <button id="pgClear" data-icon="trash">Clear</button>
+          <div class="chat-actions-right">
+            <button id="pgExportText" data-icon="copy">Copy text</button>
+            <button id="pgExportJson" data-icon="copy">Copy JSON</button>
+            <button id="pgDownloadMd" data-icon="download">Download MD</button>
+            <button id="pgCompareToggle" data-icon="columns">Compare</button>
+          </div>
+        </div>
+        <div class="collapsed" id="pgComparePanel" aria-label="Model comparison">
+          <div class="compare-config">
+            <span class="compare-hint" data-icon="columns">Compare the current input across models (non-stream)</span>
+            <div class="compare-models" id="pgCompareModels"></div>
+            <button class="primary" id="pgCompareRun" data-icon="zap">Run comparison</button>
+          </div>
+          <div id="pgCompareResults" class="compare-grid"></div>
+        </div>
+        <div>
+          <h2 style="margin-bottom:4px" data-icon="terminal">Debug</h2>
+          <div class="debug-compact" id="pgDebug">
+            <div class="debug-row">
+              <span class="debug-label" data-icon="server">Backend</span>
+              <span class="debug-value" id="dbgBackend">-</span>
+            </div>
+            <div class="debug-row">
+              <span class="debug-label" data-icon="box">Model</span>
+              <span class="debug-value" id="dbgModel">-</span>
+            </div>
+            <div class="debug-row">
+              <span class="debug-label" data-icon="zap">Mode</span>
+              <span class="debug-value" id="dbgStream">-</span>
+            </div>
+            <div class="debug-row">
+              <span class="debug-label" data-icon="clock">Latency</span>
+              <span class="debug-value" id="dbgLatency">- / <span id="dbgTtft">-</span> ttft</span>
+            </div>
+            <div class="debug-row">
+              <span class="debug-label" data-icon="hash">Tokens</span>
+              <span class="debug-value" id="dbgTokens">- / <span id="dbgTps">-</span> tps</span>
+            </div>
+            <div class="debug-row">
+              <span class="debug-label" data-icon="database">Cache</span>
+              <span class="debug-value" id="dbgCache">-</span>
+            </div>
+            <div class="debug-row">
+              <span class="debug-label" data-icon="dollar">Cost</span>
+              <span class="debug-value" id="dbgCost">-</span>
+            </div>
+            <div class="debug-row">
+              <span class="debug-label" data-icon="pie">Context</span>
+              <span class="debug-value" id="dbgContext">-</span>
+            </div>
+          </div>
+          <details style="margin-top:10px">
+            <summary>Raw response</summary>
+            <pre id="pgRaw">No response yet.</pre>
+          </details>
+        </div>
+      </div>
+    </section>
+  </div>
+</main>
+
+<footer>
+  <b>Manual:</b> config edits go in <code>config.json</code> (auto-reloads via <code>fs.watch</code>), API keys in <code>.env</code>. The router binds <code>127.0.0.1</code> only - no auth, localhost by design.
+</footer>
+
+<script>
+"use strict";
+
+const state = {
+  health: null,
+  stats: null,
+  history: null,
+  cfg: null,
+  unreachable: false,
+};
+
+// Last-rendered snapshot per section. A section only redraws when its source
+// data actually changed, so the 2s poll never rebuilds identical DOM (that was
+// the "popping" bug) and entrance animations only run once per real change.
+const lastRender = {};
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+// Lightweight inline markdown: bold **text** -> <strong>text</strong>.
+// Runs AFTER escaping so model/user text can never inject HTML.
+function fmtInline(s) {
+  return esc(s).replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+}
+
+// Human-readable one-line summary of a backend lastError. The full JSON stays
+// available in the expandable errline (data-full); this is the clean default view.
+function formatErrShort(err) {
+  if (!err) return "";
+  const parts = [];
+  if (err.status != null) parts.push("HTTP " + err.status);
+  const labels = { weekly: "weekly usage limit", rate: "rate limit", auth: "auth failure", server: "server error", manual: "manually cooled", client: "client error" };
+  if (err.kind && labels[err.kind]) parts.push(labels[err.kind]);
+  let bodyMsg = null;
+  if (typeof err.body === "string") {
+    try {
+      const parsed = JSON.parse(err.body);
+      if (parsed && typeof parsed.error === "string") bodyMsg = parsed.error;
+      else if (parsed && parsed.error && typeof parsed.error.message === "string") bodyMsg = parsed.error.message;
+      else if (parsed && typeof parsed.message === "string") bodyMsg = parsed.message;
+    } catch { bodyMsg = err.body; }
+  } else if (err.body && err.body.error && typeof err.body.error.message === "string") {
+    bodyMsg = err.body.error.message;
+  } else if (err.body && typeof err.body.error === "string") {
+    bodyMsg = err.body.error;
+  } else if (err.message) {
+    bodyMsg = err.message;
+  }
+  if (bodyMsg) {
+    bodyMsg = String(bodyMsg).replace(/\s+/g, " ").trim();
+    if (bodyMsg.length > 70) bodyMsg = bodyMsg.slice(0, 70) + "\u2026";
+    parts.push(bodyMsg);
+  }
+  const out = parts.length ? parts.join(" - ") : JSON.stringify(err);
+  return out.length > 110 ? out.slice(0, 110) + "\u2026" : out;
+}
+
+// Minimal JSON syntax highlighting for the config viewer. Escapes punctuation
+// and token text separately, then wraps keys/strings/numbers/booleans/null in
+// theme classes. No HTML injection: every fragment is escaped.
+function highlightJSON(obj) {
+  const s = JSON.stringify(obj, null, 2);
+  const re = /("(?:\\u[a-fA-F0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+-]?\d+)?)/g;
+  let out = "";
+  let last = 0;
+  let m;
+  while ((m = re.exec(s)) !== null) {
+    out += esc(s.slice(last, m.index));
+    const tok = m[0];
+    let cls = "jnum";
+    if (tok[0] === '"') cls = /:$/.test(tok) ? "jkey" : "jstr";
+    else if (tok === "true" || tok === "false") cls = "jbool";
+    else if (tok === "null") cls = "jnull";
+    out += '<span class="' + cls + '">' + esc(tok) + "</span>";
+    last = m.index + tok.length;
+  }
+  return out + esc(s.slice(last));
+}
+
+function fmtTime(t) {
+  const d = new Date(t);
+  const p = (n) => String(n).padStart(2, "0");
+  return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+}
+
+function fmtUptime(ms) {
+  if (ms == null) return "-";
+  const s = Math.floor(ms / 1000);
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (d > 0) return d + "d " + h + "h " + m + "m";
+  if (h > 0) return h + "h " + m + "m " + sec + "s";
+  if (m > 0) return m + "m " + sec + "s";
+  return sec + "s";
+}
+
+function fmtCountdown(until) {
+  // Sticky manual cools report MAX_SAFE_INTEGER as nextAvailableAtMs; never
+  // render that sentinel as a duration ("until uncooled" instead).
+  if (until != null && until >= Number.MAX_SAFE_INTEGER - 1000) return "until uncooled";
+  const ms = Math.max(0, until - Date.now());
+  const s = Math.ceil(ms / 1000);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (h > 0) return h + "h " + m + "m " + sec + "s";
+  if (m > 0) return m + "m " + sec + "s";
+  return sec + "s";
+}
+
+function chatUrl() {
+  const p = (state.cfg && state.cfg.prefix) || "/v1";
+  return p.replace(/\/$/, "") + "/chat/completions";
+}
+
+// ---- change detection --------------------------------------------------------
+
+function sectionChanged(name, data) {
+  const key = JSON.stringify(data);
+  if (lastRender[name] === key) return false;
+  lastRender[name] = key;
+  return true;
+}
+
+// ---- rendering: dashboard ----------------------------------------------------
+
+function render() {
+  renderHeader();
+  renderAlerts();
+  renderBackends();
+  renderStats();
+  renderHistory();
+}
+
+function renderHeader() {
+  const health = state.health;
+  // Stable snapshot for change detection. Clock-driven values (uptimeMs) change
+  // every poll, so they must NOT gate header updates; uptime is updated live
+  // below and by the 1s ticker instead.
+  const stable = {
+    port: health && health.port != null ? health.port : null,
+    unreachable: !!state.unreachable,
+    cooling: !!(health && Array.isArray(health.backends) && health.backends.some((b) => b.state === "cooling")),
+  };
+  if (sectionChanged("header", stable)) {
+    $("port").textContent = stable.port != null ? stable.port : "-";
+    $("unreachable").style.display = stable.unreachable ? "block" : "none";
+    const dot = $("statusDot");
+    if (stable.unreachable) {
+      dot.classList.remove("cooling");
+      dot.classList.add("down");
+      dot.setAttribute("aria-label", "Router unreachable");
+      dot.title = "Router unreachable";
+    } else {
+      dot.classList.remove("down");
+      dot.classList.toggle("cooling", stable.cooling);
+      dot.setAttribute("aria-label", stable.cooling ? "A backend is cooling" : "All backends healthy");
+      dot.title = stable.cooling ? "A backend is cooling" : "All backends healthy";
+    }
+  }
+  // Uptime is a live clock — always update the text, never gate it.
+  const u = state.stats && state.stats.uptimeMs;
+  if (u != null) $("uptime").textContent = fmtUptime(u);
+}
+
+// Prominent alert when every backend is cooling and the router cannot serve.
+function renderAlerts() {
+  const host = $("allDown");
+  const bs = state.health && Array.isArray(state.health.backends) ? state.health.backends : null;
+  const allCooling = !!bs && bs.length > 0 && bs.every((b) => b.state === "cooling");
+  if (!allCooling || state.unreachable) {
+    host.style.display = "none";
+    return;
+  }
+  if (!sectionChanged("allDown", allCooling)) return;
+  host.style.display = "flex";
+  host.innerHTML =
+    ICONS.warn +
+    '<span>All backends are cooling - the router cannot serve requests. ' +
+    (bs[0].lastError && bs[0].lastError.kind === "weekly"
+      ? "All GO accounts hit their weekly usage limits."
+      : "Check each backend below for the reason.") +
+    "</span>" +
+    '<button data-reset-all>' + ICONS.refresh + "Reset health</button>";
+}
+
+// Inline SVG icons (stroke 1.8, currentColor) — no emoji, no external assets.
+const ICONS = {
+  ok: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>',
+  warn: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>',
+  check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>',
+  grid: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>',
+  chat: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
+  server: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>',
+  activity: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>',
+  clock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>',
+  box: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>',
+  snowflake: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="2" y1="12" x2="22" y2="12"/><line x1="12" y1="2" x2="12" y2="22"/><path d="m20 16-4-4 4-4"/><path d="m4 8 4 4-4 4"/><path d="m16 4-4 4-4-4"/><path d="m8 20 4-4 4 4"/></svg>',
+  sun: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>',
+  refresh: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>',
+  send: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>',
+  zap: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>',
+  hash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="9" x2="20" y2="9"/><line x1="4" y1="15" x2="20" y2="15"/><line x1="10" y1="3" x2="8" y2="21"/><line x1="16" y1="3" x2="14" y2="21"/></svg>',
+  gauge: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></svg>',
+  database: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>',
+  stopwatch: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2 2"/><path d="M10 2h4"/><line x1="12" y1="2" x2="12" y2="5"/></svg>',
+  copy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
+  trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>',
+  sliders: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>',
+  terminal: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>',
+  dollar: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>',
+  pie: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.21 15.89A10 10 0 1 1 8 2.83"/><path d="M22 12A10 10 0 0 0 12 2v10z"/></svg>',
+  columns: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="12" y1="3" x2="12" y2="21"/></svg>',
+  download: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>',
+};
+
+// Inject icons into static elements tagged with data-icon (single source of truth).
+function decorate() {
+  document.querySelectorAll("[data-icon]").forEach((el) => {
+    const icon = ICONS[el.dataset.icon];
+    if (icon) el.insertAdjacentHTML("afterbegin", icon);
+  });
+}
+
+function renderBackends() {
+  const host = $("backends");
+  const data = state.health && state.health.backends ? state.health.backends : null;
+  if (!data) {
+    if (state.unreachable) return;
+    host.innerHTML = '<p class="empty">No backends.</p>';
+    return;
+  }
+  // Include the traffic snapshot in change detection so the card's live metrics
+  // (avg latency / success rate) refresh as requests flow, not only on health changes.
+  const statsSb = (state.stats && state.stats.byBackend) || {};
+  if (!sectionChanged("backends", { backends: data, stats: statsSb })) return;
+  host.innerHTML = data.map((b, idx) => {
+    const sb = statsSb[b.id];
+    const avgLat = sb && sb.requests ? Math.round(sb.latencySumMs / sb.requests) : null;
+    const okRate = sb && sb.requests ? Math.round(((sb.ok || 0) / sb.requests) * 100) : null;
+    const cooling = b.state === "cooling";
+    const err = b.lastError;
+    const kind = err && err.kind ? err.kind : null;
+    const weekly = kind === "weekly";
+    // The /health "manual" flag is authoritative: cooling AND the cool is a
+    // user decision (lastError.kind === "manual"). Sticky manual cools report
+    // nextAvailableAtMs = MAX_SAFE_INTEGER, which must never become a countdown.
+    const manual = cooling && !!b.manual;
+    const auth = kind === "auth";
+    const kindLabel = kind === "weekly" ? "weekly limit" : kind === "rate" ? "rate limit" : kind === "auth" ? "auth" : kind === "server" ? "server error" : kind === "manual" ? "manual" : kind === "client" ? "client error" : null;
+    const errShort = err ? formatErrShort(err) : "";
+    const errFull = err ? JSON.stringify(err, null, 2) : "";
+    const stagger = Math.min(idx * 50, 350);
+    return (
+      '<div class="card" style="animation-delay:' + stagger + 'ms">' +
+      "<h3>" + esc(b.id) + ' <span class="badge ' + (cooling ? (manual ? "manual-badge" : "cooling") : "healthy") + '">' + (cooling ? (manual ? ICONS.snowflake : ICONS.warn) : ICONS.ok) + (cooling ? (manual ? "Manual" : "cooling") : "healthy") + "</span></h3>" +
+      '<div class="row"><span>Next available</span><b>' + (cooling ? (manual ? '<span class="kind manual">until uncooled</span>' : '<span class="countdown" data-next="' + (b.nextAvailableAtMs || 0) + '">' + fmtCountdown(b.nextAvailableAtMs || 0) + "</span>") : "now") + "</b></div>" +
+      '<div class="row"><span>Fails</span><b>' + (b.fails || 0) + "</b></div>" +
+      '<div class="row"><span>Avg latency</span><b>' + (avgLat != null ? avgLat + " ms" : "-") + "</b></div>" +
+      '<div class="row"><span>Success rate</span><b>' + (okRate != null ? okRate + "%" : "-") + "</b></div>" +
+      (kind ? '<div class="row"><span>Reason</span><b><span class="kind ' + esc(kind) + '">' + esc(kindLabel) + "</span></b></div>" : "") +
+      (err ? '<div class="errbox"><span class="errline" data-short="' + esc(errShort) + '" data-full="' + esc(errFull) + '" title="Click to expand / collapse">' + esc(errShort) + "</span></div>" : "") +
+      (weekly ? '<div class="note">Cooled due to weekly usage limit - retries when the limit resets.</div>' : "") +
+      (manual ? '<div class="note">Manually cooled from the UI. Uncool to restore.</div>' : "") +
+      (auth ? '<div class="note err">Auth failure - check the API key in .env for this backend.</div>' : "") +
+      '<div class="card-actions">' +
+      '<button class="danger" data-cool="' + esc(b.id) + '">' + ICONS.snowflake + "Cool</button>" +
+      '<button data-uncool="' + esc(b.id) + '">' + ICONS.sun + "Uncool</button>" +
+      "</div></div>"
+    );
+  }).join("");
+}
+
+// Per-backend latency samples from the request history, used to compute
+// P50/P95/P99 client-side (the server only tracks sums/max).
+function statsPerfKey() {
+  const entries = (state.history && state.history.entries) || [];
+  const out = {};
+  for (const e of entries) {
+    if (e.latencyMs == null) continue;
+    (out[e.backend] = out[e.backend] || []).push(e.latencyMs);
+  }
+  return out;
+}
+
+function renderStats() {
+  const host = $("stats");
+  if (!state.stats) return;
+  // FIX (popping): exclude clock-driven fields from change detection so this
+  // section does not re-render (and replay its entrance animation) every poll.
+  // uptimeMs changes every second; the uptime text is kept live by the 1s ticker.
+  // The history-derived percentile samples must gate the redraw too, or the
+  // P50/P95/P99 figures would go stale.
+  const stableStats = Object.assign({}, state.stats);
+  delete stableStats.uptimeMs;
+  stableStats.perf = statsPerfKey();
+  if (!sectionChanged("stats", stableStats)) return;
+  const s = state.stats;
+  const names = Object.keys(s.byBackend || {});
+  const total = s.total || 0;
+  const perf = stableStats.perf;
+  let cacheTotal = 0;
+  let errorsTotal = 0;
+  let latencyTotal = 0;
+  for (const n of names) {
+    cacheTotal += s.byBackend[n].cacheHits || 0;
+    errorsTotal += s.byBackend[n].errors || 0;
+    latencyTotal += s.byBackend[n].latencySumMs || 0;
+  }
+  const successRate = total ? Math.round(((total - errorsTotal) / total) * 100) : 0;
+  const avgLat = total ? Math.round(latencyTotal / total) : 0;
+  let overview = '<div class="stat-overview">' +
+    "<span>Total requests <b>" + total + "</b></span>" +
+    '<span>Uptime <b data-stats-uptime>' + fmtUptime(s.uptimeMs) + "</b></span>" +
+    "<span>Since <b>" + fmtTime(s.since) + "</b></span>" +
+    "<span>Success <b>" + successRate + "%</b></span>" +
+    "<span>Avg latency <b>" + avgLat + "ms</b></span>" +
+    "<span>Cache <b>" + (cacheTotal > 0 ? cacheTotal + " hits" : "n/a") + "</b></span></div>";
+  if (names.length === 0) {
+    host.innerHTML = overview + '<p class="empty">No backend traffic recorded yet.</p>';
+    return;
+  }
+  const goRequests = (s.byBackend["go-primary"]?.requests || 0) + (s.byBackend["go-alt"]?.requests || 0);
+  const directRequests = s.byBackend["direct"]?.requests || 0;
+  const directOnly = total > 0 && goRequests === 0 && directRequests > 0;
+  host.innerHTML = overview + names.map((n) => {
+    const b = s.byBackend[n];
+    const avg = b.requests ? Math.round(b.latencySumMs / b.requests) : 0;
+    const ttft = b.requests ? Math.round((b.ttftSumMs || 0) / b.requests) : 0;
+    // Cache is reported as a hit COUNT, not a rate: cacheHits only counts TRUE
+    // outcomes and misses/unknowns are not tracked per-backend, so a percentage
+    // would be misleading (would implicitly treat every request as known).
+    const hits = b.cacheHits || 0;
+    const hitText = hits > 0 ? hits + " hits" : "n/a";
+    const errRate = b.requests ? Math.round(((b.errors || 0) / b.requests) * 100) : 0;
+    const lats = perf[n] || [];
+    const p50 = percentile(lats, 50);
+    const p95 = percentile(lats, 95);
+    const p99 = percentile(lats, 99);
+    const share = total ? ((b.requests / total) * 100).toFixed(1) : "0.0";
+    return (
+      '<div class="statbar">' +
+      '<div class="top"><span>' + esc(n) + " <b>(" + share + "%)</b></span>" +
+      "<span>req <b>" + b.requests + "</b></span></div>" +
+      '<div class="meta">' +
+      "<span>avg <b>" + avg + "ms</b></span>" +
+      "<span>ttft <b>" + ttft + "ms</b></span>" +
+      "<span>p50 <b>" + (p50 != null ? p50 + "ms" : "-") + "</b></span>" +
+      "<span>p95 <b>" + (p95 != null ? p95 + "ms" : "-") + "</b></span>" +
+      "<span>p99 <b>" + (p99 != null ? p99 + "ms" : "-") + "</b></span>" +
+      "<span>hit <b>" + hitText + "</b></span>" +
+      "<span>err <b>" + (b.errors || 0) + (b.requests ? " (" + errRate + "%)" : "") + "</b></span>" +
+      "</div>" +
+      '<div class="bar"><div style="width:' + share + '%">' + (parseFloat(share) >= 18 ? '<span class="bar-pct">' + share + "%</span>" : "") + "</div></div>" +
+      "</div>"
+    );
+  }).join("") +
+  (directOnly ? '<div class="note">All recent traffic is on direct - the GO accounts are idle (weekly limits or cooling).</div>' : "");
+}
+
+function renderHistory() {
+  const body = $("historyBody");
+  const entries = (state.history && state.history.entries) || [];
+  if (!state.history) return;
+  if (!sectionChanged("history", entries)) return;
+  if (entries.length === 0) {
+    body.innerHTML = '<tr><td colspan="10" class="empty">No requests yet.</td></tr>';
+    return;
+  }
+  body.innerHTML = entries.slice(0, 100).map((e) =>
+    "<tr>" +
+    '<td class="mono">' + fmtTime(e.t) + "</td>" +
+    "<td>" + esc(e.model) + "</td>" +
+    "<td>" + esc(e.backend) + "</td>" +
+    "<td>" + (e.stream ? "yes" : "no") + "</td>" +
+    '<td class="mono ' + (e.status >= 400 ? "status-err" : "status-ok") + '">' + e.status + "</td>" +
+    '<td class="mono">' + (e.latencyMs != null ? Math.round(e.latencyMs) : "-") + "</td>" +
+    '<td class="mono">' + (e.ttftMs != null ? Math.round(e.ttftMs) : "-") + "</td>" +
+    '<td class="mono">' + (e.promptTokens != null ? e.promptTokens + "/" + (e.completionTokens != null ? e.completionTokens : "?") : "-") + "</td>" +
+    '<td class="mono ' + (e.cacheHit == null ? "" : e.cacheHit ? "status-hit" : "status-miss") + '">' + (e.cacheHit == null ? "-" : e.cacheHit ? "hit" : "miss") + "</td>" +
+    "<td>" + esc(e.session) + "</td>" +
+    "</tr>"
+  ).join("");
+}
+
+function renderPresets() {
+  const body = $("presetsBody");
+  const cfg = state.cfg;
+  if (!cfg || !cfg.presets) return;
+  if (!sectionChanged("presets", cfg.presets)) return;
+  const ids = Object.keys(cfg.presets);
+  if (ids.length === 0) {
+    body.innerHTML = '<tr><td colspan="4" class="empty">No presets configured.</td></tr>';
+    return;
+  }
+  body.innerHTML = ids.map((id) => {
+    const p = cfg.presets[id] || {};
+    const meta = presetMeta(id);
+    const strategy = p.strategy || "affinity";
+    // /api/config serves normalized preset.models entries ({model, weight}).
+    // Tolerate string shorthand, and fall back to the derived members list
+    // ({backend, weight}) when p.models is absent (legacy config source).
+    const rawModels = Array.isArray(p.models) ? p.models : (Array.isArray(p.members) ? p.members : []);
+    const models = rawModels.map((m) =>
+      typeof m === "string"
+        ? { model: m, weight: 1 }
+        : m && typeof m === "object"
+          ? { model: m.model != null ? m.model : m.backend, weight: m.weight != null ? m.weight : 1 }
+          : { model: String(m), weight: 1 }
+    );
+    const modelHtml = models.map((m) => esc(m.model) + (m.weight !== 1 ? " (x" + m.weight + ")" : "")).join(", ");
+    // Pool column: affinity presets show affinityPool (default 1), others "-".
+    const pool = strategy === "affinity" ? (p.affinityPool != null ? p.affinityPool : 1) : "-";
+    const labelHtml = meta.label && meta.label !== id ? '<div class="preset-label">' + esc(meta.label) + "</div>" : "";
+    return (
+      "<tr>" +
+      '<td class="mono">' + esc(id) + labelHtml + "</td>" +
+      "<td>" + esc(strategy) + "</td>" +
+      "<td>" + modelHtml + "</td>" +
+      '<td class="mono">' + pool + "</td>" +
+      "</tr>"
+    );
+  }).join("");
+}
+
+function renderModels() {
+  const body = $("modelsBody");
+  const cfg = state.cfg;
+  if (!cfg || !cfg.models) return;
+  if (!sectionChanged("models", cfg.models)) return;
+  const ids = Object.keys(cfg.models);
+  if (ids.length === 0) {
+    body.innerHTML = '<tr><td colspan="4" class="empty">No models configured.</td></tr>';
+    return;
+  }
+  body.innerHTML = ids.map((id) => {
+    const m = cfg.models[id] || {};
+    const providers = Array.isArray(m.providers) ? m.providers : [];
+    const providerHtml = providers.map((p) => esc(p.backend) + " (" + esc(p.upstream) + ")").join(", ");
+    const affinity = m.affinityPool != null ? m.affinityPool : 1;
+    const params = m.params ? esc(JSON.stringify(m.params)) : "-";
+    const labelHtml = m.meta && m.meta.label && m.meta.label !== id ? '<div class="preset-label">' + esc(m.meta.label) + "</div>" : "";
+    return (
+      "<tr>" +
+      '<td class="mono">' + esc(id) + labelHtml + "</td>" +
+      "<td>" + providerHtml + "</td>" +
+      '<td class="mono">' + affinity + "</td>" +
+      '<td class="mono">' + params + "</td>" +
+      "</tr>"
+    );
+  }).join("");
+}
+
+// ---- data fetching ---------------------------------------------------------
+
+async function poll() {
+  const results = await Promise.allSettled([
+    fetch("/health").then((r) => r.json()),
+    fetch("/api/stats").then((r) => r.json()),
+    fetch("/api/history?limit=100").then((r) => r.json()),
+  ]);
+  state.health = results[0].status === "fulfilled" ? results[0].value : null;
+  state.stats = results[1].status === "fulfilled" ? results[1].value : null;
+  state.history = results[2].status === "fulfilled" ? results[2].value : null;
+  state.unreachable = !state.health && !state.stats && !state.history;
+  render();
+}
+
+let playgroundStateLoaded = false;
+
+async function loadConfig() {
+  try {
+    const r = await fetch("/api/config");
+    state.cfg = await r.json();
+  } catch {
+    state.cfg = null;
+  }
+  // Build the per-preset presentation metadata map from cfg.presets[id].meta,
+  // with a field-level fallback to the first valid model's meta
+  // (cfg.models[first model in preset.models].meta). Meta is optional;
+  // presetMeta() applies the defaults when a field is still absent.
+  for (const id of Object.keys(PRESET_META)) delete PRESET_META[id];
+  const cfgModels = (state.cfg && state.cfg.models) || {};
+  for (const [id, p] of Object.entries((state.cfg && state.cfg.presets) || {})) {
+    if (!p) continue;
+    const meta = p.meta && typeof p.meta === "object" ? p.meta : {};
+    const modelIds = (Array.isArray(p.models) ? p.models : []).map((m) =>
+      typeof m === "string" ? m : (m && typeof m === "object" && m.model != null ? m.model : null)
+    );
+    const firstValid = modelIds.find((m) => m && cfgModels[m]);
+    const modelMeta = firstValid && cfgModels[firstValid].meta && typeof cfgModels[firstValid].meta === "object" ? cfgModels[firstValid].meta : {};
+    const resolved = {};
+    for (const field of ["label", "contextWindow", "pricing"]) {
+      if (meta[field] != null) resolved[field] = meta[field];
+      else if (modelMeta[field] != null) resolved[field] = modelMeta[field];
+    }
+    PRESET_META[id] = resolved;
+  }
+  // Populate the playground model selector (the only one in the UI).
+  const sel = $("pgModel");
+  const prev = sel.value;
+  sel.innerHTML = "";
+  const models = state.cfg && state.cfg.presets ? Object.keys(state.cfg.presets) : [];
+  for (const m of models) {
+    const opt = document.createElement("option");
+    opt.value = m;
+    opt.textContent = m;
+    sel.appendChild(opt);
+  }
+  // Keep the previous selection only if it still exists (config may have changed).
+  if (models.includes(prev)) sel.value = prev;
+  else if (models.length) sel.value = models[0];
+  $("configView").innerHTML = state.cfg ? highlightJSON(state.cfg) : "Config unavailable.";
+  renderPresets();
+  renderModels();
+  populateCompareModels();
+  // Restore the persisted playground on the FIRST load only. Re-running this on
+  // later config-viewer reloads would clobber whatever the user is typing.
+  if (!playgroundStateLoaded) {
+    playgroundStateLoaded = true;
+    loadPlaygroundState();
+  }
+}
+
+// ---- actions: dashboard ------------------------------------------------------
+
+async function doAdmin(path, opts) {
+  try {
+    await fetch(path, Object.assign({ method: "POST" }, opts));
+  } catch {}
+  await poll();
+}
+
+$("resetHealth").addEventListener("click", () => {
+  $("resetHealth").disabled = true;
+  doAdmin("/admin/reset-health").finally(() => { $("resetHealth").disabled = false; });
+});
+
+document.addEventListener("click", (ev) => {
+  const resetAll = ev.target.closest("[data-reset-all]");
+  if (resetAll) {
+    doAdmin("/admin/reset-health");
+    return;
+  }
+  const cool = ev.target.closest("[data-cool]");
+  if (cool) {
+    doAdmin("/admin/backend", { headers: { "content-type": "application/json" }, body: JSON.stringify({ id: cool.dataset.cool, action: "cool" }) });
+    return;
+  }
+  const uncool = ev.target.closest("[data-uncool]");
+  if (uncool) {
+    doAdmin("/admin/backend", { headers: { "content-type": "application/json" }, body: JSON.stringify({ id: uncool.dataset.uncool, action: "uncool" }) });
+    return;
+  }
+  const errline = ev.target.closest(".errline");
+  if (errline) {
+    if (errline.textContent === errline.dataset.full) {
+      errline.textContent = errline.dataset.short;
+    } else {
+      errline.textContent = errline.dataset.full;
+    }
+  }
+});
+
+// ---- actions: playground -----------------------------------------------------
+
+const pg = {
+  msgs: [], // {role: "user"|"assistant", content, reasoning?}
+  lastBackend: null,
+  lastLatencyMs: null,
+  lastTTFT: null,
+  lastStart: 0,
+  lastUsage: null,
+  lastRaw: null,
+  streaming: false,
+  compareRunning: false,
+  // Cumulative per-conversation cache counters (persisted with the playground state).
+  cacheHits: 0,
+  cacheMisses: 0,
+};
+
+// Per-preset presentation metadata, built from cfg.presets[id].meta on config
+// load (see loadConfig). Fallbacks are applied per lookup in presetMeta().
+const DEFAULT_PRICING = { inputPerM: 0.18, outputPerM: 0.87 };
+const DEFAULT_CONTEXT_WINDOW = 128000;
+const PRESET_META = {};
+
+// PRESET_META[id] -> {label, contextWindow, pricing} with the design-contract
+// fallbacks when meta (or a field) is absent: label = preset id, context 128000,
+// pricing 0.18/0.87 per M. Never used for routing - purely presentation.
+function presetMeta(id) {
+  const m = PRESET_META[id] || {};
+  return {
+    label: m.label != null ? m.label : id,
+    contextWindow: m.contextWindow != null ? m.contextWindow : DEFAULT_CONTEXT_WINDOW,
+    pricing: m.pricing && typeof m.pricing === "object" ? m.pricing : DEFAULT_PRICING,
+  };
+}
+
+function calcCost(promptTokens, completionTokens, modelId) {
+  const p = Number(promptTokens) || 0;
+  const c = Number(completionTokens) || 0;
+  const pricing = presetMeta(modelId).pricing;
+  return (p / 1_000_000) * pricing.inputPerM + (c / 1_000_000) * pricing.outputPerM;
+}
+
+function fmtCost(cost) {
+  if (cost == null || Number.isNaN(cost)) return "-";
+  if (cost < 0.01) return "$" + cost.toFixed(4);
+  if (cost < 1) return "$" + cost.toFixed(3);
+  return "$" + cost.toFixed(2);
+}
+
+// Context window tracker: how much of the preset's window this conversation used.
+function fmtContext(pTok, cTok, modelId) {
+  if (pTok == null) return "-";
+  const window = presetMeta(modelId).contextWindow;
+  const used = (Number(pTok) || 0) + (Number(cTok) || 0);
+  const left = Math.max(0, window - used);
+  return used + " / " + window + " used \u00b7 " + left + " left";
+}
+
+// P-th percentile of an unsorted numeric array (null when empty).
+function percentile(arr, p) {
+  if (!arr || !arr.length) return null;
+  const s = arr.slice().sort((a, b) => a - b);
+  const idx = Math.min(s.length - 1, Math.max(0, Math.ceil((p / 100) * s.length) - 1));
+  return s[idx];
+}
+
+// ---- playground: localStorage persistence ----------------------------------
+
+const PG_STORAGE_KEY = "lmr-playground";
+
+function savePlaygroundState() {
+  try {
+    const state_ = {
+      msgs: pg.msgs,
+      model: $("pgModel").value,
+      stream: $("pgStream").checked,
+      showReasoning: $("pgShowReasoning").checked,
+      session: $("pgSession").value,
+      system: $("pgSystem").value,
+      temp: $("pgTemp").value,
+      maxTokens: $("pgMaxTokens").value,
+      reasoning: $("pgReasoning").value,
+      topP: $("pgTopP").value,
+      freqPenalty: $("pgFreqPenalty").value,
+      presencePenalty: $("pgPresencePenalty").value,
+      cacheHits: pg.cacheHits,
+      cacheMisses: pg.cacheMisses,
+      advancedOpen: $("pgAdvanced").classList.contains("open"),
+      // Debug panel: capture the last request's DISPLAYED values directly from
+      // the DOM so a reload can restore them verbatim without re-deriving.
+      debug: {
+        backend: $("dbgBackend").textContent,
+        model: $("dbgModel").textContent,
+        stream: $("dbgStream").textContent,
+        latency: $("dbgLatency").innerHTML,
+        ttft: $("dbgTtft") ? $("dbgTtft").textContent : null,
+        tokens: $("dbgTokens").innerHTML,
+        tps: $("dbgTps") ? $("dbgTps").textContent : null,
+        cache: $("dbgCache").textContent,
+        cost: $("dbgCost").textContent,
+        context: $("dbgContext").textContent,
+        raw: $("pgRaw") ? $("pgRaw").textContent : null,
+        lastStart: pg.lastStart || 0,
+        lastUsage: pg.lastUsage || null,
+        lastRaw: pg.lastRaw || null,
+      },
+    };
+    localStorage.setItem(PG_STORAGE_KEY, JSON.stringify(state_));
+  } catch {}
+}
+
+let pgSaveTimer = null;
+// Debounced save: input events fire rapidly; flush at most 300ms after the last one.
+function scheduleSave() {
+  clearTimeout(pgSaveTimer);
+  pgSaveTimer = setTimeout(savePlaygroundState, 300);
+}
+// Flush any pending debounced save when the tab closes.
+window.addEventListener("beforeunload", () => {
+  if (pgSaveTimer) {
+    clearTimeout(pgSaveTimer);
+    savePlaygroundState();
+  }
+});
+
+function loadPlaygroundState() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(PG_STORAGE_KEY));
+    if (!saved) return;
+    if (Array.isArray(saved.msgs)) pg.msgs = saved.msgs;
+    if (saved.model) {
+      const sel = $("pgModel");
+      if (sel) {
+        let found = false;
+        for (const opt of sel.options) { if (opt.value === saved.model) { found = true; break; } }
+        if (found) sel.value = saved.model;
+      }
+    }
+    if (saved.stream != null) $("pgStream").checked = !!saved.stream;
+    if (saved.showReasoning != null) $("pgShowReasoning").checked = !!saved.showReasoning;
+    if (saved.session != null) $("pgSession").value = saved.session;
+    if (saved.system != null) $("pgSystem").value = saved.system;
+    if (saved.temp != null && saved.temp !== "") $("pgTemp").value = saved.temp;
+    if (saved.maxTokens != null && saved.maxTokens !== "") $("pgMaxTokens").value = saved.maxTokens;
+    if (saved.reasoning != null) $("pgReasoning").value = saved.reasoning;
+    if (saved.topP != null && saved.topP !== "") $("pgTopP").value = saved.topP;
+    if (saved.freqPenalty != null && saved.freqPenalty !== "") $("pgFreqPenalty").value = saved.freqPenalty;
+    if (saved.presencePenalty != null && saved.presencePenalty !== "") $("pgPresencePenalty").value = saved.presencePenalty;
+    if (typeof saved.cacheHits === "number") pg.cacheHits = saved.cacheHits;
+    if (typeof saved.cacheMisses === "number") pg.cacheMisses = saved.cacheMisses;
+    if (saved.advancedOpen) $("pgAdvanced").classList.add("open");
+    renderThread();
+    restoreDebugState(saved.debug);
+  } catch {}
+}
+
+// Restore the debug panel's last displayed values after a reload. Latency and
+// tokens were captured as innerHTML (they own the inner ttft/tps spans), every
+// other cell is a plain setDebug; the raw response panel gets its text back.
+function restoreDebugState(debug) {
+  if (!debug || typeof debug !== "object") return;
+  if (debug.backend != null) setDebug("dbgBackend", String(debug.backend), debug.backend === "direct" || debug.backend === "none" ? "err" : "ok");
+  if (debug.model != null) setDebug("dbgModel", String(debug.model));
+  if (debug.stream != null) setDebug("dbgStream", String(debug.stream));
+  if (typeof debug.latency === "string") $("dbgLatency").innerHTML = debug.latency;
+  if (typeof debug.tokens === "string") $("dbgTokens").innerHTML = debug.tokens;
+  if (debug.cache != null) setDebug("dbgCache", String(debug.cache));
+  if (debug.cost != null) setDebug("dbgCost", String(debug.cost));
+  if (debug.context != null) setDebug("dbgContext", String(debug.context));
+  if (debug.raw != null && debug.raw !== "No response yet.") $("pgRaw").textContent = debug.raw;
+  else if (pg.lastRaw) $("pgRaw").textContent = pg.lastRaw;
+  // Keep the runtime fields aligned so applyServerDebugMetrics() can still match
+  // this request against history (e.g. the next poll before any new send).
+  if (typeof debug.lastStart === "number" && debug.lastStart > 0) pg.lastStart = debug.lastStart;
+  if (debug.lastUsage && typeof debug.lastUsage === "object") pg.lastUsage = debug.lastUsage;
+  if (debug.lastRaw && typeof debug.lastRaw === "string") pg.lastRaw = debug.lastRaw;
+}
+
+// ---- playground: prompt templates -------------------------------------------
+
+const TEMPLATES = {
+  review: "Please review this code for bugs, security issues, and code quality problems. Point out concrete issues with line references and suggest fixes:\n\n```\n[paste code here]\n```",
+  bug: "I'm investigating a bug. Here is the symptom and the relevant code:\n\nSymptom: [describe what happens, expected vs actual]\n\nCode:\n```\n[paste code here]\n```\n\nWhat is the most likely root cause, and what is the minimal fix?",
+  refactor: "Suggest refactoring improvements for this code while preserving its observable behavior. Prioritize readability, maintainability, and testability:\n\n```\n[paste code here]\n```",
+  test: "Generate unit tests for the function/module below. Cover normal cases, edge cases, and failure paths. Include arrange/act/assert structure:\n\n```\n[paste code here]\n```",
+  docs: "Write clear documentation for this code: purpose, usage, parameters, return values, and a small example:\n\n```\n[paste code here]\n```",
+};
+
+function renderThread() {
+  const host = $("pgThread");
+  if (pg.msgs.length === 0) {
+    host.innerHTML = '<p class="empty">Send a message to start chatting. Watch which backend serves each request in the debug panel below.</p>';
+    return;
+  }
+  host.innerHTML = pg.msgs.map((m) => {
+    if (m.role === "user") {
+      return '<div class="msg user"><span class="role">You</span>' + esc(m.content) + "</div>";
+    }
+    const reasoning = m.reasoning && $("pgShowReasoning").checked
+      ? '<div class="msg reasoning"><span class="role">Reasoning</span>' + fmtInline(m.reasoning) + "</div>"
+      : "";
+    return reasoning + '<div class="msg assistant"><span class="role">Assistant</span>' + esc(m.content) + "</div>";
+  }).join("");
+  host.scrollTop = host.scrollHeight;
+}
+
+function setDebug(k, v, cls) {
+  const el = $(k);
+  if (!el) return;
+  el.textContent = v;
+  el.classList.remove("ok", "err");
+  if (cls) el.classList.add(cls);
+}
+
+// Latency row shows "total ms / ttft ms ttft"; rebuilds the inner dbgTtft span
+// because textContent would destroy it.
+function setLatencyMetric(totalMs, ttftMs) {
+  $("dbgLatency").innerHTML =
+    esc(totalMs != null ? Math.round(totalMs) + " ms" : "-") +
+    " / <span id=\"dbgTtft\">" +
+    esc(ttftMs != null ? Math.round(ttftMs) + " ms" : "-") +
+    "</span> ttft";
+}
+
+// Tokens row shows "prompt / completion / tps tok/s"; rebuilds the inner dbgTps span.
+function setTokensMetric(pTok, cTok, tps) {
+  const toks = pTok != null ? pTok + " / " + (cTok != null ? cTok : "?") : "-";
+  $("dbgTokens").innerHTML =
+    esc(toks) +
+    " / <span id=\"dbgTps\">" +
+    esc(tps != null ? tps + " tok/s" : "-") +
+    "</span> tps";
+}
+
+function setCostMetric(pTok, cTok) {
+  if (pTok == null) {
+    setDebug("dbgCost", "-");
+    setDebug("dbgContext", "-");
+    return;
+  }
+  // Cost/context derive from the currently selected preset's meta.
+  const modelId = $("pgModel").value;
+  setDebug("dbgCost", fmtCost(calcCost(pTok, cTok, modelId)));
+  setDebug("dbgContext", fmtContext(pTok, cTok, modelId));
+}
+
+function clearDebug() {
+  setDebug("dbgBackend", "-");
+  setDebug("dbgModel", "-");
+  setDebug("dbgStream", "-");
+  setLatencyMetric(null, null);
+  setTokensMetric(null, null, null);
+  setDebug("dbgCache", "-");
+  setDebug("dbgCost", "-");
+  setDebug("dbgContext", "-");
+  $("pgRaw").textContent = "No response yet.";
+}
+
+// Fill TTFT / TPS / cache / token metrics from the router's recorded history
+// entry for the most recent request. The server is authoritative for cache
+// hits, generation time, and exact token counts (which the client may miss in
+// streaming). Falls back to client-measured values when no entry is found.
+// Also accumulates per-conversation cache hit/miss counters and derives cost
+// and context-window usage from the server-reported token counts.
+function applyServerDebugMetrics() {
+  const entries = (state.history && state.history.entries) || [];
+  if (!entries.length) return;
+  const start = pg.lastStart || 0;
+  let best = null;
+  for (const e of entries) {
+    if (!e.t || Math.abs(e.t - start) > 30000) continue;
+    if (!best || e.t > best.t) best = e;
+  }
+  if (!best) return;
+  // The router records the actual model that served the request (routedModel);
+  // fall back to the requested id (best.model) for pre-3layer history entries.
+  setDebug("dbgModel", best.routedModel || best.model || "-");
+  const latencyMs = best.latencyMs != null ? Math.round(best.latencyMs) : pg.lastLatencyMs;
+  const ttft = best.ttftMs != null ? Math.round(best.ttftMs) : pg.lastTTFT;
+  const genMs = best.genMs != null ? best.genMs : null;
+  const pTok = best.promptTokens != null ? best.promptTokens : (pg.lastUsage && pg.lastUsage.prompt_tokens != null ? pg.lastUsage.prompt_tokens : null);
+  const cTok = best.completionTokens != null ? best.completionTokens : (pg.lastUsage && pg.lastUsage.completion_tokens != null ? pg.lastUsage.completion_tokens : null);
+  const cache = best.cacheHit != null ? best.cacheHit : null;
+
+  setLatencyMetric(latencyMs, ttft);
+
+  const tps = cTok != null && genMs > 0 ? Math.round((cTok / (genMs / 1000)) * 10) / 10 : null;
+  setTokensMetric(pTok, cTok, tps);
+
+  // Cumulative cache hit rate over KNOWN outcomes only. The server now reports
+  // cacheHit as tri-state: true (cache hit), false (real miss), null (no cache
+  // signal, e.g. CommandCode) - unknown entries do not count either way.
+  if (cache === true) pg.cacheHits++;
+  else if (cache === false) pg.cacheMisses++;
+  const cacheTotal = pg.cacheHits + pg.cacheMisses;
+  const hitRate = cacheTotal > 0 ? Math.round((pg.cacheHits / cacheTotal) * 100) : 0;
+  setDebug("dbgCache", cacheTotal > 0 ? hitRate + "% hit (" + pg.cacheHits + "/" + cacheTotal + ")" : "n/a", cacheTotal > 0 && hitRate > 50 ? "ok" : "");
+
+  setCostMetric(pTok, cTok);
+
+  // Persist so the cumulative counters survive reloads too.
+  savePlaygroundState();
+}
+
+async function pgSend() {
+  const input = $("pgInput");
+  const text = input.value.trim();
+  if (!text || pg.streaming) return;
+  const model = $("pgModel").value;
+  const stream = $("pgStream").checked;
+  const session = $("pgSession").value.trim();
+  const tempRaw = parseFloat($("pgTemp").value);
+  const temp = Number.isNaN(tempRaw) ? 0.7 : Math.min(2, Math.max(0, tempRaw));
+  const maxTokensRaw = parseInt($("pgMaxTokens").value, 10);
+  const maxTokens = Number.isNaN(maxTokensRaw) ? 1024 : Math.min(32768, Math.max(1, maxTokensRaw));
+  const system = $("pgSystem").value.trim();
+  const reasoning = $("pgReasoning").value;
+  const topPRaw = parseFloat($("pgTopP").value);
+  const freqRaw = parseFloat($("pgFreqPenalty").value);
+  const presRaw = parseFloat($("pgPresencePenalty").value);
+
+  pg.msgs.push({ role: "user", content: text });
+  input.value = "";
+  renderThread();
+
+  const messages = [];
+  if (system) messages.push({ role: "system", content: system });
+  for (const m of pg.msgs) messages.push({ role: m.role, content: m.content });
+
+  const body = { model, stream, messages, temperature: temp, max_tokens: maxTokens };
+  // "off" is sent as thinking disabled (CommandCode rejects reasoning_effort:"off"
+  // with 503; OpenAI-standard thinking:{type:"disabled"} is honored by DeepSeek).
+  if (reasoning === "off") body.thinking = { type: "disabled" };
+  else if (reasoning) body.reasoning_effort = reasoning;
+  if (!Number.isNaN(topPRaw) && topPRaw !== 1) body.top_p = topPRaw;
+  if (!Number.isNaN(freqRaw) && freqRaw !== 0) body.frequency_penalty = freqRaw;
+  if (!Number.isNaN(presRaw) && presRaw !== 0) body.presence_penalty = presRaw;
+
+  const headers = { "content-type": "application/json" };
+  if (session) headers["x-session-affinity"] = session;
+
+  const started = Date.now();
+  pg.lastStart = started;
+  pg.lastTTFT = null;
+  pg.streaming = true;
+  $("pgSend").disabled = true;
+  $("pgInput").disabled = true;
+  setDebug("dbgStream", stream ? "SSE" : "JSON");
+
+  // Assistant placeholder appended now; content fills in as chunks arrive.
+  const idx = pg.msgs.length;
+  pg.msgs.push({ role: "assistant", content: "", reasoning: "" });
+  renderThread();
+
+  try {
+    const resp = await fetch(chatUrl(), { method: "POST", headers, body: JSON.stringify(body) });
+    const backend = resp.headers.get("x-router-backend") || "unknown";
+    pg.lastBackend = backend;
+    setDebug("dbgBackend", backend, backend === "direct" || backend === "none" ? "err" : "ok");
+
+    if (!resp.ok) {
+      const errText = await resp.text();
+      pg.msgs[idx].content = "HTTP " + resp.status + "\n" + errText.slice(0, 2000);
+      pg.lastRaw = "HTTP " + resp.status + "\n" + errText;
+      $("pgRaw").textContent = pg.lastRaw;
+      pg.lastLatencyMs = Date.now() - started;
+      setLatencyMetric(pg.lastLatencyMs, null);
+      renderThread();
+      return;
+    }
+
+    if (stream) {
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      let usage = null;
+      let reasoning = "";
+      let sawDone = false;
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          const lines = buf.split("\n");
+          buf = lines.pop();
+          for (const line of lines) {
+            const t = line.trim();
+            if (!t.startsWith("data:")) continue;
+            const payload = t.slice(5).trim();
+            if (payload === "[DONE]") { sawDone = true; continue; }
+            let chunk;
+            try { chunk = JSON.parse(payload); } catch { continue; }
+            const delta = chunk.choices && chunk.choices[0] && chunk.choices[0].delta;
+            if (delta) {
+              if (delta.content) {
+                if (pg.lastTTFT == null) {
+                  pg.lastTTFT = Date.now() - started;
+                  setLatencyMetric(Date.now() - started, pg.lastTTFT);
+                }
+                pg.msgs[idx].content += delta.content;
+              }
+              // Backends differ on the reasoning key: CommandCode sends
+              // delta.reasoning (+ reasoning_details), DeepSeek/OpenAI-native
+              // send delta.reasoning_content. Read both so reasoning always
+              // renders regardless of which backend served the request.
+              const rKey = delta.reasoning != null ? delta.reasoning : delta.reasoning_content;
+              if (rKey) { reasoning += rKey; pg.msgs[idx].reasoning = reasoning; }
+            }
+            if (chunk.usage) usage = chunk.usage;
+          }
+          pg.lastLatencyMs = Date.now() - started;
+          setLatencyMetric(Date.now() - started, pg.lastTTFT);
+          renderThread();
+        }
+      } catch (e) {
+        // Mid-stream failure: keep the partial output, mark it clearly.
+        if (!sawDone) pg.msgs[idx].content += "\n\n[stream interrupted: " + e + "]";
+      }
+      if (!sawDone && pg.msgs[idx].content && !/\[stream interrupted/.test(pg.msgs[idx].content)) {
+        pg.msgs[idx].content += "\n\n[stream ended without [DONE] - possibly truncated]";
+      }
+      pg.lastUsage = usage;
+      if (usage && usage.prompt_tokens != null) {
+        setTokensMetric(usage.prompt_tokens, usage.completion_tokens != null ? usage.completion_tokens : null, null);
+        setCostMetric(usage.prompt_tokens, usage.completion_tokens);
+      } else {
+        setTokensMetric(null, null, null);
+      }
+      if (pg.lastTTFT == null) setLatencyMetric(Date.now() - started, null);
+    } else {
+      const data = await resp.json();
+      pg.msgs[idx].content = data.choices && data.choices[0] && data.choices[0].message ? data.choices[0].message.content : JSON.stringify(data);
+      if (data.choices && data.choices[0] && data.choices[0].message) {
+        const msg = data.choices[0].message;
+        // Same dual-key handling as the stream branch: CommandCode uses
+        // message.reasoning, DeepSeek-native uses message.reasoning_content.
+        const r = msg.reasoning != null ? msg.reasoning : msg.reasoning_content;
+        if (r) pg.msgs[idx].reasoning = r;
+      }
+      pg.lastUsage = data.usage || null;
+      pg.lastLatencyMs = Date.now() - started;
+      setLatencyMetric(pg.lastLatencyMs, null); // TTFT not separately measurable for JSON; server metrics fill in after poll
+      if (pg.lastUsage && pg.lastUsage.prompt_tokens != null) {
+        setTokensMetric(pg.lastUsage.prompt_tokens, pg.lastUsage.completion_tokens != null ? pg.lastUsage.completion_tokens : null, null);
+        setCostMetric(pg.lastUsage.prompt_tokens, pg.lastUsage.completion_tokens);
+      } else {
+        setTokensMetric(null, null, null);
+      }
+      pg.lastRaw = JSON.stringify(data, null, 2);
+      $("pgRaw").textContent = pg.lastRaw;
+      renderThread();
+    }
+  } catch (e) {
+    pg.msgs[idx].content = "Request failed: " + e;
+    pg.lastLatencyMs = Date.now() - started;
+    setLatencyMetric(pg.lastLatencyMs, null);
+    renderThread();
+  } finally {
+    pg.streaming = false;
+    $("pgSend").disabled = false;
+    $("pgInput").disabled = false;
+    $("pgInput").focus();
+  }
+  await poll();
+  applyServerDebugMetrics();
+  savePlaygroundState();
+}
+
+$("pgSend").addEventListener("click", pgSend);
+// Enter (with or without Ctrl) sends; Shift+Enter inserts a newline.
+$("pgInput").addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter" && !ev.shiftKey) {
+    ev.preventDefault();
+    pgSend();
+  }
+});
+
+function pgClear() {
+  pg.msgs = [];
+  pg.cacheHits = 0;
+  pg.cacheMisses = 0;
+  clearDebug();
+  renderThread();
+  savePlaygroundState();
+}
+$("pgClear").addEventListener("click", pgClear);
+
+$("pgAdvancedToggle").addEventListener("click", () => {
+  $("pgAdvanced").classList.toggle("open");
+  savePlaygroundState();
+});
+$("pgShowReasoning").addEventListener("change", () => { renderThread(); scheduleSave(); });
+
+// Persist playground settings whenever any control changes (debounced).
+["pgModel", "pgStream", "pgShowReasoning", "pgSession", "pgSystem", "pgTemp", "pgMaxTokens", "pgReasoning", "pgTopP", "pgFreqPenalty", "pgPresencePenalty"].forEach((id) => {
+  const el = $(id);
+  if (!el) return;
+  el.addEventListener(el.type === "checkbox" ? "change" : "input", scheduleSave);
+});
+
+// ---- playground: prompt templates -------------------------------------------
+
+$("pgTemplate").addEventListener("change", () => {
+  const tpl = TEMPLATES[$("pgTemplate").value];
+  if (!tpl) return;
+  const input = $("pgInput");
+  input.value = tpl;
+  input.focus();
+});
+
+// ---- playground: model comparison ---------------------------------------------
+
+function populateCompareModels() {
+  const host = $("pgCompareModels");
+  if (!host) return;
+  const prev = new Set(Array.from(host.querySelectorAll("input:checked")).map((cb) => cb.value));
+  host.innerHTML = "";
+  const models = state.cfg && state.cfg.presets ? Object.keys(state.cfg.presets) : [];
+  for (const m of models) {
+    const lbl = document.createElement("label");
+    lbl.className = "check";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.value = m;
+    cb.checked = prev.has(m) || prev.size === 0;
+    lbl.appendChild(cb);
+    lbl.appendChild(document.createTextNode(m));
+    host.appendChild(lbl);
+  }
+}
+
+$("pgCompareToggle").addEventListener("click", () => {
+  $("pgComparePanel").classList.toggle("open");
+  if ($("pgComparePanel").classList.contains("open") && !$("pgCompareModels").children.length) populateCompareModels();
+});
+
+$("pgCompareRun").addEventListener("click", async () => {
+  const input = $("pgInput");
+  const text = input.value.trim() || (pg.msgs.length ? pg.msgs[pg.msgs.length - 1].content : "");
+  if (!text || pg.compareRunning) return;
+  const selected = Array.from($("pgCompareModels").querySelectorAll("input:checked")).map((cb) => cb.value);
+  if (!selected.length) return;
+  const results = $("pgCompareResults");
+  pg.compareRunning = true;
+  $("pgCompareRun").disabled = true;
+  results.innerHTML = '<p class="empty">Running comparison across ' + selected.length + " model(s)...</p>";
+
+  const system = $("pgSystem").value.trim();
+  const tempRaw = parseFloat($("pgTemp").value);
+  const temp = Number.isNaN(tempRaw) ? 0.7 : Math.min(2, Math.max(0, tempRaw));
+  const maxTokensRaw = parseInt($("pgMaxTokens").value, 10);
+  const maxTokens = Number.isNaN(maxTokensRaw) ? 1024 : Math.min(32768, Math.max(1, maxTokensRaw));
+  const reasoning = $("pgReasoning").value;
+  const session = $("pgSession").value.trim();
+
+  const out = await Promise.all(selected.map(async (model) => {
+    const messages = [];
+    if (system) messages.push({ role: "system", content: system });
+    messages.push({ role: "user", content: text });
+    const body = { model, stream: false, messages, temperature: temp, max_tokens: maxTokens };
+    if (reasoning === "off") body.thinking = { type: "disabled" };
+    else if (reasoning) body.reasoning_effort = reasoning;
+    const headers = { "content-type": "application/json" };
+    if (session) headers["x-session-affinity"] = session;
+    const t0 = Date.now();
+    try {
+      const resp = await fetch(chatUrl(), { method: "POST", headers, body: JSON.stringify(body) });
+      const backend = resp.headers.get("x-router-backend") || "unknown";
+      if (!resp.ok) {
+        const errText = await resp.text();
+        return { model, backend, error: "HTTP " + resp.status + "\n" + errText.slice(0, 500), latencyMs: Date.now() - t0 };
+      }
+      const data = await resp.json();
+      const content = data.choices && data.choices[0] && data.choices[0].message ? data.choices[0].message.content : JSON.stringify(data);
+      const usage = data.usage || {};
+      const pTok = usage.prompt_tokens != null ? usage.prompt_tokens : null;
+      const cTok = usage.completion_tokens != null ? usage.completion_tokens : null;
+      return { model, backend, content, latencyMs: Date.now() - t0, pTok, cTok };
+    } catch (e) {
+      return { model, backend: "?", error: String(e), latencyMs: Date.now() - t0 };
+    }
+  }));
+  results.innerHTML = out.map((r) => {
+    const bodyHtml = r.error
+      ? '<div class="compare-err">' + esc(r.error) + "</div>"
+      : '<div class="compare-body">' + fmtInline(r.content || "(empty response)") + "</div>";
+    return (
+      '<div class="compare-card">' +
+      "<h4>" + esc(r.model) + "</h4>" +
+      '<div class="compare-meta">' +
+      "<span>backend <b>" + esc(r.backend) + "</b></span>" +
+      "<span>latency <b>" + Math.round(r.latencyMs) + "ms</b></span>" +
+      (r.pTok != null ? "<span>tokens <b>" + r.pTok + "/" + (r.cTok != null ? r.cTok : "?") + "</b></span>" : "") +
+      (r.pTok != null ? "<span>cost <b>" + fmtCost(calcCost(r.pTok, r.cTok, r.model)) + "</b></span>" : "") +
+      "</div>" + bodyHtml + "</div>"
+    );
+  }).join("");
+  $("pgCompareRun").disabled = false;
+  pg.compareRunning = false;
+});
+
+// ---- playground: keyboard shortcuts --------------------------------------------
+
+document.addEventListener("keydown", (ev) => {
+  if (!ev.ctrlKey && !ev.metaKey) return;
+  const tag = (document.activeElement && document.activeElement.tagName) || "";
+  const inField = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
+  if ((ev.key === "l" || ev.key === "L")) {
+    if (inField) return; // never hijack while editing a field
+    ev.preventDefault();
+    pgClear();
+  }
+  if ((ev.key === "c" || ev.key === "C")) {
+    if (inField) return; // let native copy work in inputs
+    const sel = window.getSelection && window.getSelection().toString();
+    if (sel) return; // let native copy work when text is selected
+    ev.preventDefault();
+    exportTranscript("text");
+  }
+});
+
+// ---- playground: export --------------------------------------------------------
+
+function pgTranscriptText() {
+  const lines = pg.msgs.map((m) => {
+    if (m.role === "user") return "You: " + m.content;
+    const r = m.reasoning ? "\n[reasoning]\n" + m.reasoning + "\n[/reasoning]" : "";
+    return "Assistant:" + r + "\n" + m.content;
+  });
+  const meta = "Local Model Router conversation - " + new Date().toISOString() + "\nModel: " + ($("pgModel").value || "-") + "\n\n";
+  return meta + lines.join("\n\n");
+}
+
+function pgTranscriptJson() {
+  return JSON.stringify({
+    exportedAt: new Date().toISOString(),
+    model: $("pgModel").value || null,
+    messages: pg.msgs.map((m) => ({ role: m.role, content: m.content, reasoning: m.reasoning || null })),
+  }, null, 2);
+}
+
+async function copyToClipboard(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    // Fallback for non-secure contexts / older browsers.
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    let ok = false;
+    try { ok = document.execCommand("copy"); } catch {}
+    ta.remove();
+    return ok;
+  }
+}
+
+async function exportTranscript(kind) {
+  const text = kind === "json" ? pgTranscriptJson() : pgTranscriptText();
+  const btn = kind === "json" ? $("pgExportJson") : $("pgExportText");
+  const ok = await copyToClipboard(text);
+  const old = btn.innerHTML;
+  btn.innerHTML = (ok ? ICONS.check : ICONS.warn) + (ok ? " Copied!" : " Failed");
+  setTimeout(() => { btn.innerHTML = old; }, 1200);
+  if (!ok) $("pgRaw").textContent = text; // fallback: show the transcript in the raw panel
+}
+
+$("pgExportText").addEventListener("click", () => exportTranscript("text"));
+$("pgExportJson").addEventListener("click", () => exportTranscript("json"));
+
+function pgTranscriptMarkdown() {
+  const lines = pg.msgs.map((m) => {
+    if (m.role === "user") return "**You:**\n\n" + m.content;
+    const r = m.reasoning ? "\n\n<details><summary>Reasoning</summary>\n\n" + m.reasoning + "\n\n</details>" : "";
+    return "**Assistant:**" + r + "\n\n" + m.content;
+  });
+  const meta = "# Local Model Router conversation\n\n" +
+    "- Date: " + new Date().toISOString() + "\n" +
+    "- Model: " + ($("pgModel").value || "-") + "\n" +
+    "- Session: " + ($("pgSession").value || "-") + "\n\n---\n\n";
+  return meta + lines.join("\n\n---\n\n");
+}
+
+$("pgDownloadMd").addEventListener("click", () => {
+  if (!pg.msgs.length) return;
+  const md = pgTranscriptMarkdown();
+  const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "lmr-conversation-" + new Date().toISOString().replace(/[:.]/g, "-") + ".md";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+});
+
+// ---- tabs ---------------------------------------------------------------------
+
+document.querySelectorAll(".tab").forEach((tab) => {
+  tab.addEventListener("click", () => {
+    document.querySelectorAll(".tab").forEach((t) => {
+      t.classList.toggle("active", t === tab);
+      t.setAttribute("aria-selected", t === tab ? "true" : "false");
+    });
+    document.querySelectorAll(".view").forEach((v) => {
+      v.classList.toggle("active", v.id === "view-" + tab.dataset.view);
+    });
+  });
+});
+
+// ---- wiring: config viewer + countdown ticker + poll ---------------------------
+
+$("configDetails").addEventListener("toggle", () => {
+  if ($("configDetails").open) loadConfig();
+});
+
+setInterval(() => {
+  document.querySelectorAll(".countdown").forEach((el) => {
+    const until = parseInt(el.dataset.next, 10);
+    if (until) el.textContent = fmtCountdown(until);
+  });
+  // Live uptime without re-rendering the stats/header sections (keeps the
+  // "popping" fix intact — the sections only redraw on real data changes).
+  const u = state.stats && state.stats.uptimeMs;
+  if (u != null) {
+    const headerUptime = $("uptime");
+    if (headerUptime) headerUptime.textContent = fmtUptime(u);
+    const statsUptime = document.querySelector("[data-stats-uptime]");
+    if (statsUptime) statsUptime.textContent = fmtUptime(u);
+  }
+}, 1000);
+
+let pollTimer = null;
+function syncPollTimer() {
+  clearInterval(pollTimer);
+  if ($("autoRefresh").checked) pollTimer = setInterval(poll, 2000);
+}
+$("autoRefresh").addEventListener("change", () => {
+  syncPollTimer();
+  if ($("autoRefresh").checked) poll();
+});
+
+decorate();
+loadConfig();
+poll();
+syncPollTimer();
+</script>
+</body>
+</html>

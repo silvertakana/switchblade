@@ -1,0 +1,135 @@
+{
+  "port": 8787,
+  "prefix": "/v1",
+  "masterKeyEnv": null,
+  "backends": [
+    { "id": "go-primary", "baseURL": "https://opencode.ai/zen/go/v1",
+      "apiKeyEnv": "OPENCODE_GO_KEY" },
+    { "id": "go-alt", "baseURL": "https://opencode.ai/zen/go/v1",
+      "apiKeyEnv": "OPENCODE_GO_ALT_KEY" },
+    { "id": "direct", "baseURL": "https://api.deepseek.com/v1",
+      "apiKeyEnv": "DEEPSEEK_API_KEY", "translateDeveloperRole": true },
+    { "id": "commandcode", "baseURL": "https://api.commandcode.ai/provider/v1",
+      "apiKeyEnv": "COMMANDCODE_API_KEY", "translateDeveloperRole": true,
+      "timeoutMs": 60000 },
+    { "id": "zai", "baseURL": "https://api.z.ai/api/coding/paas/v4",
+      "apiKeyEnv": "ZAI_API_KEY" }
+  ],
+  "models": {
+    "deepseek-v4-flash": {
+      "providers": [
+        { "backend": "go-primary", "upstream": "deepseek-v4-flash" },
+        { "backend": "go-alt", "upstream": "deepseek-v4-flash" },
+        { "backend": "commandcode", "upstream": "deepseek/deepseek-v4-flash" },
+        { "backend": "direct", "upstream": "deepseek-v4-flash" }
+      ],
+      "affinityPool": 3,
+      "meta": {
+        "label": "DeepSeek V4 Flash",
+        "contextWindow": 128000,
+        "pricing": { "inputPerM": 0.18, "outputPerM": 0.87 }
+      }
+    },
+    "deepseek-v4-flash-direct": {
+      "providers": [
+        { "backend": "direct", "upstream": "deepseek-v4-flash" }
+      ],
+      "affinityPool": 1,
+      "meta": {
+        "label": "DeepSeek V4 Flash",
+        "contextWindow": 128000,
+        "pricing": { "inputPerM": 0.18, "outputPerM": 0.87 }
+      }
+    },
+    "glm-5.3": {
+      "providers": [
+        { "backend": "zai", "upstream": "glm-5.3" },
+        { "backend": "commandcode", "upstream": "zai-org/GLM-5.3" }
+      ],
+      "affinityPool": 1,
+      "params": { "reasoning_effort": "medium" },
+      "meta": {
+        "label": "GLM 5.3",
+        "contextWindow": 1000000,
+        "pricing": { "inputPerM": 1.40, "outputPerM": 4.40 }
+      }
+    },
+    "deepseek-v4-pro": {
+      "providers": [
+        { "backend": "commandcode", "upstream": "deepseek/deepseek-v4-pro" },
+        { "backend": "go-primary", "upstream": "deepseek-v4-pro" },
+        { "backend": "go-alt", "upstream": "deepseek-v4-pro" },
+        { "backend": "direct", "upstream": "deepseek-v4-pro" }
+      ],
+      "affinityPool": 3,
+      "meta": {
+        "label": "DeepSeek V4 Pro",
+        "contextWindow": 1000000,
+        "pricing": { "inputPerM": 0.66, "outputPerM": 1.98 }
+      }
+    },
+    "mimo-v2.5-pro": {
+      "providers": [
+        { "backend": "commandcode", "upstream": "xiaomi/mimo-v2.5-pro" },
+        { "backend": "go-primary", "upstream": "mimo-v2.5-pro" },
+        { "backend": "go-alt", "upstream": "mimo-v2.5-pro" }
+      ],
+      "affinityPool": 3,
+      "meta": {
+        "label": "MiMo V2.5 Pro",
+        "contextWindow": 1000000,
+        "pricing": { "inputPerM": 0.435, "outputPerM": 0.87 }
+      }
+    },
+    "laguna-s-2.1-free": {
+      "providers": [
+        { "backend": "commandcode", "upstream": "poolside/laguna-s-2.1-free" }
+      ],
+      "affinityPool": 1,
+      "meta": {
+        "label": "Laguna S 2.1 Free",
+        "contextWindow": 256000,
+        "pricing": { "inputPerM": 0, "outputPerM": 0 }
+      }
+    }
+  },
+  "presets": {
+    "deepseek-v4-flash": {
+      "strategy": "affinity",
+      "models": ["deepseek-v4-flash"]
+    },
+    "deepseek-v4-flash-alt": {
+      "strategy": "affinity",
+      "models": ["deepseek-v4-flash"]
+    },
+    "deepseek-v4-flash-direct": {
+      "strategy": "failover",
+      "models": ["deepseek-v4-flash-direct"]
+    },
+    "glm-5.3": {
+      "strategy": "failover",
+      "models": ["glm-5.3"]
+    },
+    "deepseek-v4-pro": {
+      "strategy": "affinity",
+      "models": ["deepseek-v4-pro"]
+    },
+    "mimo-v2.5-pro": {
+      "strategy": "affinity",
+      "models": ["mimo-v2.5-pro"]
+    },
+    "laguna-s-2.1-free": {
+      "strategy": "failover",
+      "models": ["laguna-s-2.1-free"]
+    }
+  },
+  "backoff": {
+    "rateLimitBaseMs": 30000,
+    "rateLimitMaxMs": 600000,
+    "serverBaseMs": 30000,
+    "serverMaxMs": 300000,
+    "authBaseMs": 60000,
+    "authMaxMs": 1800000,
+    "weeklyDefaultMs": 604800000
+  }
+}

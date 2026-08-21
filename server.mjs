@@ -1,0 +1,1114 @@
+// local-model-router server.mjs
+// Zero-dependency Node 25 router that replaces homelab LiteLLM for the
+// deepseek-v4-flash family: two OpenCode Go accounts load-balanced by
+// session-affinity hashing, with a DeepSeek direct fallback, per-backend
+// health tracking and exponential backoff. Routing goes through three layers:
+// backends -> models -> presets. Backends are raw upstream accounts (no model
+// binding; a legacy `model` field remains legal as a default-upstream source).
+// Models bind a logical id to one or more providers (backend + upstream +
+// optional per-provider dialect). Presets are routing policies over models
+// (affinity / failover / weighted strategies). Legacy configs (old `models`
+// with `backends`, and DESIGN-PRESETS-era presets with `members`) are
+// synthesized into the new shape at load. Manual cools are sticky: they never
+// participate in the all-cooling fallback and a success never clears them.
+
+import http from "node:http";
+import { readFileSync, watch as watchF, appendFileSync } from "node:fs";
+import { readFile as readFileP } from "node:fs/promises";
+import { Readable, Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import { dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import crypto from "node:crypto";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const CONFIG_PATH = process.env.ROUTER_CONFIG || join(__dirname, "config.json");
+const ENV_PATH = process.env.ROUTER_ENV || join(__dirname, ".env");
+
+// ---- config + env loading ----------------------------------------------------
+
+function parseEnv(text) {
+  const out = {};
+  for (const line of text.split(/\r?\n/)) {
+    const t = line.trim();
+    if (!t || t.startsWith("#")) continue;
+    const eq = t.indexOf("=");
+    if (eq < 0) continue;
+    const k = t.slice(0, eq).trim();
+    let v = t.slice(eq + 1).trim();
+    if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
+      v = v.slice(1, -1);
+    }
+    if (k) out[k] = v;
+  }
+  return out;
+}
+
+function loadEnv() {
+  try {
+    const raw = readFileSync(ENV_PATH, "utf8");
+    const parsed = parseEnv(raw);
+    // Only set env vars not already present so a real shell env wins.
+    for (const [k, v] of Object.entries(parsed)) {
+      if (process.env[k] === undefined) process.env[k] = v;
+    }
+  } catch {
+    // no .env file -> rely on real environment
+  }
+}
+
+function mask(key) {
+  if (!key) return "";
+  return key.length > 14 ? key.slice(0, 4) + "..." + key.slice(-4) : "(secret)";
+}
+
+// ---- health registry ---------------------------------------------------------
+
+const health = new Map(); // backendId -> {state, nextAvailableAt, fails, backoffMs, lastError}
+
+function backoffFor(kind, cfg, fails) {
+  const bp = cfg.backoff;
+  const base = bp[kind + "BaseMs"] ?? 30000;
+  const max = bp[kind + "MaxMs"] ?? 300000;
+  return Math.min(base * 2 ** (fails - 1), max);
+}
+
+function markHealthy(id) {
+  health.set(id, { state: "healthy", nextAvailableAt: 0, fails: 0, backoffMs: 0, lastError: null });
+}
+
+function ensureBackends(cfg) {
+  for (const b of cfg.backends) {
+    if (!health.has(b.id)) markHealthy(b.id);
+  }
+}
+
+// Classify an upstream failure into a backoff "kind".
+function classify(status, bodyText) {
+  if (status === 429) {
+    if (/GoUsageLimitError/i.test(bodyText || "")) return "weekly";
+    return "rate";
+  }
+  if (status === 401 || status === 403) return "auth";
+  if (status >= 500) return "server";
+  if (status === 0) return "server"; // network error
+  if (status === 400 || status === 422) return "client"; // our payload bug, not backend health
+  return "server";
+}
+
+function markFailure(cfg, id, status, bodyText) {
+  const h = health.get(id) || { state: "healthy", fails: 0, backoffMs: 0 };
+  const kind = classify(status, bodyText);
+  if (kind === "client") {
+    // Client-side payload error: the backend is fine; do not cool it down.
+    // Record the last error for visibility but keep the backend healthy.
+    h.lastError = { status, kind, body: (bodyText || "").slice(0, 300) };
+    health.set(id, h);
+    return;
+  }
+  h.fails = (h.fails || 0) + 1;
+  let nextMs;
+  if (kind === "weekly") {
+    // Parse "Resets in N days" if present, else full week.
+    const m = /resets in (\d+)\s+day/i.exec(bodyText || "");
+    const days = m ? parseInt(m[1], 10) : 7;
+    nextMs = cfg.backoff.weeklyDefaultMs || days * 24 * 60 * 60 * 1000;
+    h.fails = 100; // effectively pinned until reset
+  } else {
+    h.backoffMs = backoffFor(kind, cfg, h.fails);
+    nextMs = h.backoffMs;
+  }
+  h.state = "cooling";
+  h.nextAvailableAt = Date.now() + nextMs;
+  h.lastError = { status, kind, body: (bodyText || "").slice(0, 300) };
+  health.set(id, h);
+}
+
+function markSuccess(id) {
+  const h = health.get(id);
+  // A manual cool is a user decision: a success must NEVER clear it. Only the
+  // Uncool button (or expiry of a timed manual cool) restores the backend.
+  if (h && h.state === "cooling" && h.lastError && h.lastError.kind === "manual") return;
+  markHealthy(id);
+}
+
+function resetAllHealth() {
+  for (const id of health.keys()) markHealthy(id);
+}
+
+// ---- history + stats ----------------------------------------------------------
+
+const HISTORY_CAP = 500;
+const HISTORY = []; // ring buffer (newest at tail): {t, model, backend, stream, status, latencyMs, ttftMs, promptTokens, completionTokens, cacheHit, genMs, session}
+const STATS = {
+  since: Date.now(),
+  total: 0,
+  byBackend: {}, // backendId -> {requests, ok, errors, latencySumMs, latencyMaxMs}
+  byModel: {}, // modelId -> count
+};
+const startedAt = Date.now();
+// JSONL history lands next to the config so tests write into their temp dir.
+const historyPath = process.env.ROUTER_HISTORY || join(dirname(CONFIG_PATH), "router-history.jsonl");
+
+function recordHistory(entry) {
+  HISTORY.push(entry);
+  if (HISTORY.length > HISTORY_CAP) HISTORY.shift();
+  try {
+    appendFileSync(historyPath, JSON.stringify(entry) + "\n");
+  } catch {
+    // Logging must never crash the router.
+  }
+}
+
+// Canonical history entry shape with metric defaults, so every row (success
+// or failure) carries the same fields for the UI. Backward compatible: the
+// original fields (t, model, backend, stream, status, latencyMs, session)
+// keep their exact semantics.
+function newHistoryEntry(f) {
+  return {
+    t: f.t ?? Date.now(),
+    model: f.model,
+    backend: f.backend,
+    stream: !!f.stream,
+    status: f.status,
+    latencyMs: f.latencyMs ?? 0,
+    ttftMs: f.ttftMs ?? 0,                       // time to first upstream response (== latencyMs on success)
+    promptTokens: f.promptTokens ?? 0,           // prompt usage tokens (0 if upstream did not report)
+    completionTokens: f.completionTokens ?? 0,   // completion usage tokens (0 if upstream did not report)
+    cacheHit: f.cacheHit,                          // tri-state: true (header/usage hit), false (miss reported), null (unknown - no signal)
+    genMs: f.genMs ?? 0,                         // generation time: stream duration, or total - ttft for non-stream
+    tps: f.tps ?? 0,                             // completion tokens per second (derived)
+    session: f.session,
+    routedModel: f.routedModel ?? null,          // resolved model id (success: serving attempt; failure: first candidate; null: none)
+  };
+}
+
+function recordStats(entry) {
+  STATS.total++;
+  const b = STATS.byBackend[entry.backend] || {
+    requests: 0, ok: 0, errors: 0, latencySumMs: 0, latencyMaxMs: 0,
+    promptTokensSum: 0, completionTokensSum: 0, cacheHits: 0, ttftSumMs: 0,
+  };
+  b.requests++;
+  if (entry.status >= 200 && entry.status < 400) b.ok++;
+  else b.errors++;
+  b.latencySumMs += entry.latencyMs || 0;
+  if (entry.latencyMs > b.latencyMaxMs) b.latencyMaxMs = entry.latencyMs;
+  if (entry.ttftMs != null) b.ttftSumMs += entry.ttftMs;
+  if (entry.promptTokens) b.promptTokensSum += entry.promptTokens;
+  if (entry.completionTokens) b.completionTokensSum += entry.completionTokens;
+  if (entry.cacheHit) b.cacheHits++;
+  STATS.byBackend[entry.backend] = b;
+  STATS.byModel[entry.model] = (STATS.byModel[entry.model] || 0) + 1;
+}
+
+// ---- config normalization ---------------------------------------------------
+
+// Normalize the three-layer config at load (initial + hot-reload), in place.
+// Detection is PER ENTRY so single-era configs and accidental mixes both work:
+// - `models[id]` with `providers` (new shape) is validated.
+// - `models[id]` with `backends` (pre-presets era, path A) is synthesized into
+//   providers `{backend, upstream: <that backend's model>}`.
+// - `presets[id]` with `models` (new shape) is validated.
+// - `presets[id]` with `members` (DESIGN-PRESETS era, path B) synthesizes ONE
+//   model per preset (providers = members in order with per-provider upstream)
+//   and rewrites the preset to `{strategy, models: [{model, weight: 1}]}`.
+// Validation is lenient (warn + drop, never crash the router). Derived
+// read-only `preset.members` (flattened provider backends, first occurrence,
+// deduped) keeps the UI/tests working across the phased rollout. The
+// normalized form lives only in memory; never written back to disk.
+const collisionWarned = new Set(); // model id == preset id warns once per process
+
+function normalizeConfig(cfg) {
+  if (!cfg || typeof cfg !== "object") cfg = {};
+  const backendById = new Map((cfg.backends || []).map((b) => [b.id, b]));
+  if (!cfg.models || typeof cfg.models !== "object") cfg.models = {};
+  if (!cfg.presets || typeof cfg.presets !== "object") cfg.presets = {};
+
+  const warnOnce = (set, key, msg) => {
+    if (set.has(key)) return;
+    set.add(key);
+    console.warn(msg);
+  };
+
+  // ---- 1. models map -----------------------------------------------------
+  const legacySynthesized = new Set(); // path A model ids (need presets later)
+  for (const [id, m] of Object.entries(cfg.models)) {
+    if (!m || typeof m !== "object") {
+      console.warn(`config warning: model '${id}': invalid entry dropped`);
+      delete cfg.models[id];
+      continue;
+    }
+    if (Array.isArray(m.providers)) {
+      // NEW shape: validate each provider; keep optional dialect fields.
+      const valid = [];
+      for (const pr of m.providers) {
+        if (!pr || typeof pr !== "object" || typeof pr.backend !== "string") {
+          console.warn(`config warning: model '${id}': provider without backend id dropped`);
+          continue;
+        }
+        const b = backendById.get(pr.backend);
+        if (!b) {
+          console.warn(`config warning: model '${id}': provider references unknown backend '${pr.backend}', dropped`);
+          continue;
+        }
+        const upstream = pr.upstream ?? b.model;
+        if (!upstream) {
+          console.warn(`config warning: model '${id}': provider '${pr.backend}' has no resolvable upstream, dropped`);
+          continue;
+        }
+        valid.push({ ...pr, upstream });
+      }
+      m.providers = valid;
+    } else if (Array.isArray(m.backends)) {
+      // path A: pre-presets era, `{backends: [id...], affinityPool}`.
+      const valid = [];
+      for (const bid of m.backends) {
+        const b = typeof bid === "string" ? backendById.get(bid) : null;
+        if (!b) {
+          console.warn(`config warning: model '${id}': unknown backend '${bid}' dropped`);
+          continue;
+        }
+        if (!b.model) {
+          console.warn(`config warning: model '${id}': backend '${bid}' has no model (upstream), dropped`);
+          continue;
+        }
+        valid.push({ backend: bid, upstream: b.model });
+      }
+      m.providers = valid;
+      delete m.backends;
+      legacySynthesized.add(id);
+    } else {
+      console.warn(`config warning: model '${id}': no providers/backends, entry dropped`);
+      delete cfg.models[id];
+      continue;
+    }
+    if ("params" in m && (m.params === null || typeof m.params !== "object")) {
+      console.warn(`config warning: model '${id}': params must be an object, ignored`);
+      delete m.params;
+    }
+  }
+
+  // ---- 2. presets map -----------------------------------------------------
+  for (const [id, p] of Object.entries(cfg.presets)) {
+    if (!p || typeof p !== "object") {
+      console.warn(`config warning: preset '${id}': invalid entry dropped`);
+      delete cfg.presets[id];
+      continue;
+    }
+    if (Array.isArray(p.models)) {
+      // NEW shape: normalize model refs to {model, weight} objects.
+      const refs = [];
+      for (const ref of p.models) {
+        let mref = null;
+        let weight = 1;
+        if (typeof ref === "string") {
+          mref = ref;
+        } else if (ref && typeof ref === "object" && typeof ref.model === "string") {
+          mref = ref.model;
+          weight = typeof ref.weight === "number" && ref.weight > 0 ? ref.weight : 1;
+        } else {
+          console.warn(`config warning: preset '${id}': invalid model entry dropped`);
+          continue;
+        }
+        if (!cfg.models[mref]) {
+          console.warn(`config warning: preset '${id}': dropping unknown model '${mref}'`);
+          continue;
+        }
+        refs.push({ model: mref, weight });
+      }
+      p.models = refs;
+      if (p.strategy !== "affinity" && p.strategy !== "failover" && p.strategy !== "weighted") {
+        console.warn(`config warning: preset '${id}': unknown strategy '${p.strategy}', defaulting to affinity`);
+        p.strategy = "affinity";
+      }
+      if ("params" in p && (p.params === null || typeof p.params !== "object")) {
+        console.warn(`config warning: preset '${id}': params must be an object, ignored`);
+        delete p.params;
+      }
+      continue;
+    }
+    if (Array.isArray(p.members)) {
+      // path B: DESIGN-PRESETS era. ONE model per preset; providers keep their
+      // own per-provider upstream (mixed upstreams are exactly the target shape).
+      const valid = [];
+      for (const mem of p.members) {
+        const bid = typeof mem === "string" ? mem : mem && typeof mem.backend === "string" ? mem.backend : null;
+        const b = bid ? backendById.get(bid) : null;
+        if (!b) {
+          console.warn(`config warning: preset '${id}': dropping unknown backend member '${bid || mem}'`);
+          continue;
+        }
+        if (!b.model) {
+          console.warn(`config warning: preset '${id}': backend '${bid}' has no model (upstream), dropped`);
+          continue;
+        }
+        valid.push({ backend: bid, upstream: b.model });
+      }
+      // Model id = the preset id; reuse an existing model only if its provider
+      // backend-id set equals the synthesized set (order-insensitive).
+      let modelId = id;
+      const existing = cfg.models[modelId];
+      if (existing) {
+        const existingSet = new Set((existing.providers || []).map((pr) => pr.backend));
+        const synthSet = new Set(valid.map((v) => v.backend));
+        const equal =
+          existingSet.size === synthSet.size && [...synthSet].every((bid) => existingSet.has(bid));
+        if (!equal) {
+          modelId = `${id}-legacy`;
+          console.warn(`config warning: preset '${id}': existing model '${id}' provider set differs; synthesized model '${modelId}'`);
+        }
+      }
+      if (!cfg.models[modelId]) {
+        const nm = { providers: valid };
+        if (typeof p.affinityPool === "number") nm.affinityPool = p.affinityPool;
+        cfg.models[modelId] = nm;
+      }
+      // Strategy: the original, EXCEPT legacy weighted -> affinity (weights over
+      // backends are not representable at the model layer; declared order kept).
+      let strategy = p.strategy || "affinity";
+      if (strategy !== "affinity" && strategy !== "failover" && strategy !== "weighted") {
+        console.warn(`config warning: preset '${id}': unknown strategy '${strategy}', defaulting to affinity`);
+        strategy = "affinity";
+      }
+      if (strategy === "weighted") {
+        console.warn(`config warning: preset '${id}': legacy weighted preset collapsed to affinity (weights not representable at the model layer)`);
+        strategy = "affinity";
+      }
+      const np = { strategy, models: [{ model: modelId, weight: 1 }] };
+      if (p.params && typeof p.params === "object") np.params = p.params;
+      if (p.meta && typeof p.meta === "object") np.meta = p.meta;
+      cfg.presets[id] = np;
+      if ("params" in p && (p.params === null || typeof p.params !== "object")) {
+        console.warn(`config warning: preset '${id}': params must be an object, ignored`);
+      }
+      continue;
+    }
+    console.warn(`config warning: preset '${id}': no models/members, entry dropped`);
+    delete cfg.presets[id];
+  }
+
+  // ---- 3. path A models with no preset get an identity preset ------------
+  for (const id of legacySynthesized) {
+    if (!cfg.presets[id]) {
+      cfg.presets[id] = { strategy: "affinity", models: [{ model: id, weight: 1 }] };
+    }
+  }
+
+  // ---- 4. derived read-only preset members --------------------------------
+  for (const p of Object.values(cfg.presets)) {
+    const members = [];
+    const seen = new Set();
+    for (const ref of p.models || []) {
+      const m = cfg.models[ref.model];
+      if (!m) continue;
+      for (const pr of m.providers || []) {
+        if (seen.has(pr.backend)) continue;
+        seen.add(pr.backend);
+        members.push({ backend: pr.backend, weight: 1 });
+      }
+    }
+    p.members = members;
+  }
+
+  // ---- 5. collision + params validation warnings --------------------------
+  for (const mid of Object.keys(cfg.models)) {
+    if (cfg.presets[mid]) {
+      warnOnce(collisionWarned, mid, `config warning: model id '${mid}' collides with a preset id; the preset wins at request time`);
+    }
+  }
+  const warnModelInParams = (layer, where) => {
+    if (layer && typeof layer === "object" && "model" in layer) {
+      console.warn(`config warning: params layer ${where} contains reserved 'model' key, ignored`);
+    }
+  };
+  warnModelInParams(cfg.params, "global");
+  for (const b of cfg.backends || []) warnModelInParams(b.params, `backend ${b.id}`);
+  for (const [mid, m] of Object.entries(cfg.models)) {
+    warnModelInParams(m.params, `model ${mid}`);
+    for (const pr of m.providers || []) warnModelInParams(pr.params, `provider ${mid}/${pr.backend}`);
+  }
+  for (const [pid, p] of Object.entries(cfg.presets)) warnModelInParams(p.params, `preset ${pid}`);
+  // dropParams union warnings: every dropped public/request key is a silent
+  // no-op for requests that use it.
+  const warnedDrop = new Set();
+  for (const [pid, p] of Object.entries(cfg.presets)) {
+    for (const ref of p.models || []) {
+      const m = cfg.models[ref.model];
+      if (!m) continue;
+      for (const pr of m.providers || []) {
+        const b = backendById.get(pr.backend);
+        if (!b) continue;
+        const drop = new Set([...(b.dropParams || []), ...(pr.dropParams || [])]);
+        for (const k of drop) {
+          warnOnce(
+            warnedDrop,
+            `${pid}|${ref.model}|${pr.backend}|${k}`,
+            `config warning: preset ${pid} model ${ref.model} provider ${pr.backend} drops param ${k} - requests using it will not receive it`
+          );
+        }
+      }
+    }
+  }
+  return cfg;
+}
+
+// ---- routing ---------------------------------------------------------------
+
+function sessionKeyOf(req, body) {
+  const h = req.headers;
+  return h["x-session-affinity"] || h["x-session-id"] || (body && body.user) || "no-session";
+}
+
+function hashStr(s) {
+  return crypto.createHash("sha256").update(String(s)).digest().readUInt32BE(0);
+}
+
+// Build the flattened, backend-deduped ordered attempt list for a request:
+// - preset-or-implicit-model resolution: a preset id uses its strategy; a bare
+//   model id acts as an implicit single-model preset
+//   {strategy: "affinity", models: [id], affinityPool: 1}.
+// - preset level: order the candidate MODELS per strategy. affinity picks
+//   models[hash(sessionKey) % pool]; failover keeps declared order; weighted
+//   picks weighted-random (rng injectable for tests), rest sorted by weight
+//   desc (stable sort keeps declared-order tiebreak).
+// - model level: each model orders its PROVIDERS by affinity (pool =
+//   min(model.affinityPool || 1, providers.length); primary =
+//   providers[hash(sessionKey) % pool]; rest in declared order).
+// - flatten in model order into {model, backend, upstream} attempts, deduped
+//   by backend id (first occurrence wins, keeping that occurrence's model +
+//   upstream) so a shared account is never retried twice in one request.
+// hashStr and the modulo arithmetic are UNCHANGED from the preset-only era so
+// affinity routing stays byte-identical for identical effective configs.
+// Returns null for unknown ids, else {kind, presetId, preset, models, primary,
+// ordered} where preset is the normalized preset object or null (implicit
+// model), primary is ordered[0] or null, ordered is the attempt list. A preset
+// with zero valid models returns ordered: [] (not null) so handleChat can
+// produce the specific 404 message.
+function candidates(cfg, requestedId, sessionKey, rng = Math.random) {
+  const preset = (cfg.presets || {})[requestedId] || null;
+  let kind;
+  let modelIds;
+  let modelRefs;
+  if (preset) {
+    kind = "preset";
+    modelRefs = (preset.models || []).map((m) => (typeof m === "string" ? { model: m, weight: 1 } : m));
+    modelIds = modelRefs.map((m) => m.model);
+  } else if ((cfg.models || {})[requestedId]) {
+    kind = "model";
+    modelIds = [requestedId];
+    modelRefs = [{ model: requestedId, weight: 1 }];
+  } else {
+    return null;
+  }
+
+  // Preset-level model ordering.
+  let orderedModels;
+  if (!preset) {
+    orderedModels = modelIds; // implicit model: single candidate
+  } else if (preset.strategy === "failover") {
+    orderedModels = modelIds; // declared order
+  } else if (preset.strategy === "weighted") {
+    const weights = modelRefs.map((m) => m.weight || 1);
+    const total = weights.reduce((s, w) => s + w, 0);
+    const r = (typeof rng === "function" ? rng() : Math.random()) * total;
+    let pickIdx = modelIds.length - 1;
+    let acc = 0;
+    for (let i = 0; i < modelIds.length; i++) {
+      acc += weights[i];
+      if (r < acc) {
+        pickIdx = i;
+        break;
+      }
+    }
+    const rest = modelRefs
+      .map((m, i) => ({ id: modelIds[i], weight: m.weight || 1 }))
+      .filter((_, i) => i !== pickIdx)
+      .sort((a, b) => (b.weight || 1) - (a.weight || 1)); // stable -> declared-order tiebreak
+    orderedModels = [modelIds[pickIdx], ...rest.map((x) => x.id)];
+  } else {
+    // affinity (default)
+    const pool = Math.min(preset.affinityPool || 1, modelIds.length);
+    const primaryIdx = hashStr(sessionKey) % pool;
+    orderedModels = [modelIds[primaryIdx], ...modelIds.filter((_, i) => i !== primaryIdx)];
+  }
+
+  // Model-level provider ordering + flatten + backend dedup.
+  const ordered = [];
+  const seenBackends = new Set();
+  for (const mid of orderedModels) {
+    const m = (cfg.models || {})[mid];
+    if (!m) continue;
+    const providers = m.providers || [];
+    if (providers.length === 0) continue;
+    const pool = Math.min(m.affinityPool || 1, providers.length);
+    const primaryIdx = hashStr(sessionKey) % pool;
+    const providerOrder = [providers[primaryIdx], ...providers.filter((_, i) => i !== primaryIdx)];
+    for (const pr of providerOrder) {
+      if (seenBackends.has(pr.backend)) continue;
+      seenBackends.add(pr.backend);
+      ordered.push({ model: mid, backend: pr.backend, upstream: pr.upstream });
+    }
+  }
+
+  return {
+    kind,
+    presetId: requestedId,
+    preset,
+    models: modelIds,
+    primary: ordered.length ? ordered[0] : null,
+    ordered,
+  };
+}
+
+function newError(status, body) {
+  return { status, body };
+}
+
+// ---- layered parameters ----------------------------------------------------
+
+// Merge request parameters across the six layers, highest priority last:
+// global < backend.params < provider.params < model.params < preset.params <
+// request body. `model` is RESERVED: config-layer model keys are ignored and
+// the forwarded `model` is ALWAYS provider.upstream. Dialect handling runs
+// AFTER the merge, on the PUBLIC/request key space: dropParams (union of
+// backend + provider, legacy backend field still honored) deletes keys first,
+// then provider.paramMap renames the survivors, then the developer-role
+// translation (backend field, special-cased). Pure: never mutates `body`.
+function buildPayload(body, cfg, preset, model, provider, backend) {
+  const out = {};
+  Object.assign(out, cfg.params || {}); // lowest layer
+  Object.assign(out, backend.params || {});
+  Object.assign(out, provider.params || {});
+  Object.assign(out, model.params || {});
+  if (preset) Object.assign(out, preset.params || {});
+  delete out.model; // reserved in config layers
+  Object.assign(out, body); // request body wins
+  out.model = provider.upstream; // always
+  // Dialect: drop FIRST (public/request key space), then rename survivors.
+  const drop = new Set([...(backend.dropParams || []), ...(provider.dropParams || [])]);
+  for (const k of drop) delete out[k];
+  for (const [from, to] of Object.entries(provider.paramMap || {})) {
+    if (from in out) {
+      out[to] = out[from];
+      delete out[from];
+    }
+  }
+  // Role translation last (unchanged field-flag behavior).
+  if (backend.translateDeveloperRole && Array.isArray(out.messages)) {
+    out.messages = out.messages.map((m) => (m && m.role === "developer" ? { ...m, role: "system" } : m));
+  }
+  return out;
+}
+
+// ---- request forwarding ----------------------------------------------------
+
+async function forward(req, cfg, backend, payload, incomingHeaders, stream) {
+  const key = process.env[backend.apiKeyEnv];
+  const upstream = backend.baseURL.replace(/\/$/, "") + "/chat/completions";
+
+  const outHeaders = {
+    "content-type": "application/json",
+    authorization: `Bearer ${key}`,
+    accept: stream ? "text/event-stream" : "application/json",
+  };
+  // Forward prompt-cache headers verbatim.
+  for (const h of ["x-cache-key", "cachekey", "set-cache-key"]) {
+    if (incomingHeaders[h]) outHeaders[h] = incomingHeaders[h];
+  }
+
+  const payloadText = JSON.stringify(payload);
+
+  let upstreamRes;
+  try {
+    upstreamRes = await fetch(upstream, {
+      method: "POST",
+      headers: outHeaders,
+      body: payloadText,
+      signal: AbortSignal.timeout(backend.timeoutMs || cfg.timeoutMs || 45000),
+    });
+  } catch (e) {
+    return { err: newError(0, String(e && e.message)) };
+  }
+
+  if (!upstreamRes.ok) {
+    let text = "";
+    try {
+      text = await upstreamRes.text();
+    } catch {}
+    return {
+      err: newError(upstreamRes.status, text),
+      statusFromUpstream: upstreamRes.status,
+    };
+  }
+  return { res: upstreamRes };
+}
+
+// ---- HTTP handlers ---------------------------------------------------------
+
+async function handleChat(req, res, cfg, bodyText) {
+  const started = Date.now();
+  let body;
+  try {
+    body = JSON.parse(bodyText);
+  } catch {
+    const e = newError(400, JSON.stringify({ error: { message: "invalid JSON body", type: "invalid_request_error" } }));
+    return writeError(res, e);
+  }
+  const modelId = body && body.model;
+  const stream = !!(body && body.stream);
+  if (!modelId) {
+    const e = newError(404, JSON.stringify({ error: { message: `model '${modelId}' not found`, type: "model_not_found" } }));
+    return writeError(res, e);
+  }
+
+  const sessionKey = sessionKeyOf(req, body);
+  const c = candidates(cfg, modelId, sessionKey);
+  if (!c) {
+    const e = newError(404, JSON.stringify({ error: { message: `model '${modelId}' not found`, type: "model_not_found" } }));
+    return writeError(res, e);
+  }
+  if (c.kind === "preset" && c.models.length === 0) {
+    const e = newError(404, JSON.stringify({ error: { message: `preset '${modelId}' has no valid models`, type: "model_not_found" } }));
+    return writeError(res, e);
+  }
+  if (c.kind === "model" && c.ordered.length === 0) {
+    const e = newError(404, JSON.stringify({ error: { message: `model '${modelId}' has no valid providers`, type: "model_not_found" } }));
+    return writeError(res, e);
+  }
+
+  // Prefer healthy candidates. If all cooling, fall back to system-cooled
+  // backends only (soonest nextAvailableAt first); manually cooled backends
+  // NEVER participate in the all-cooling fallback.
+  const now = Date.now();
+  const healthy = c.ordered.filter((a) => {
+    const h = health.get(a.backend);
+    return !h || h.state !== "cooling" || h.nextAvailableAt <= now;
+  });
+  const manualCooled = new Set(
+    c.ordered
+      .filter((a) => {
+        const h = health.get(a.backend);
+        return !!h && h.state === "cooling" && h.lastError && h.lastError.kind === "manual";
+      })
+      .map((a) => a.backend)
+  );
+  let pool;
+  if (healthy.length) {
+    pool = healthy;
+  } else {
+    pool = c.ordered.filter((a) => !manualCooled.has(a.backend)).sort((a, b) => {
+      return (health.get(a.backend)?.nextAvailableAt || 0) - (health.get(b.backend)?.nextAvailableAt || 0);
+    });
+    if (pool.length === 0) {
+      const latencyMs = Date.now() - started;
+      recordHistory(newHistoryEntry({ t: Date.now(), model: modelId, backend: "none", stream, status: 503, latencyMs, session: sessionKey, routedModel: c.ordered[0] ? c.ordered[0].model : null }));
+      recordStats({ backend: "none", model: modelId, status: 503, latencyMs });
+      res.setHeader("x-router-backend", "none");
+      const msg = JSON.stringify({
+        error: {
+          message: `all available backends are cooling (${manualCooled.size} manually cooled - uncool to restore)`,
+          type: "router_unavailable",
+        },
+      });
+      return writeError(res, newError(503, msg));
+    }
+  }
+
+  let lastErr = null;
+  let lastTried = null;
+  for (const attempt of pool) {
+    lastTried = attempt;
+    const backend = cfg.backends.find((b) => b.id === attempt.backend);
+    const model = (cfg.models || {})[attempt.model];
+    const provider = (model && (model.providers || []).find((p) => p.backend === attempt.backend)) || null;
+    if (!backend || !model || !provider) continue; // defensive: candidates built the attempt
+    const payload = buildPayload(body, cfg, c.preset, model, provider, backend);
+    const result = await forward(req, cfg, backend, payload, req.headers, stream);
+    if (result.err) {
+      lastErr = result.err;
+      markFailure(cfg, attempt.backend, result.err.status, result.err.body);
+      // Client-side errors are the same for every backend: fail fast, no retry.
+      if (classify(result.err.status, result.err.body) === "client") break;
+      continue;
+    }
+    // Success: mark healthy, relay (ttft = time to first upstream response),
+    // then record full metrics once the body has been forwarded to the client.
+    markSuccess(attempt.backend);
+    const latencyMs = Date.now() - started;
+    let metrics;
+    try {
+      metrics = await relay(res, result.res, stream, attempt.backend, started);
+    } catch (e) {
+      // Belt-and-suspenders: relay() already catches internally, but metric
+      // collection must never crash the router.
+      console.error("relay threw:", e && e.message);
+      metrics = { ttftMs: latencyMs, cacheHit: false, promptTokens: 0, completionTokens: 0, genMs: 0 };
+    }
+    const genSec = (metrics.genMs || 0) / 1000;
+    const entry = newHistoryEntry({
+      t: Date.now(), model: modelId, backend: attempt.backend, stream, status: 200, latencyMs,
+      ttftMs: metrics.ttftMs ?? latencyMs,
+      promptTokens: metrics.promptTokens ?? 0,
+      completionTokens: metrics.completionTokens ?? 0,
+      cacheHit: metrics.cacheHit,
+      genMs: metrics.genMs ?? 0,
+      tps: genSec > 0 && (metrics.completionTokens || 0) > 0 ? Math.round((metrics.completionTokens / genSec) * 10) / 10 : 0,
+      session: sessionKey,
+      routedModel: attempt.model,
+    });
+    recordHistory(entry);
+    recordStats(entry);
+    return;
+  }
+
+  const latencyMs = Date.now() - started;
+  recordHistory(newHistoryEntry({ t: Date.now(), model: modelId, backend: lastTried ? lastTried.backend : "none", stream, status: 503, latencyMs, session: sessionKey, routedModel: c.ordered[0] ? c.ordered[0].model : null }));
+  recordStats({ backend: lastTried ? lastTried.backend : "none", model: modelId, status: 503, latencyMs });
+  res.setHeader("x-router-backend", lastTried ? lastTried.backend : "none");
+  const msg = lastErr ? lastErr.body : "all backends unavailable";
+  return writeError(res, newError(503, typeof msg === "string" && msg ? msg : JSON.stringify({ error: { message: "all backends cooling", type: "router_unavailable" } })));
+}
+
+// Cache detection: the router forwards x-cache-key/cachekey/set-cache-key as
+// REQUEST headers; when the upstream response echoes any of them back it is
+// signaling a cache hit (or a cache write) for this request.
+function hasCacheHeader(upstreamRes) {
+  const h = upstreamRes.headers;
+  return !!(h && h.get && (h.get("x-cache-key") || h.get("cachekey") || h.get("set-cache-key")));
+}
+
+// Incremental SSE usage collector. Streaming chat completions normally place
+// the cumulative `usage` object on the final chunk before [DONE], so the LAST
+// usage object seen wins. Chunk boundaries are handled by keeping a partial
+// trailing line between feeds.
+function makeUsageCollector() {
+  let leftover = "";
+  let promptTokens = 0;
+  let completionTokens = 0;
+  let promptCacheHit = 0;
+  let promptCacheMiss = 0;
+  let cacheFieldSeen = false;
+  function consume(line) {
+    const t = line.trim();
+    if (!t.startsWith("data:")) return;
+    const payload = t.slice(5).trim();
+    if (!payload || payload === "[DONE]") return;
+    try {
+      const obj = JSON.parse(payload);
+      if (obj && obj.usage) {
+        promptTokens = Number(obj.usage.prompt_tokens) || 0;
+        completionTokens = Number(obj.usage.completion_tokens) || 0;
+        // DeepSeek/OpenAI-style prompt-cache accounting. Some providers expose
+        // prompt_cache_hit_tokens + prompt_cache_miss_tokens; others expose
+        // prompt_tokens_details.cached_tokens. Either one means the upstream
+        // reports cache state at all (cacheFieldSeen), which lets us tell a
+        // real miss from "no signal".
+        const hit = Number(obj.usage.prompt_cache_hit_tokens);
+        const miss = Number(obj.usage.prompt_cache_miss_tokens);
+        const cached = obj.usage.prompt_tokens_details && obj.usage.prompt_tokens_details.cached_tokens;
+        const cachedN = Number(cached);
+        if (!Number.isNaN(hit) || !Number.isNaN(miss) || !Number.isNaN(cachedN)) cacheFieldSeen = true;
+        if (!Number.isNaN(hit)) promptCacheHit = hit;
+        else if (!Number.isNaN(cachedN)) promptCacheHit = cachedN;
+        if (!Number.isNaN(miss)) promptCacheMiss = miss;
+      }
+    } catch {
+      // Non-JSON SSE event (keepalive comment, etc.) — ignore.
+    }
+  }
+  return {
+    feed(chunk) {
+      let text = leftover + (Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk));
+      const lines = text.split("\n");
+      leftover = lines.pop() || "";
+      for (const line of lines) consume(line);
+    },
+    finalize() {
+      if (leftover) consume(leftover);
+      leftover = "";
+      return { promptTokens, completionTokens, promptCacheHit, promptCacheMiss, cacheFieldSeen };
+    },
+  };
+}
+
+// Pass-through transform that feeds every chunk to the usage collector.
+// Metrics collection must never break the stream, so failures are swallowed.
+function usageTransform(collector) {
+  return new Transform({
+    transform(chunk, _enc, cb) {
+      try {
+        collector.feed(chunk);
+      } catch {
+        /* ignore */
+      }
+      cb(null, chunk);
+    },
+  });
+}
+
+// Relay the upstream response to the client while capturing per-request
+// metrics. Returns { ttftMs, cacheHit, promptTokens, completionTokens, genMs }.
+// Never throws: on any failure it closes the response and returns what it has.
+async function relay(res, upstreamRes, stream, backendId, started) {
+  const ttftMs = Date.now() - started;
+  const headers = {
+    "content-type": upstreamRes.headers.get("content-type") || "application/json",
+    "x-router-backend": backendId || "unknown",
+  };
+  let cacheHit = null;   // tri-state: true / false / null (unknown - no signal)
+  let promptTokens = 0;
+  let completionTokens = 0;
+  let genMs = 0;
+  try {
+    if (upstreamRes.headers.get("x-request-id")) headers["x-request-id"] = upstreamRes.headers.get("x-request-id");
+    res.writeHead(200, headers);
+    if (hasCacheHeader(upstreamRes)) cacheHit = true;
+
+    if (stream && upstreamRes.body) {
+      // Tee the stream: one branch goes to the client, the transform branch
+      // accumulates usage data from the final SSE chunk.
+      const collector = makeUsageCollector();
+      const genStart = Date.now();
+      await pipeline(Readable.fromWeb(upstreamRes.body), usageTransform(collector), res);
+      genMs = Date.now() - genStart;
+      const usage = collector.finalize();
+      promptTokens = usage.promptTokens;
+      completionTokens = usage.completionTokens;
+      if (cacheHit !== true) {
+        cacheHit = usage.cacheFieldSeen ? usage.promptCacheHit > 0 : null;
+      }
+    } else {
+      const buf = Buffer.from(await upstreamRes.arrayBuffer());
+      try {
+        const parsed = JSON.parse(buf.toString("utf8"));
+        const usage = parsed && parsed.usage;
+        if (usage) {
+          promptTokens = Number(usage.prompt_tokens) || 0;
+          completionTokens = Number(usage.completion_tokens) || 0;
+          if (cacheHit !== true) {
+            const hit = Number(usage.prompt_cache_hit_tokens);
+            const miss = Number(usage.prompt_cache_miss_tokens);
+            const cached = usage.prompt_tokens_details && usage.prompt_tokens_details.cached_tokens;
+            const cachedN = Number(cached);
+            const seen = !Number.isNaN(hit) || !Number.isNaN(miss) || !Number.isNaN(cachedN);
+            if (seen) cacheHit = (!Number.isNaN(hit) ? hit : cachedN) > 0;
+            // else keep null (no signal)
+          }
+        }
+      } catch {
+        // Body not JSON (e.g. upstream proxy error) — keep token counts at 0.
+      }
+      res.end(buf);
+      genMs = Math.max(0, Date.now() - started - ttftMs);
+    }
+  } catch (e) {
+    // Relay must never crash the router: record what we have and close cleanly.
+    console.error("relay error:", e && e.message);
+    try {
+      if (!res.writableEnded) res.end();
+    } catch {
+      /* ignore */
+    }
+  }
+  return { ttftMs, cacheHit, promptTokens, completionTokens, genMs };
+}
+
+function writeError(res, e) {
+  const status = e.status || 500;
+  let buf;
+  try {
+    buf = Buffer.from(e.body || "");
+  } catch {
+    buf = Buffer.from(JSON.stringify({ error: { message: "router error", type: "router_error" } }));
+  }
+  // If upstream returned an error body that is JSON-shaped, pass it through;
+  // the status reflects it.
+  res.writeHead(status, { "content-type": "application/json" });
+  res.end(buf);
+}
+
+// ---- server ---------------------------------------------------------------
+
+let cfg = null;
+
+async function loadConfig() {
+  const raw = await readFileP(CONFIG_PATH, "utf8");
+  const parsed = JSON.parse(raw);
+  // Normalize the three-layer shape (backends -> models -> presets) on every
+  // load: validate new-shape entries, synthesize legacy configs, derive preset
+  // members. Routing and /api/config only ever see the normalized form.
+  normalizeConfig(parsed);
+  // Reconcile: keep health registry keyed by backend id on reload.
+  const prevIds = new Set(cfg ? cfg.backends.map((b) => b.id) : []);
+  cfg = parsed;
+  ensureBackends(cfg);
+  return cfg;
+}
+
+function server() {
+  return http.createServer(async (req, res) => {
+    const url = req.url.split("?")[0];
+    const prefix = cfg.prefix || "/v1";
+    const p = prefix.replace(/\/$/, "");
+
+    if (req.method === "GET" && url === "/health") {
+      const now = Date.now();
+      const backends = cfg.backends.map((b) => {
+        const h = health.get(b.id) || {};
+        const isCooling = h.state === "cooling" && h.nextAvailableAt > now;
+        return {
+          id: b.id,
+          state: isCooling ? "cooling" : "healthy",
+          nextAvailableAtMs: h.nextAvailableAt || 0,
+          fails: h.fails || 0,
+          lastError: h.lastError || null,
+          manual: !!(isCooling && h.lastError && h.lastError.kind === "manual"),
+        };
+      });
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ ok: true, port: cfg.port, backends }));
+    }
+
+    if (req.method === "POST" && url === "/admin/reset-health") {
+      resetAllHealth();
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ ok: true }));
+    }
+
+    if (req.method === "GET" && url === p + "/models") {
+      // Preset ids first (config order), then model ids not already listed
+      // (config order). Colliding ids appear exactly once (the preset owns it).
+      const ids = [];
+      for (const id of Object.keys(cfg.presets || {})) {
+        if (!ids.includes(id)) ids.push(id);
+      }
+      for (const id of Object.keys(cfg.models || {})) {
+        if (!ids.includes(id)) ids.push(id);
+      }
+      const data = ids.map((id) => ({ id, object: "model", owned_by: "local-router" }));
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ object: "list", data }));
+    }
+
+    if (req.method === "POST" && url === p + "/chat/completions") {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      const bodyText = Buffer.concat(chunks).toString("utf8");
+      return handleChat(req, res, cfg, bodyText);
+    }
+
+    if (req.method === "GET" && url === "/") {
+      let html;
+      try {
+        html = readFileSync(join(__dirname, "index.html"), "utf8");
+      } catch {
+        res.writeHead(404, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ error: { message: "ui not found", type: "not_found" } }));
+      }
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
+      return res.end(html);
+    }
+
+    if (req.method === "GET" && url === "/api/history") {
+      const raw = new URL(req.url, "http://localhost").searchParams.get("limit");
+      let limit = 100;
+      if (raw) {
+        const n = parseInt(raw, 10);
+        if (!Number.isNaN(n)) limit = Math.max(1, Math.min(500, n));
+      }
+      const entries = [...HISTORY].reverse().slice(0, limit);
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ entries, limit }));
+    }
+
+    if (req.method === "GET" && url === "/api/stats") {
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(
+        JSON.stringify({ since: STATS.since, uptimeMs: Date.now() - startedAt, total: STATS.total, byBackend: STATS.byBackend, byModel: STATS.byModel })
+      );
+    }
+
+    if (req.method === "GET" && url === "/api/config") {
+      // Safe: cfg.backends carry apiKeyEnv NAMES, never resolved key values.
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify(cfg));
+    }
+
+    if (req.method === "POST" && url === "/admin/backend") {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      const bodyText = Buffer.concat(chunks).toString("utf8");
+      let body;
+      try {
+        body = JSON.parse(bodyText);
+      } catch {
+        res.writeHead(400, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ error: { message: "invalid JSON body", type: "invalid_request_error" } }));
+      }
+      const id = body && body.id;
+      const action = body && body.action;
+      if (!id || !cfg.backends.some((b) => b.id === id)) {
+        res.writeHead(404, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ error: { message: `backend '${id}' not found`, type: "not_found" } }));
+      }
+      if (action !== "cool" && action !== "uncool") {
+        res.writeHead(400, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ error: { message: "action must be 'cool' or 'uncool'", type: "invalid_request_error" } }));
+      }
+      if (action === "cool") {
+        const h = health.get(id) || { state: "healthy", fails: 0, backoffMs: 0 };
+        // No forMs = STICKY manual cool: cooled until uncooled. MAX_SAFE_INTEGER
+        // is set exactly so /health can render "until uncooled" instead of a
+        // countdown. A positive forMs = timed manual cool.
+        const forMs = typeof body.forMs === "number" && body.forMs > 0 ? body.forMs : null;
+        h.state = "cooling";
+        h.nextAvailableAt = forMs ? Date.now() + forMs : Number.MAX_SAFE_INTEGER;
+        h.fails = h.fails || 0;
+        h.backoffMs = h.backoffMs || 0;
+        h.lastError = { status: 0, kind: "manual", body: "manually cooled via UI" };
+        health.set(id, h);
+      } else {
+        markHealthy(id);
+      }
+      const h = health.get(id);
+      const state = h.state === "cooling" && h.nextAvailableAt > Date.now() ? "cooling" : "healthy";
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ ok: true, id, state }));
+    }
+
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { message: `not found: ${req.method} ${url}`, type: "not_found" } }));
+  });
+}
+
+// ---- startup ---------------------------------------------------------------
+
+async function main() {
+  loadEnv();
+  await loadConfig();
+  watchF(CONFIG_PATH, () => {
+    loadConfig().catch((e) => console.error("config reload failed:", e.message));
+  });
+
+  const srv = server();
+  srv.listen(cfg.port, "127.0.0.1", () => {
+    const addr = srv.address();
+    const port = typeof addr === "object" && addr ? addr.port : cfg.port;
+    console.error(`local-model-router listening on http://127.0.0.1:${port}${cfg.prefix || "/v1"}`);
+    console.error(`config: ${CONFIG_PATH}`);
+    console.error(`backends: ${cfg.backends.map((b) => `${b.id}(${mask(process.env[b.apiKeyEnv])})`).join(", ")}`);
+  });
+}
+
+// Running the file as a script starts the server; importing it (test.mjs
+// imports candidates/normalizeConfig/buildPayload for unit tests) does not.
+const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMain) {
+  main().catch((e) => {
+    console.error("fatal:", e);
+    process.exit(1);
+  });
+}
+
+export { candidates, normalizeConfig, buildPayload };

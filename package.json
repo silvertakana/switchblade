@@ -1,0 +1,14 @@
+{
+  "name": "local-model-router",
+  "version": "1.0.0",
+  "description": "Local zero-dependency model router replacing homelab LiteLLM for deepseek-v4-flash (two OpenCode Go accounts + direct fallback)",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node test.mjs"
+  },
+  "engines": {
+    "node": ">=25"
+  }
+}
