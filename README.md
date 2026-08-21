@@ -9,6 +9,8 @@ and a small web dashboard.
 Runs entirely on your machine at `127.0.0.1:8787`. No Redis, no Postgres, no
 Kubernetes, no cloud — one Node process, ~125 MB RAM idle, one config file.
 
+![Switchblade dashboard](assets/switchblade-ui.jpg)
+
 ## Why
 
 Most self-hosted LLM routers are built for teams and clouds: they pull in a
