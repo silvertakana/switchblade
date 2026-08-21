@@ -1,4 +1,4 @@
-# Local Model Router — Spec
+# Switchblade — Spec
 
 A local, boot-launched Node server that replaces the homelab LiteLLM proxy for
 DeepSeek V4 Flash routing. It load-balances two OpenCode Go accounts
@@ -36,7 +36,7 @@ machine, launched at boot, fully under their control.
 
 Keys: OPENCODE_GO_KEY and OPENCODE_GO_ALT_KEY live ONLY on the homelab
 container currently. They must be pulled into a local env file
-(`~/.local-model-router/.env` or the project dir) for the router to use.
+(`~/.switchblade/.env` or the project dir) for the router to use.
 DEEPSEEK_API_KEY already exists locally (`~/.dsh/.env`).
 
 ## Health state machine (per backend)

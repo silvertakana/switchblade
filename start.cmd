@@ -1,5 +1,5 @@
 @echo off
-rem Local model router launcher. Run at Windows logon via a scheduled task.
+rem Switchblade launcher. Run at Windows logon via a scheduled task.
 rem Uses the full node path (scheduled tasks do not inherit the user PATH).
 set NODE=C:\Program Files\nodejs\node.exe
 set LOG="C:\dev\local-model-router\router.log"

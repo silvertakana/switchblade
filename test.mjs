@@ -1,4 +1,4 @@
-// test.mjs — mock-based test for local-model-router. No real keys or network.
+// test.mjs — mock-based test for switchblade. No real keys or network.
 // Spins up local mock backends and a server instance using a temp config.
 
 import http from "node:http";

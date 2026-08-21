@@ -1,5 +1,6 @@
 {
   "port": 8787,
+  "host": "100.65.175.106",
   "prefix": "/v1",
   "masterKeyEnv": null,
   "backends": [

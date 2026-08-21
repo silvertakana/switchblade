@@ -1,4 +1,4 @@
-// local-model-router server.mjs
+// switchblade server.mjs
 // Zero-dependency Node 25 router that replaces homelab LiteLLM for the
 // deepseek-v4-flash family: two OpenCode Go accounts load-balanced by
 // session-affinity hashing, with a DeepSeek direct fallback, per-backend
@@ -1091,14 +1091,21 @@ async function main() {
     loadConfig().catch((e) => console.error("config reload failed:", e.message));
   });
 
-  const srv = server();
-  srv.listen(cfg.port, "127.0.0.1", () => {
-    const addr = srv.address();
-    const port = typeof addr === "object" && addr ? addr.port : cfg.port;
-    console.error(`local-model-router listening on http://127.0.0.1:${port}${cfg.prefix || "/v1"}`);
-    console.error(`config: ${CONFIG_PATH}`);
-    console.error(`backends: ${cfg.backends.map((b) => `${b.id}(${mask(process.env[b.apiKeyEnv])})`).join(", ")}`);
-  });
+  // Always listen on localhost (existing consumers: OpenCode, dsh, local UI).
+  // When cfg.host is set (e.g. the Tailscale IP for `vastus:8787`), listen on
+  // that address too. Two server instances share the same request handler.
+  const hosts = new Set(["127.0.0.1"]);
+  if (cfg.host) hosts.add(String(cfg.host));
+  for (const bindHost of hosts) {
+    const srv = server();
+    srv.listen(cfg.port, bindHost, () => {
+      const addr = srv.address();
+      const port = typeof addr === "object" && addr ? addr.port : cfg.port;
+      console.error(`switchblade listening on http://${bindHost}:${port}${cfg.prefix || "/v1"}`);
+    });
+  }
+  console.error(`config: ${CONFIG_PATH}`);
+  console.error(`backends: ${cfg.backends.map((b) => `${b.id}(${mask(process.env[b.apiKeyEnv])})`).join(", ")}`);
 }
 
 // Running the file as a script starts the server; importing it (test.mjs

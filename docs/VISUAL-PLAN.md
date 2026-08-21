@@ -1,4 +1,4 @@
-# Local Model Router - Visual Polish Plan
+# Switchblade - Visual Polish Plan
 
 ## Screenshots Analyzed
 - Playground tab: Chat interface with reasoning display, debug panel

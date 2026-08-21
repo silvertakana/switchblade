@@ -1,4 +1,4 @@
-# Local Model Router — Web UI Plan (v2)
+# Switchblade — Web UI Plan (v2)
 
 Comprehensive feature plan for the router web UI (Dashboard + Playground).
 Covers every use case we could devise, user stories, and traced user flows.

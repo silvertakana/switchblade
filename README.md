@@ -1,4 +1,4 @@
-# local-model-router
+# Switchblade
 
 A zero-dependency, single-file local model router for OpenAI-compatible LLM APIs.
 It load-balances requests across multiple upstream providers (OpenCode Go,
@@ -79,7 +79,7 @@ Requires Node.js 22+ (developed on 25; no Node-25-only APIs are used).
 
 ```bash
 git clone <your-fork-or-this-repo>
-cd local-model-router
+cd switchblade
 cp .env.example .env      # add your API keys
 ```
 

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Local Model Router</title>
+<title>Switchblade</title>
 <style>
   :root {
     --bg: #0a0a0a;
@@ -262,18 +262,71 @@
   }
   @media (max-width: 900px) {
     .debug-grid { grid-template-columns: repeat(2, 1fr); }
+    .stat-overview { gap: 8px 16px; }
   }
   @media (max-width: 640px) {
-    body { padding: 16px; }
-    h1 { font-size: 19px; }
-    .header-controls { width: 100%; justify-content: space-between; }
+    body { padding: 14px; }
+    h1 { font-size: 18px; }
+    .header-controls { width: 100%; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+    .header-controls button, .header-controls label { min-height: 40px; display: inline-flex; align-items: center; }
+
+    /* tabs: full-width half-and-half, tappable */
+    .tabs { gap: 0; }
+    .tab { flex: 1; padding: 12px 8px; font-size: 14px; text-align: center; }
+
+    /* touch targets */
+    button, select, input[type="text"], input[type="number"], textarea { min-height: 40px; font-size: 14px; }
+    label.check { min-height: 40px; }
+
+    /* stacked history table: each row becomes a card of label:value pairs */
+    #historyBody tr { display: block; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 12px; margin-bottom: 8px; }
+    #historyBody td { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; padding: 3px 0; border: none; font-size: 13px; }
+    #historyBody td::before { content: attr(data-label); color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; flex-shrink: 0; }
+    #historyBody td.mono::before { font-family: inherit; }
+    #historyBody td:first-child { padding-top: 0; }
+    #historyBody td:last-child { padding-bottom: 0; }
+    #historyBody .skeleton { height: 40px; }
+
+    /* presets/models tables keep horizontal scroll but tighten */
     table { font-size: 12px; }
     th, td { padding: 6px 8px; }
+
+    /* playground chat */
     .msg { max-width: 95%; }
-    .debug-grid { grid-template-columns: 1fr; }
+    .chat-thread { max-height: 50vh; }
+    .chat-input-row textarea { min-height: 72px; }
+    .chat-actions { gap: 8px; }
+    .chat-actions-right { width: 100%; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .chat-actions-right button { width: 100%; }
+    .chat-actions > button { flex: 1; }
+    .chat-controls { gap: 8px; }
+    .chat-controls label { flex-wrap: wrap; }
+    #pgSession { width: 100% !important; min-height: 40px; }
+    #pgAdvanced .chat-controls { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; align-items: center; }
+    #pgAdvanced .chat-controls label { flex-wrap: wrap; }
+    #pgAdvanced input[type="number"], #pgAdvanced select { width: 100% !important; }
+
+    /* debug panel */
+    .debug-compact { padding: 10px 12px; }
+    .debug-row { flex-wrap: wrap; }
+    .debug-label { min-width: 90px; }
+
+    /* dashboard cards/stats */
     .cards { grid-template-columns: 1fr; }
     .card-actions { flex-wrap: wrap; }
+    .statbar .top { flex-wrap: wrap; }
+    .stat-overview { flex-direction: column; align-items: flex-start; gap: 6px; padding: 10px 14px; }
     .compare-grid { grid-template-columns: 1fr; }
+    .compare-config { flex-direction: column; align-items: flex-start; }
+    .debug-grid { grid-template-columns: 1fr; }
+    .bar-pct { font-size: 10px; }
+  }
+  @media (max-width: 380px) {
+    .chat-actions-right { grid-template-columns: 1fr; }
+    .chat-input-row { flex-direction: column; align-items: stretch; }
+    .chat-input-row button { width: 100%; }
+    h1 { font-size: 17px; }
+    .subtitle { font-size: 12px; }
   }
 </style>
 </head>
@@ -281,7 +334,7 @@
 
 <header>
   <div>
-    <h1><span id="statusDot" class="status-dot" role="img" aria-label="All backends healthy" title="All backends healthy"></span>Local Model Router</h1>
+    <h1><span id="statusDot" class="status-dot" role="img" aria-label="All backends healthy" title="All backends healthy"></span>Switchblade</h1>
     <p class="subtitle">Port <span id="port" class="mono">-</span> &middot; Uptime <span id="uptime">-</span></p>
   </div>
   <div class="header-controls">
@@ -312,6 +365,7 @@
 
     <section>
       <h2 data-icon="clock">Request history</h2>
+      <div id="historyCacheSummary" class="stat-overview" style="margin-bottom:10px;display:none"></div>
       <div style="overflow-x:auto">
         <table>
           <thead>
@@ -834,25 +888,41 @@ function renderStats() {
 
 function renderHistory() {
   const body = $("historyBody");
+  const sum = $("historyCacheSummary");
   const entries = (state.history && state.history.entries) || [];
   if (!state.history) return;
   if (!sectionChanged("history", entries)) return;
+  // Cache summary over KNOWN entries only (tri-state: null = no signal, skip).
+  let hits = 0, misses = 0;
+  for (const e of entries) {
+    if (e.cacheHit === true) hits++;
+    else if (e.cacheHit === false) misses++;
+  }
+  const known = hits + misses;
+  const pct = known > 0 ? Math.round((hits / known) * 100) : 0;
   if (entries.length === 0) {
+    sum.style.display = "none";
     body.innerHTML = '<tr><td colspan="10" class="empty">No requests yet.</td></tr>';
     return;
   }
+  sum.style.display = "flex";
+  sum.innerHTML =
+    "<span>Cache <b>" + (known > 0 ? pct + "% hit" : "n/a") + "</b></span>" +
+    "<span>Hits <b class='status-ok'>" + hits + "</b></span>" +
+    "<span>Misses <b>" + misses + "</b></span>" +
+    "<span>Known <b>" + known + "</b></span>";
   body.innerHTML = entries.slice(0, 100).map((e) =>
     "<tr>" +
-    '<td class="mono">' + fmtTime(e.t) + "</td>" +
-    "<td>" + esc(e.model) + "</td>" +
-    "<td>" + esc(e.backend) + "</td>" +
-    "<td>" + (e.stream ? "yes" : "no") + "</td>" +
-    '<td class="mono ' + (e.status >= 400 ? "status-err" : "status-ok") + '">' + e.status + "</td>" +
-    '<td class="mono">' + (e.latencyMs != null ? Math.round(e.latencyMs) : "-") + "</td>" +
-    '<td class="mono">' + (e.ttftMs != null ? Math.round(e.ttftMs) : "-") + "</td>" +
-    '<td class="mono">' + (e.promptTokens != null ? e.promptTokens + "/" + (e.completionTokens != null ? e.completionTokens : "?") : "-") + "</td>" +
-    '<td class="mono ' + (e.cacheHit == null ? "" : e.cacheHit ? "status-hit" : "status-miss") + '">' + (e.cacheHit == null ? "-" : e.cacheHit ? "hit" : "miss") + "</td>" +
-    "<td>" + esc(e.session) + "</td>" +
+    '<td class="mono" data-label="Time">' + fmtTime(e.t) + "</td>" +
+    '<td data-label="Model">' + esc(e.model) + "</td>" +
+    '<td data-label="Backend">' + esc(e.backend) + "</td>" +
+    '<td data-label="Stream">' + (e.stream ? "yes" : "no") + "</td>" +
+    '<td class="mono ' + (e.status >= 400 ? "status-err" : "status-ok") + '" data-label="Status">' + e.status + "</td>" +
+    '<td class="mono" data-label="Latency">' + (e.latencyMs != null ? Math.round(e.latencyMs) + "ms" : "-") + "</td>" +
+    '<td class="mono" data-label="TTFT">' + (e.ttftMs != null ? Math.round(e.ttftMs) + "ms" : "-") + "</td>" +
+    '<td class="mono" data-label="Tokens">' + (e.promptTokens != null ? e.promptTokens + "/" + (e.completionTokens != null ? e.completionTokens : "?") : "-") + "</td>" +
+    '<td class="mono ' + (e.cacheHit == null ? "" : e.cacheHit ? "status-hit" : "status-miss") + '" data-label="Cache">' + (e.cacheHit == null ? "-" : e.cacheHit ? "hit" : "miss") + "</td>" +
+    '<td data-label="Session">' + esc(e.session) + "</td>" +
     "</tr>"
   ).join("");
 }
@@ -1665,7 +1735,7 @@ function pgTranscriptText() {
     const r = m.reasoning ? "\n[reasoning]\n" + m.reasoning + "\n[/reasoning]" : "";
     return "Assistant:" + r + "\n" + m.content;
   });
-  const meta = "Local Model Router conversation - " + new Date().toISOString() + "\nModel: " + ($("pgModel").value || "-") + "\n\n";
+  const meta = "Switchblade conversation - " + new Date().toISOString() + "\nModel: " + ($("pgModel").value || "-") + "\n\n";
   return meta + lines.join("\n\n");
 }
 
@@ -1715,7 +1785,7 @@ function pgTranscriptMarkdown() {
     const r = m.reasoning ? "\n\n<details><summary>Reasoning</summary>\n\n" + m.reasoning + "\n\n</details>" : "";
     return "**Assistant:**" + r + "\n\n" + m.content;
   });
-  const meta = "# Local Model Router conversation\n\n" +
+  const meta = "# Switchblade conversation\n\n" +
     "- Date: " + new Date().toISOString() + "\n" +
     "- Model: " + ($("pgModel").value || "-") + "\n" +
     "- Session: " + ($("pgSession").value || "-") + "\n\n---\n\n";

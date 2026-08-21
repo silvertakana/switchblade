@@ -1,9 +1,9 @@
 {
-  "name": "local-model-router",
+  "name": "switchblade",
   "version": "1.0.0",
-  "description": "Local zero-dependency model router replacing homelab LiteLLM for deepseek-v4-flash (two OpenCode Go accounts + direct fallback)",
+  "description": "Zero-dependency local model router for OpenAI-compatible APIs",
   "type": "module",
-  "private": true,
+  "private": false,
   "scripts": {
     "start": "node server.mjs",
     "test": "node test.mjs"
