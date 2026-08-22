@@ -636,7 +636,12 @@ function normalizeConfig(cfg) {
 
 function sessionKeyOf(req, body) {
   const h = req.headers;
-  return h["x-session-affinity"] || h["x-session-id"] || (body && body.user) || "no-session";
+  return (
+    h["x-session-affinity"] ||
+    h["x-session-id"] ||
+    (body && (body.session_id || body.sessionId || body.user)) ||
+    "no-session"
+  );
 }
 
 function hashStr(s) {

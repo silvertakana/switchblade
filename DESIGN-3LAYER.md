@@ -275,6 +275,12 @@ Session-affinity hashing (`hashStr`, sha256 readUInt32BE), the health registry
 history: UNCHANGED. This is a hard requirement: for an identical effective
 config, the same session key must hash to the same primary backend as before.
 
+Session key resolution (priority order): `x-session-affinity` header,
+`x-session-id` header, then the request body's `session_id` / `sessionId` /
+`user`, then the constant `no-session`. The two body session spellings let a
+client that identifies its conversation in the chat-completions body (instead
+of via headers) still get per-session affinity; the hash itself is unchanged.
+
 ---
 
 ## 3a. Preset-of-presets (tier-style nesting)

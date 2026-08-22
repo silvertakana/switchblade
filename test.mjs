@@ -1802,6 +1802,51 @@ async function main() {
     }
   }
 
+  // y1) session affinity from request body session fields (session_id / sessionId);
+  //     x-session-id header still takes precedence over the body.
+  {
+    const srvA = mockBackend("sya", {});
+    const srvB = mockBackend("syb", {});
+    const portA = await listen(srvA.srv);
+    const portB = await listen(srvB.srv);
+    srvA.port = portA; srvB.port = portB;
+    const cfgSY = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "sya", baseURL: `http://${HOST}:${portA}`, apiKeyEnv: "KEY_SYA" },
+        { id: "syb", baseURL: `http://${HOST}:${portB}`, apiKeyEnv: "KEY_SYB" },
+      ],
+      models: { "msy": { providers: [{ backend: "sya", upstream: "usy" }, { backend: "syb", upstream: "usy" }], affinityPool: 2 } },
+      presets: { "psy": { strategy: "affinity", models: ["msy"] } },
+      backoff: BO,
+    };
+    const { child: childSY, base: baseSY, dir: dirSY } = await startRouterCfg(cfgSY, "KEY_SYA=k\nKEY_SYB=k\n");
+    try {
+      const backendOf = async (opts) => {
+        const rr = await api(baseSY, "/v1/chat/completions", opts);
+        const jj = await rr.json();
+        const m = /^mock:([a-z0-9_-]+)/.exec(jj && jj.choices && jj.choices[0] && jj.choices[0].message && jj.choices[0].message.content);
+        return m ? m[1] : null;
+      };
+      const baseOpts = { model: "psy", messages: [] };
+      const b1a = await backendOf({ body: { ...baseOpts, session_id: "sy-body-1" } });
+      const b1b = await backendOf({ body: { ...baseOpts, session_id: "sy-body-1" } });
+      const b1c = await backendOf({ body: { ...baseOpts, session_id: "sy-body-1" } });
+      assert(b1a && b1a === b1b && b1b === b1c, "y1) body session_id binds one session to one backend (" + JSON.stringify([b1a, b1b, b1c]) + ")");
+      const b2a = await backendOf({ body: { ...baseOpts, sessionId: "sy-case-1" } });
+      const b2b = await backendOf({ body: { ...baseOpts, sessionId: "sy-case-1" } });
+      assert(b2a && b2a === b2b, "y2) body sessionId (camelCase) binds one session to one backend (" + JSON.stringify([b2a, b2b]) + ")");
+      const h1 = await backendOf({ body: { ...baseOpts, session_id: "sy-body-1" }, headers: { "x-session-id": "sy-head-1" } });
+      const h2 = await backendOf({ body: { ...baseOpts, session_id: "sy-body-1" }, headers: { "x-session-id": "sy-head-1" } });
+      const h3 = await backendOf({ body: { ...baseOpts }, headers: { "x-session-id": "sy-head-1" } });
+      assert(h1 && h1 === h2 && h2 === h3, "y3) x-session-id header wins over body session_id (" + JSON.stringify([h1, h2, h3]) + ")");
+    } finally {
+      childSY.kill();
+      srvA.srv.close(); srvB.srv.close();
+      await rm(dirSY, { recursive: true, force: true });
+    }
+  }
+
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
 }
