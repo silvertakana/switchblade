@@ -1374,6 +1374,194 @@ async function main() {
     }
   }
 
+  // z19) preset-of-presets: a preset whose models list contains another preset
+  //      id expands to the nested preset's models (recursively), preserving
+  //      declared order, with the TOP-LEVEL strategy governing the ordering.
+  {
+    const z19a = mockBackend("z19a", {});
+    const z19b = mockBackend("z19b", {});
+    const z19c = mockBackend("z19c", {});
+    const z19d = mockBackend("z19d", {});
+    const portsZ19 = await Promise.all([listen(z19a.srv), listen(z19b.srv), listen(z19c.srv), listen(z19d.srv)]);
+    z19a.port = portsZ19[0]; z19b.port = portsZ19[1]; z19c.port = portsZ19[2]; z19d.port = portsZ19[3];
+    const cfgZ19 = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "z19a", baseURL: `http://${HOST}:${z19a.port}`, apiKeyEnv: "KEY_Z19A" },
+        { id: "z19b", baseURL: `http://${HOST}:${z19b.port}`, apiKeyEnv: "KEY_Z19B" },
+        { id: "z19c", baseURL: `http://${HOST}:${z19c.port}`, apiKeyEnv: "KEY_Z19C" },
+        { id: "z19d", baseURL: `http://${HOST}:${z19d.port}`, apiKeyEnv: "KEY_Z19D" },
+      ],
+      models: {
+        "m19a": { providers: [{ backend: "z19a", upstream: "u19a" }], affinityPool: 1 },
+        "m19b": { providers: [{ backend: "z19b", upstream: "u19b" }], affinityPool: 1 },
+        "m19c": { providers: [{ backend: "z19c", upstream: "u19c" }], affinityPool: 1 },
+        "m19d": { providers: [{ backend: "z19d", upstream: "u19d" }], affinityPool: 1 },
+      },
+      presets: {
+        "glm": { strategy: "failover", models: ["m19a", "m19b"] },   // nested preset
+        "os": { strategy: "affinity", models: ["m19c", "m19d"] },    // nested preset (own strategy ignored)
+        "super": { strategy: "failover", models: ["glm", "os"] },    // tier aggregating two presets
+      },
+      backoff: BO,
+    };
+    const { child: childZ19, base: baseZ19, dir: dirZ19 } = await startRouterCfg(cfgZ19, "KEY_Z19A=k\nKEY_Z19B=k\nKEY_Z19C=k\nKEY_Z19D=k\n");
+    try {
+      // /v1/models: presets first (config order), models not already listed.
+      const mods = await (await api(baseZ19, "/v1/models", { method: "GET" })).json();
+      const ids = (mods.data || []).map((m) => m.id);
+      const presetFirst = ids[0] === "glm" && ids[1] === "os" && ids[2] === "super" && ids.includes("m19a");
+      // failover through nested presets: m19a serves (declared order, own
+      // strategies ignored for ordering).
+      const rr = await api(baseZ19, "/v1/chat/completions", { body: { model: "super", messages: [] } });
+      const bb = await rr.json();
+      const served = rr.headers.get("x-router-backend");
+      const routedModel = (await (await api(baseZ19, "/api/history?limit=1", { method: "GET" })).json()).entries[0].routedModel;
+      assert(
+        rr.status === 200 && /^mock:z19a/.test(bb.choices[0].message.content) && served === "z19a" && routedModel === "m19a",
+        "z19a) preset-of-presets: nested preset expands, failover serves first expanded model (status=" + rr.status + ", served=" + served + ", routedModel=" + routedModel + ")"
+      );
+      assert(presetFirst, "z19b) /v1/models unchanged by nesting: presets first, then models (" + JSON.stringify(ids) + ")");
+      // /api/config derived members include nested presets' backends.
+      const cfgBody = await (await api(baseZ19, "/api/config", { method: "GET" })).json();
+      const superMembers = cfgBody.presets.super.members.map((m) => m.backend);
+      assert(
+        JSON.stringify(superMembers) === JSON.stringify(["z19a", "z19b", "z19c", "z19d"]),
+        "z19c) derived members expand nested presets (" + JSON.stringify(superMembers) + ")"
+      );
+    } finally {
+      childZ19.kill();
+      z19a.srv.close(); z19b.srv.close(); z19c.srv.close(); z19d.srv.close();
+      await rm(dirZ19, { recursive: true, force: true });
+    }
+  }
+
+  // z20) preset-of-presets cycle A->B->A terminates with a clean response (no
+  //      hang, no crash): the cycle is cut, valid siblings still route.
+  {
+    const z20a = mockBackend("z20a", {});
+    const z20b = mockBackend("z20b", {});
+    const portsZ20 = await Promise.all([listen(z20a.srv), listen(z20b.srv)]);
+    z20a.port = portsZ20[0]; z20b.port = portsZ20[1];
+    const cfgZ20 = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "z20a", baseURL: `http://${HOST}:${z20a.port}`, apiKeyEnv: "KEY_Z20A" },
+        { id: "z20b", baseURL: `http://${HOST}:${z20b.port}`, apiKeyEnv: "KEY_Z20B" },
+      ],
+      models: {
+        "m20a": { providers: [{ backend: "z20a", upstream: "u20a" }], affinityPool: 1 },
+        "m20b": { providers: [{ backend: "z20b", upstream: "u20b" }], affinityPool: 1 },
+      },
+      presets: {
+        "a": { strategy: "affinity", models: ["b"] },          // a -> b -> a cycle
+        "b": { strategy: "affinity", models: ["a", "m20b"] },  // cycle cut at 'a', m20b survives
+      },
+      backoff: BO,
+    };
+    const { child: childZ20, base: baseZ20, dir: dirZ20 } = await startRouterCfg(cfgZ20, "KEY_Z20A=k\nKEY_Z20B=k\n");
+    try {
+      const rr = await api(baseZ20, "/v1/chat/completions", { body: { model: "a", messages: [] } });
+      const bb = await rr.json();
+      const served = rr.headers.get("x-router-backend");
+      const routedModel = (await (await api(baseZ20, "/api/history?limit=1", { method: "GET" })).json()).entries[0].routedModel;
+      assert(
+        rr.status === 200 && /^mock:z20b/.test(bb.choices[0].message.content) && served === "z20b" && routedModel === "m20b",
+        "z20a) cycle a->b->a terminates, valid sibling model routes (status=" + rr.status + ", served=" + served + ", routedModel=" + routedModel + ")"
+      );
+    } finally {
+      childZ20.kill();
+      z20a.srv.close(); z20b.srv.close();
+      await rm(dirZ20, { recursive: true, force: true });
+    }
+  }
+
+  // z21) unit-level: top-level strategy governs ordering over the EXPANDED
+  //      list. failover through a nested preset's models in declared order;
+  //      weighted keeps the top-level weight of the nested preset position.
+  {
+    const wcfg = {
+      backends: [
+        { id: "b1", model: "u1" }, { id: "b2", model: "u2" },
+        { id: "b3", model: "u3" }, { id: "b4", model: "u4" },
+      ],
+      models: {
+        "m1": { providers: [{ backend: "b1", upstream: "u1" }] },
+        "m2": { providers: [{ backend: "b2", upstream: "u2" }] },
+        "m3": { providers: [{ backend: "b3", upstream: "u3" }] },
+        "m4": { providers: [{ backend: "b4", upstream: "u4" }] },
+      },
+      presets: {
+        "glm": { strategy: "failover", models: ["m1", "m2"] },
+        "os": { strategy: "affinity", models: ["m3", "m4"] },
+        "super": { strategy: "failover", models: ["glm", "os"] },
+        "superW": { strategy: "weighted", models: [{ model: "glm", weight: 3 }, { model: "os", weight: 1 }] },
+      },
+    };
+    normalizeConfig(wcfg);
+    const fo = candidates(wcfg, "super", "sess");
+    assert(
+      JSON.stringify(fo.models) === JSON.stringify(["m1", "m2", "m3", "m4"]) &&
+      JSON.stringify(fo.ordered.map((o) => o.model)) === JSON.stringify(["m1", "m2", "m3", "m4"]),
+      "z21a) failover: nested presets expand in declared order, top-level strategy governs (" + JSON.stringify(fo.ordered.map((o) => o.model)) + ")"
+    );
+    // weighted: rng 0.01 -> glm band (weight 3) -> first model m1; rest weight
+    // desc with declared-order tiebreak: m2 (glm's second), then os models.
+    const cw = candidates(wcfg, "superW", "sess", () => 0.01);
+    assert(
+      JSON.stringify(cw.ordered.map((o) => o.model)) === JSON.stringify(["m1", "m2", "m3", "m4"]),
+      "z21b) weighted: nested preset refs carry top-level weight (" + JSON.stringify(cw.ordered.map((o) => o.model)) + ")"
+    );
+    // nested preset's own strategy is ignored for ordering (os is affinity but
+    // inside a failover parent it contributes declared order).
+    assert(
+      JSON.stringify(candidates(wcfg, "super", "sess").ordered.map((o) => o.backend)) === JSON.stringify(["b1", "b2", "b3", "b4"]),
+      "z21c) nested preset own strategy ignored: failover parent, declared order (" + JSON.stringify(candidates(wcfg, "super", "sess").ordered.map((o) => o.backend)) + ")"
+    );
+  }
+
+  // z22) unknown id inside a preset-of-presets context is dropped (with warn),
+  //      valid sibling models still route.
+  {
+    const z22a = mockBackend("z22a", {});
+    const z22b = mockBackend("z22b", {});
+    const portsZ22 = await Promise.all([listen(z22a.srv), listen(z22b.srv)]);
+    z22a.port = portsZ22[0]; z22b.port = portsZ22[1];
+    const cfgZ22 = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "z22a", baseURL: `http://${HOST}:${z22a.port}`, apiKeyEnv: "KEY_Z22A" },
+        { id: "z22b", baseURL: `http://${HOST}:${z22b.port}`, apiKeyEnv: "KEY_Z22B" },
+      ],
+      models: {
+        "m22a": { providers: [{ backend: "z22a", upstream: "u22a" }], affinityPool: 1 },
+        "m22b": { providers: [{ backend: "z22b", upstream: "u22b" }], affinityPool: 1 },
+      },
+      presets: {
+        "ghost": { strategy: "affinity", models: ["nope-model"] },   // unknown -> dropped at normalize
+        "base": { strategy: "failover", models: ["m22a"] },
+        "top": { strategy: "failover", models: ["base", "ghost", "m22b"] }, // ghost has 0 valid models; m22b survives
+      },
+      backoff: BO,
+    };
+    const { child: childZ22, base: baseZ22, dir: dirZ22 } = await startRouterCfg(cfgZ22, "KEY_Z22A=k\nKEY_Z22B=k\n");
+    try {
+      // "top" expands: base -> [m22a], ghost -> [] (unknown dropped at
+      // normalize), m22b. failover declared order -> m22a serves.
+      const rr = await api(baseZ22, "/v1/chat/completions", { body: { model: "top", messages: [] } });
+      const bb = await rr.json();
+      const served = rr.headers.get("x-router-backend");
+      assert(
+        rr.status === 200 && /^mock:z22a/.test(bb.choices[0].message.content) && served === "z22a",
+        "z22a) unknown id inside nested preset dropped; valid siblings route (status=" + rr.status + ", served=" + served + ")"
+      );
+    } finally {
+      childZ22.kill();
+      z22a.srv.close(); z22b.srv.close();
+      await rm(dirZ22, { recursive: true, force: true });
+    }
+  }
+
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
 }

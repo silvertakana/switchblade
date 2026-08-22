@@ -206,7 +206,9 @@ Design decisions worth stating plainly:
 - `models[id].params`, `models[id].meta`: optional.
 - `presets[id].models[]`: strings or `{model, weight}` objects (weight only
   matters for `weighted`; default 1, must be > 0). MUST reference existing
-  model ids (else dropped with console.warn).
+  model ids or existing preset ids (else dropped with console.warn). A ref to
+  another preset id creates a PRESET OF PRESETS (tier-style nesting, section
+  3a): that preset's model list is expanded in place at request time.
 - `presets[id].strategy`: affinity | failover | weighted (default affinity,
   unknown values warn + default).
 - `presets[id].affinityPool`: default 1, applies to the preset's model
@@ -272,6 +274,85 @@ Session-affinity hashing (`hashStr`, sha256 readUInt32BE), the health registry
 (keyed by backend id), weekly pinning, backoff, metrics, stream tee, JSONL
 history: UNCHANGED. This is a hard requirement: for an identical effective
 config, the same session key must hash to the same primary backend as before.
+
+---
+
+## 3a. Preset-of-presets (tier-style nesting)
+
+A preset's `models` array may reference MODEL ids AND/OR PRESET ids. A ref to
+another preset is expanded, recursively, into that preset's model list at
+request time (and at derived-`members` computation). This gives tier
+abstraction: `lite`/`standard`/`pro`/`super` tiers, each an aggregation, where
+a tier can reuse another tier's full definition.
+
+```jsonc
+"presets": {
+  "glm":  { "strategy": "failover", "models": ["glm-5.3", "glm-5.3-lite"] },
+  "os-alpha": { "strategy": "affinity", "models": ["deepseek-v4-flash", "mimo-v2.5-pro"] },
+  "super": { "strategy": "failover", "models": ["glm", "os-alpha"] }
+}
+```
+
+Requesting `super` expands `glm` -> `[glm-5.3, glm-5.3-lite]` and `os-alpha` ->
+`[deepseek-v4-flash, mimo-v2.5-pro]`, producing the flat model list
+`[glm-5.3, glm-5.3-lite, deepseek-v4-flash, mimo-v2.5-pro]` in declared order.
+
+### Expansion semantics
+
+- **In-place flattening, declared order preserved.** Each nested preset's model
+  list is spliced into the parent list exactly where the preset ref appeared.
+  Duplicates in the MODEL list are allowed (they are resolved by the existing
+  backend-dedup pass: first occurrence wins, so a duplicate model contributes
+  no extra attempts).
+- **The top-level preset's strategy governs ordering** over the EXPANDED list
+  (affinity/failover/weighted behave exactly as if the expanded models had
+  been declared directly).
+- **A nested preset's own strategy/affinityPool/weights are IGNORED for
+  ordering.** Only its model list is taken. `os-alpha` above is `affinity`, but
+  inside the `failover` `super` it contributes its two models in declared
+  order, exactly as if `super` had listed the model ids directly.
+- **Weights.** When the top-level strategy is `weighted`, each ref carries its
+  declared weight. A preset ref's weight applies to the whole nested group's
+  first model for the weighted-random pick; the rest of the group is ordered
+  per the standard weighted rule (rest sorted by weight desc, declared-order
+  tiebreak) and each leaf keeps its own weight 1 unless declared otherwise.
+
+### Cycle detection
+
+`A -> B -> A` (or self-reference `A -> A`) must not infinite-loop. Expansion
+carries a visited set of preset ids per path:
+
+- On a cycle, `console.warn` once per cyclic path (deduped per process), stop
+  expanding that path, and:
+  - if the id that closed the cycle also resolves as a MODEL id (id collision
+    case), keep it as a model in the expanded list;
+  - otherwise drop it.
+- The request still succeeds if any valid model remains (see z20: a valid
+  sibling of the cyclic ref routes normally).
+
+### Collision rule (unchanged)
+
+"Preset wins" at request time is INTACT: if an id is both a preset and a model,
+a request for that id resolves the preset. The special identity case (a preset
+whose `models` list references its own colliding id - produced by path B
+synthesis, `{models: [{model: <same id>}]}`) is treated as a MODEL ref, not a
+nested-preset self-cycle, so legacy synthesized presets keep working
+byte-identically.
+
+### Config validation
+
+`normalizeConfig` now accepts a preset ref if the id exists in EITHER
+namespace (`models[id]` or `presets[id]`). An id in neither is still dropped
+with the existing `dropping unknown model '<id>'` warning. The derived
+read-only `members` array (flattened provider backends) recursively expands
+nested preset refs, so `/api/config` and the UI keep showing the full provider
+chain of a tier preset.
+
+### /v1/models
+
+Unchanged: preset ids first (config order), then model ids not already listed.
+A preset-of-presets does NOT change the id list - nested presets are already
+listed as their own ids.
 
 ---
 
@@ -342,7 +423,8 @@ On every config load (initial + hot-reload), after normalization:
 - Unknown strategy -> warn + default affinity.
 - Provider referencing an unknown backend id -> drop + warn.
 - Provider with no resolvable upstream -> drop + warn.
-- Preset referencing an unknown model id -> drop + warn.
+- Preset referencing an unknown model id (an id that is neither a model nor a
+  preset) -> drop + warn.
 - Legacy weighted preset collapsed (section 6) -> warn.
 - Model id colliding with a preset id -> warn once.
 - A preset left with zero valid models, or a model with zero valid providers,
@@ -369,9 +451,10 @@ Request-time 404 messages (type `model_not_found`, same shape as today):
 - `GET /api/config`: returns the normalized config: backends (apiKeyEnv NAMES
   only, never values), models with normalized providers, presets with
   normalized `models` arrays PLUS a derived read-only `members` array
-  `[{backend, weight: 1}]` (flattened provider backends of the preset's models,
-  first-occurrence order, deduped) kept for UI/test compatibility across the
-  phased rollout, top-level `params` when present, backoff. Never key values.
+  `[{backend, weight: 1}]` (flattened provider backends of the preset's models
+  - nested preset refs recursively expanded, first-occurrence order, deduped)
+  kept for UI/test compatibility across the phased rollout, top-level `params`
+  when present, backoff. Never key values.
 - `/health`, `/api/stats`, `/api/history` (entries gain `routedModel`),
   `/v1/chat/completions`, `/admin/*`: unchanged shapes apart from `routedModel`.
 
@@ -682,9 +765,23 @@ backends capture payloads):
     cool the session's primary backend; request -> served by the other
     provider; success does NOT clear the manual cool (/health manual still
     true); uncool restores. Complements u/w with the model layer in between.
+16. z19 preset-of-presets expansion: preset `super` = failover [glm, os] where
+    glm and os are themselves presets (failover/affinity) -> request routes to
+    the first EXPANDED model; /v1/models unchanged (presets first, then
+    models); derived `members` on `super` includes all four backends.
+17. z20 cycle termination: presets a -> [b], b -> [a, m20b] (cycle A->B->A) ->
+    request to `a` succeeds via m20b, no hang/crash; the cycle path warns once
+    and is cut.
+18. z21 ordering rules (unit): failover parent over nested presets preserves
+    declared expansion order; weighted parent applies the top-level weight of
+    the nested preset position; a nested preset's own strategy is ignored for
+    ordering.
+19. z22 unknown id in nesting: a preset whose models list contains an unknown
+    id (dropped at normalize) inside a nested preset context; valid sibling
+    models still route.
 
-Expected total after phase 1: 63 + 15 = 80 passing asserts (63 legacy names,
-y-block rewritten in place, plus z1..z15).
+Expected total after preset-of-presets: 80 + 11 = 91 passing asserts (63
+legacy names, y-block, z1..z18 = 83 baseline, plus z19..z22 = 8 more).
 
 ---
 
