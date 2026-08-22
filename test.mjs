@@ -295,10 +295,13 @@ async function main() {
     r = await api(base, "/v1/chat/completions", { body: detailReqBody });
     assert(r.status === 200, "m2a) fresh request for detail lookup succeeds (status=" + r.status + ")");
     const servedBackendM2 = r.headers.get("x-router-backend");
+    const callHeaderM2 = r.headers.get("x-router-call");
+    assert(!!callHeaderM2 && /^c/.test(callHeaderM2), "m2a2) response carries an x-router-call id (header=" + callHeaderM2 + ")");
     r = await api(base, "/api/history?limit=5", { method: "GET" });
     body = await r.json();
     const latest = (body.entries || [])[0];
     assert(latest && latest.model === "deepseek-v4-flash" && latest.status === 200, "m2b) newest history entry is the fresh request (latest=" + JSON.stringify(latest) + ")");
+    assert(latest && latest.callId && latest.callId === callHeaderM2, "m2b2) history entry carries the same callId as the response header (entry=" + (latest && latest.callId) + ", header=" + callHeaderM2 + ")");
     r = await api(base, "/api/history/detail?t=" + latest.t, { method: "GET" });
     const detailResp = await r.json();
     const dr = detailResp && detailResp.detail;
@@ -309,11 +312,33 @@ async function main() {
       dr.attempts[0].status === 200 && dr.response && dr.response.status === 200 && dr.response.preview != null,
       "m2c) detail endpoint returns stored payload + attempts + response summary (backend=" + servedBackendM2 + ", attempts=" + (dr && dr.attempts && dr.attempts.length) + ")"
     );
+    // m2c2) detail is also reachable by call id (the "Call" column lookup).
+    r = await api(base, "/api/history/detail?call=" + encodeURIComponent(latest.callId), { method: "GET" });
+    const drCall = await r.json();
+    assert(
+      r.status === 200 && drCall.detail && drCall.detail.t === latest.t &&
+      drCall.detail.payload && drCall.detail.payload.messages && drCall.detail.payload.messages[0].content === "detail-check",
+      "m2c2) detail endpoint resolves by call id (call=" + latest.callId + ", t=" + (drCall.detail && drCall.detail.t) + ")"
+    );
     r = await api(base, "/api/history/detail?t=" + (latest.t + 999999), { method: "GET" });
     const missResp = await r.json();
     assert(r.status === 404 && missResp.error === "not found", "m2d) detail endpoint 404s for unknown t (status=" + r.status + ")");
     r = await api(base, "/api/history/detail", { method: "GET" });
     assert(r.status === 404, "m2e) detail endpoint 404s when t is missing (status=" + r.status + ")");
+
+    // m3) oversized request bodies still get a (bounded) detail record.
+    const bigContent = "x".repeat(120000); // > DETAIL_MAX_BODY_BYTES (100 KB)
+    r = await api(base, "/v1/chat/completions", { body: { model: "deepseek-v4-flash", messages: [{ role: "user", content: bigContent }], max_tokens: 5 } });
+    assert(r.status === 200, "m3a) oversized-body request succeeds (status=" + r.status + ")");
+    const bigCall = r.headers.get("x-router-call");
+    r = await api(base, "/api/history/detail?call=" + encodeURIComponent(bigCall), { method: "GET" });
+    const bigDr = await r.json();
+    assert(
+      r.status === 200 && bigDr.detail && bigDr.detail.payload && Array.isArray(bigDr.detail.payload.messages) &&
+      bigDr.detail.payload.messages[0].content.length < bigContent.length &&
+      /truncated/.test(bigDr.detail.payload.messages[0].content),
+      "m3b) oversized body stored bounded (contentLen=" + (bigDr.detail && bigDr.detail.payload && bigDr.detail.payload.messages && bigDr.detail.payload.messages[0].content.length) + ")"
+    );
 
     // n) manual cool / uncool via /admin/backend, then reflect in /health.
     const coolStates = [];

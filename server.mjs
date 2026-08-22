@@ -157,7 +157,15 @@ function resetAllHealth() {
 // ---- history + stats ----------------------------------------------------------
 
 const HISTORY_CAP = 500;
-const HISTORY = []; // ring buffer (newest at tail): {t, model, backend, stream, status, latencyMs, ttftMs, promptTokens, completionTokens, cacheHit, genMs, session}
+const HISTORY = []; // ring buffer (newest at tail): {t, callId, model, backend, stream, status, latencyMs, ttftMs, promptTokens, completionTokens, cacheHit, genMs, session}
+// Collision-safe counter + entropy mix so two calls in the same ms still
+// produce distinct ids; the `c` prefix keeps the id grep-able in logs.
+let callCounter = 0;
+function newCallId() {
+  callCounter = (callCounter + 1) % 1296; // 36^2, wraps harmlessly
+  const entropy = crypto.randomBytes(5).toString("base64url").slice(0, 8);
+  return "c" + callCounter.toString(36).padStart(2, "0") + entropy;
+}
 const STATS = {
   since: Date.now(),
   total: 0,
@@ -196,18 +204,42 @@ function recordHistory(entry) {
 //   unique enough within the ring buffer (Date.now() per request).
 const DETAIL_CAP = 100;
 const DETAIL_MAX_BODY_BYTES = 100000;
-const DETAILS = []; // ring buffer (newest at tail): {t, payload, attempts, ...}
+const DETAILS = []; // ring buffer (newest at tail): {t, callId, payload, attempts, ...}
+
+// Bounded copy of the outgoing payload for the deep-dive store. Requests whose
+// raw body exceeds DETAIL_MAX_BODY_BYTES would otherwise be skipped entirely
+// (no detail record at all); instead we keep a truncated copy so every request
+// stays inspectable without holding multi-hundred-KB payloads in memory:
+// message content is clipped per message, and tool schemas are reduced to the
+// first few with the true count preserved.
+function boundedPayload(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  const out = { ...payload };
+  if (Array.isArray(out.messages)) {
+    out.messages = out.messages.map((m) => {
+      const c = { ...m };
+      if (typeof c.content === "string" && c.content.length > 400) c.content = c.content.slice(0, 400) + "…[truncated]";
+      return c;
+    });
+  }
+  if (Array.isArray(out.tools)) {
+    out._truncated = { tools: out.tools.length, kept: Math.min(out.tools.length, 5) };
+    out.tools = out.tools.slice(0, 5);
+  }
+  return out;
+}
 
 // Record (or update) the deep-dive detail record for the request whose summary
-// entry timestamp is `t`. Pass the full outgoing request payload (what forward()
-// sent, never API keys - keys live only in env) and an append-style attempt
-// record. Retries may already exist on the detail record (a parallel thread can
-// call this per attempt), so this function merges into attempts[] by appending.
-function recordDetail(t, payload, attempt) {
+// entry timestamp is `t` (and whose call id is `callId`). Pass the outgoing
+// request payload (what forward() sent, never API keys - keys live only in
+// env) and an append-style attempt record. Retries may already exist on the
+// detail record (a parallel thread can call this per attempt), so this
+// function merges into attempts[] by appending.
+function recordDetail(t, callId, payload, attempt) {
   if (!t || !payload || typeof payload !== "object") return;
   let rec = DETAILS.find((d) => d.t === t);
   if (!rec) {
-    rec = { t, payload, attempts: [] };
+    rec = { t, callId: callId || null, payload, attempts: [] };
     DETAILS.push(rec);
     if (DETAILS.length > DETAIL_CAP) DETAILS.shift();
   }
@@ -224,9 +256,15 @@ function finalizeDetail(t, summary) {
   if (summary) rec.response = summary;
 }
 
-// Get a detail record by summary timestamp. Returns the record or null.
+// Get a detail record by summary timestamp, or by call id. Returns the record
+// or null.
 function getDetail(t) {
   return DETAILS.find((d) => d.t === t) || null;
+}
+
+function getDetailByCall(callId) {
+  if (!callId) return null;
+  return DETAILS.find((d) => d.callId === callId) || null;
 }
 
 // Canonical history entry shape with metric defaults, so every row (success
@@ -236,6 +274,11 @@ function getDetail(t) {
 function newHistoryEntry(f) {
   return {
     t: f.t ?? Date.now(),
+    // Stable per-request id for cross-referencing ("that call c-…"). Legacy
+    // entries (pre-callId JSONL lines or rows built without one) get a
+    // deterministic id derived from their timestamp so every row is
+    // referenceable, not just new ones.
+    callId: f.callId ?? "t" + (f.t ?? Date.now()).toString(36),
     model: f.model,
     backend: f.backend,
     stream: !!f.stream,
@@ -885,6 +928,10 @@ async function handleChat(req, res, cfg, bodyText) {
   }
 
   const sessionKey = sessionKeyOf(req, body);
+  // One call id per incoming request, shared by the history entry, the detail
+  // record, and the x-router-call response header so any request can be
+  // referenced by a single short id.
+  const callId = newCallId();
   const c = candidates(cfg, modelId, sessionKey);
   if (!c) {
     const e = newError(404, JSON.stringify({ error: { message: `model '${modelId}' not found`, type: "model_not_found" } }));
@@ -925,28 +972,29 @@ async function handleChat(req, res, cfg, bodyText) {
     if (pool.length === 0) {
       const latencyMs = Date.now() - started;
       const detailT = Date.now();
-      const entry = newHistoryEntry({ t: detailT, model: modelId, backend: "none", stream, status: 503, latencyMs, session: sessionKey, routedModel: c.ordered[0] ? c.ordered[0].model : null });
+      const entry = newHistoryEntry({ t: detailT, callId, model: modelId, backend: "none", stream, status: 503, latencyMs, session: sessionKey, routedModel: c.ordered[0] ? c.ordered[0].model : null });
       recordHistory(entry);
       recordStats({ backend: "none", model: modelId, status: 503, latencyMs });
       // Detail record even with no attempts: captures the payload + a "no
       // candidates were eligible" note so the empty-pool 503 is inspectable.
-      if (bodyText.length <= DETAIL_MAX_BODY_BYTES) {
-        recordDetail(detailT, { ...body }, null);
-        finalizeDetail(detailT, {
-          status: 503,
-          ttftMs: 0,
-          latencyMs,
-          genMs: 0,
-          promptTokens: 0,
-          completionTokens: 0,
-          reasoningTokens: 0,
-          cacheHit: null,
-          preview: null,
-          errorBody: `all available backends are cooling (${manualCooled.size} manually cooled - uncool to restore)`,
-          noEligibleBackends: true,
-        });
-      }
+      // Always recorded; oversized bodies are stored bounded (see
+      // boundedPayload) so the panel never silently 404s.
+      recordDetail(detailT, callId, bodyText.length <= DETAIL_MAX_BODY_BYTES ? { ...body } : boundedPayload(body), null);
+      finalizeDetail(detailT, {
+        status: 503,
+        ttftMs: 0,
+        latencyMs,
+        genMs: 0,
+        promptTokens: 0,
+        completionTokens: 0,
+        reasoningTokens: 0,
+        cacheHit: null,
+        preview: null,
+        errorBody: `all available backends are cooling (${manualCooled.size} manually cooled - uncool to restore)`,
+        noEligibleBackends: true,
+      });
       res.setHeader("x-router-backend", "none");
+      res.setHeader("x-router-call", callId);
       const msg = JSON.stringify({
         error: {
           message: `all available backends are cooling (${manualCooled.size} manually cooled - uncool to restore)`,
@@ -1008,7 +1056,9 @@ async function handleChat(req, res, cfg, bodyText) {
       errorBody: result.err ? (result.err.body || null) : null,
       retry: typeof attempt.retry === "number" ? attempt.retry : (attempt.attemptIndex != null ? attempt.attemptIndex : null),
     };
-    if (captureDetail) recordDetail(detailT, payload, attemptRec);
+    // Always record the attempt in the deep-dive store; oversized bodies are
+    // stored bounded (see boundedPayload) so the panel never silently 404s.
+    recordDetail(detailT, callId, captureDetail ? payload : boundedPayload(payload), attemptRec);
     if (result.err) {
       lastErr = result.err;
       markFailure(cfg, attempt.backend, result.err.status, result.err.body);
@@ -1022,7 +1072,7 @@ async function handleChat(req, res, cfg, bodyText) {
     const latencyMs = Date.now() - started;
     let metrics;
     try {
-      metrics = await relay(res, result.res, stream, attempt.backend, started);
+      metrics = await relay(res, result.res, stream, attempt.backend, started, callId);
     } catch (e) {
       // Belt-and-suspenders: relay() already catches internally, but metric
       // collection must never crash the router.
@@ -1031,7 +1081,7 @@ async function handleChat(req, res, cfg, bodyText) {
     }
     const genSec = (metrics.genMs || 0) / 1000;
     const entry = newHistoryEntry({
-      t: detailT, model: modelId, backend: attempt.backend, stream, status: 200, latencyMs,
+      t: detailT, callId, model: modelId, backend: attempt.backend, stream, status: 200, latencyMs,
       ttftMs: metrics.ttftMs ?? latencyMs,
       promptTokens: metrics.promptTokens ?? 0,
       completionTokens: metrics.completionTokens ?? 0,
@@ -1066,24 +1116,25 @@ async function handleChat(req, res, cfg, bodyText) {
   // All attempts failed (or were skipped): record the exhausted failure with a
   // 503. The detail record keyed by detailT holds every attempt's outcome.
   const latencyMs = Date.now() - started;
-  const failEntry = newHistoryEntry({ t: detailT, model: modelId, backend: lastTried ? lastTried.backend : "none", stream, status: 503, latencyMs, session: sessionKey, routedModel: c.ordered[0] ? c.ordered[0].model : null });
+  const failEntry = newHistoryEntry({ t: detailT, callId, model: modelId, backend: lastTried ? lastTried.backend : "none", stream, status: 503, latencyMs, session: sessionKey, routedModel: c.ordered[0] ? c.ordered[0].model : null });
   recordHistory(failEntry);
   recordStats({ backend: lastTried ? lastTried.backend : "none", model: modelId, status: 503, latencyMs });
-  if (captureDetail) {
-    finalizeDetail(detailT, {
-      status: 503,
-      ttftMs: 0,
-      latencyMs,
-      genMs: 0,
-      promptTokens: 0,
-      completionTokens: 0,
-      reasoningTokens: 0,
-      cacheHit: null,
-      preview: null,
-      errorBody: lastErr ? lastErr.body : null,
-    });
-  }
+  // A detail record exists whenever at least one attempt ran (recorded per
+  // attempt above); finalize it unconditionally.
+  finalizeDetail(detailT, {
+    status: 503,
+    ttftMs: 0,
+    latencyMs,
+    genMs: 0,
+    promptTokens: 0,
+    completionTokens: 0,
+    reasoningTokens: 0,
+    cacheHit: null,
+    preview: null,
+    errorBody: lastErr ? lastErr.body : null,
+  });
   res.setHeader("x-router-backend", lastTried ? lastTried.backend : "none");
+  res.setHeader("x-router-call", callId);
   const msg = lastErr ? lastErr.body : "all backends unavailable";
   return writeError(res, newError(503, typeof msg === "string" && msg ? msg : JSON.stringify({ error: { message: "all backends cooling", type: "router_unavailable" } })));
 }
@@ -1303,12 +1354,13 @@ function reasoningNormalizeTransform() {
 // preview is the first content fragment (stream: first content delta;
 // non-stream: first choice's message content), truncated to 200 chars.
 // Never throws: on any failure it closes the response and returns what it has.
-async function relay(res, upstreamRes, stream, backendId, started) {
+async function relay(res, upstreamRes, stream, backendId, started, callId) {
   const ttftMs = Date.now() - started;
   const headers = {
     "content-type": upstreamRes.headers.get("content-type") || "application/json",
     "x-router-backend": backendId || "unknown",
   };
+  if (callId) headers["x-router-call"] = callId;
   let cacheHit = null;   // tri-state: true / false / null (unknown - no signal)
   let promptTokens = 0;
   let completionTokens = 0;
@@ -1497,9 +1549,12 @@ function server() {
     }
 
     if (req.method === "GET" && url === "/api/history/detail") {
-      const raw = new URL(req.url, "http://localhost").searchParams.get("t");
-      const t = raw != null && raw !== "" ? Number(raw) : NaN;
-      const detail = !Number.isNaN(t) ? getDetail(t) : null;
+      const params = new URL(req.url, "http://localhost").searchParams;
+      // Look up by call id (preferred, from the "Call" column) or legacy t.
+      const callId = params.get("call");
+      const rawT = params.get("t");
+      const t = rawT != null && rawT !== "" ? Number(rawT) : NaN;
+      const detail = (callId ? getDetailByCall(callId) : null) || (!Number.isNaN(t) ? getDetail(t) : null);
       if (!detail) {
         res.writeHead(404, { "content-type": "application/json" });
         return res.end(JSON.stringify({ error: "not found" }));

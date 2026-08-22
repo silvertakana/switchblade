@@ -220,7 +220,7 @@ three-layer shape at load, byte-identically for identical effective configs.
 | POST | `/v1/chat/completions` | chat completions (stream + non-stream) |
 | GET | `/api/stats` | traffic stats |
 | GET | `/api/history?limit=N` | request history (default 100, clamp 1..500) |
-| GET | `/api/history/detail?t=<timestamp>` | deep-dive detail for one history entry (payload, attempts, response summary) |
+| GET | `/api/history/detail?t=<timestamp>` or `?call=<callId>` | deep-dive detail for one history entry (payload, attempts, response summary) |
 | GET | `/api/config` | normalized config (env NAMES only, never key values) |
 | POST | `/admin/reset-health` | reset all cooling states |
 | POST | `/admin/backend` | `{id, action: "cool"\|"uncool", forMs?}` manual cool/uncool |
@@ -228,6 +228,15 @@ three-layer shape at load, byte-identically for identical effective configs.
 
 History lives in an in-memory ring buffer (500 entries) and appends to
 `router-history.jsonl` (override with `ROUTER_HISTORY`).
+
+### Call IDs
+
+Every request gets a short, stable `callId` (e.g. `c09AlJGPME`), returned in the
+`x-router-call` response header, stored on its history entry, and shown as the
+**Call** column of the dashboard's request history (with a copy button). Use it
+to reference a specific request in conversation, logs, or scripts — the detail
+endpoint accepts it as `?call=<callId>` (falling back to `?t=<timestamp>` for
+pre-callId rows).
 
 ### Request detail deep dive
 
@@ -244,19 +253,21 @@ the full debug picture for that request:
   usage, cache state, and a first-content preview (truncated to 200 chars).
 
 Detail records are stored **in memory only** (never written to
-`router-history.jsonl`), capped at **100 records** (oldest dropped), and only
-for requests whose raw body is **≤ 100 KB**. Requests with larger bodies still
-appear in the history table but have no deep-dive record. The panel closes via
-the X button, the Escape key, or clicking outside.
+`router-history.jsonl`), capped at **100 records** (oldest dropped). Every
+request gets a detail record; oversized bodies (raw payload > 100 KB) are
+stored truncated (message content clipped, tool schemas kept to a few) so the
+panel never silently 404s. The panel closes via the X button, the Escape key,
+or clicking outside.
 
 ## Web UI
 
 `index.html` — single file, inline CSS + JS, zero external assets, works
 offline. Dashboard: backend cards with live cooling countdowns, traffic stats
 with p50/p95/p99 and cache-hit %, presets table, models table, request history
-with TTFT/TPS/tokens/cache columns and a click-to-open detail panel per row,
-config viewer, and a playground that can stream a chat, show reasoning, compare
-models side by side, and export the conversation.
+with per-request call IDs (copyable), TTFT/TPS/tokens/cache columns and a
+click-to-open detail panel per row, config viewer, and a playground that can
+stream a chat, show reasoning, compare models side by side, and export the
+conversation.
 
 ## Test
 

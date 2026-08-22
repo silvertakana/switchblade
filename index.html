@@ -223,6 +223,17 @@
   .status-miss { color: var(--faint); }
   .status-hit { color: var(--green); font-weight: 600; }
 
+  /* ---- request history: call id cell + copy button ---- */
+  .call-cell { white-space: nowrap; }
+  .call-id { display: inline-flex; align-items: center; gap: 4px; font-family: var(--mono); color: var(--text); }
+  .call-copy {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 18px; height: 18px; padding: 0; margin-left: 2px;
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 4px;
+    color: var(--muted); font-size: 11px; line-height: 1; cursor: pointer; vertical-align: middle;
+  }
+  .call-copy:hover { color: var(--text); border-color: var(--muted); }
+
   /* ---- request detail slide-out panel ---- */
   .detail-overlay {
     position: fixed; inset: 0; z-index: 50;
@@ -460,9 +471,9 @@
       <div style="overflow-x:auto">
         <table>
           <thead>
-            <tr><th scope="col">Time</th><th scope="col">Model</th><th scope="col">Backend</th><th scope="col">Stream</th><th scope="col">Status</th><th scope="col">Latency (ms)</th><th scope="col">TTFT (ms)</th><th scope="col">Tokens</th><th scope="col">Cache</th><th scope="col">Session</th></tr>
+            <tr><th scope="col">Call</th><th scope="col">Time</th><th scope="col">Model</th><th scope="col">Backend</th><th scope="col">Stream</th><th scope="col">Status</th><th scope="col">Latency (ms)</th><th scope="col">TTFT (ms)</th><th scope="col">Tokens</th><th scope="col">Cache</th><th scope="col">Session</th></tr>
           </thead>
-          <tbody id="historyBody"><tr><td colspan="10"><div class="skeleton"></div></td></tr></tbody>
+          <tbody id="historyBody"><tr><td colspan="11"><div class="skeleton"></div></td></tr></tbody>
         </table>
       </div>
     </section>
@@ -1014,6 +1025,14 @@ function renderStats() {
   (directOnly ? '<div class="note">All recent traffic is on direct - the GO accounts are idle (weekly limits or cooling).</div>' : "");
 }
 
+// Call ID cell: shows the short per-request id with a copy button so any row
+// can be referenced elsewhere ("that call c-…"). Clicking the copy button must
+// not trigger the row's open-detail handler, so the button stops propagation.
+function callIdHtml(callId) {
+  return '<span class="call-id" title="Copy call ID">' + esc(callId) +
+    '<button type="button" class="call-copy" data-call="' + esc(callId) + '" title="Copy call ID">⧉</button></span>';
+}
+
 function renderHistory() {
   const body = $("historyBody");
   const sum = $("historyCacheSummary");
@@ -1030,7 +1049,7 @@ function renderHistory() {
   const pct = known > 0 ? Math.round((hits / known) * 100) : 0;
   if (entries.length === 0) {
     sum.style.display = "none";
-    body.innerHTML = '<tr><td colspan="10" class="empty">No requests yet.</td></tr>';
+    body.innerHTML = '<tr><td colspan="11" class="empty">No requests yet.</td></tr>';
     return;
   }
   sum.style.display = "flex";
@@ -1040,7 +1059,8 @@ function renderHistory() {
     "<span>Misses <b>" + misses + "</b></span>" +
     "<span>Known <b>" + known + "</b></span>";
   body.innerHTML = entries.slice(0, 100).map((e) =>
-    '<tr class="hist-row" data-t="' + e.t + '" title="Click for full request detail">' +
+    '<tr class="hist-row" data-t="' + e.t + '" data-call="' + esc(e.callId || "") + '" title="Click for full request detail">' +
+    '<td class="mono call-cell" data-label="Call">' + callIdHtml(e.callId || "t" + e.t) + "</td>" +
     '<td class="mono" data-label="Time">' + fmtTime(e.t) + "</td>" +
     '<td data-label="Model">' + esc(e.model) + "</td>" +
     '<td data-label="Backend">' + esc(e.backend) + "</td>" +
@@ -1241,38 +1261,43 @@ document.addEventListener("click", (ev) => {
 // per-attempt outcomes, timing, usage, and the response preview. The panel
 // stays open across polls (it re-renders only when a new row is opened or the
 // polled row's data changes) and closes via the X, Escape, or click-outside.
-const detail = { t: null, fetching: false, entry: null };
+const detail = { t: null, call: null, fetching: false, entry: null };
 
 function detailOpen() {
   return $("detailPanel").classList.contains("open");
 }
 
-function openDetail(t, entry) {
+function openDetail(t, entry, callId) {
   detail.t = t;
+  detail.call = callId || null;
   detail.entry = entry || null;
   $("detailPanel").classList.add("open");
   $("detailPanel").setAttribute("aria-hidden", "false");
   $("detailOverlay").classList.add("open");
   $("detailBody").innerHTML = '<div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>';
-  fetchDetail(t);
+  fetchDetail(t, detail.call);
 }
 
 function closeDetail() {
   detail.t = null;
+  detail.call = null;
   detail.fetching = false;
   $("detailPanel").classList.remove("open");
   $("detailPanel").setAttribute("aria-hidden", "true");
   $("detailOverlay").classList.remove("open");
 }
 
-async function fetchDetail(t) {
+async function fetchDetail(t, callId) {
   detail.fetching = true;
   let body;
   try {
-    const r = await fetch("/api/history/detail?t=" + encodeURIComponent(t));
+    // Prefer call id when the row has one (stable across restarts); fall back
+    // to the timestamp for legacy rows without a call id.
+    const q = callId ? "call=" + encodeURIComponent(callId) : "t=" + encodeURIComponent(t);
+    const r = await fetch("/api/history/detail?" + q);
     body = await r.json();
     if (r.status !== 200 || !body || !body.detail) {
-      $("detailBody").innerHTML = '<div class="detail-err">Detail not found for t=' + esc(t) + (body && body.error ? " (" + esc(body.error) + ")" : "") + '. The record may have been dropped by the retention cap or the request was too large to capture.</div>';
+      $("detailBody").innerHTML = '<div class="detail-err">Detail not found for ' + (callId ? "call=" + esc(callId) : "t=" + esc(t)) + (body && body.error ? " (" + esc(body.error) + ")" : "") + '. The record may have been dropped by the retention cap.</div>';
       return;
     }
   } catch (e) {
@@ -1297,6 +1322,7 @@ function detailMetaRows(d) {
   const e = detail.entry || {};
   const resp = d.response || {};
   const rows = [
+    ["Call ID", e.callId ? '<span class="call-id">' + esc(e.callId) + "</span>" : "-"],
     ["Status", '<span class="' + (resp.status >= 400 ? "status-err" : "status-ok") + '">' + (resp.status != null ? resp.status : "?") + "</span>"],
     ["Model (requested)", e.model != null ? esc(String(e.model)) : "-"],
     ["Backend (served)", e.backend != null ? esc(String(e.backend)) : "-"],
@@ -1360,10 +1386,10 @@ function renderDetail(d) {
       "<h4>Attempts <span class='chip'>" + attempts.length + "</span></h4>" + attemptsHtml +
     "</div>" +
     '<div class="detail-section">' +
-      "<h4>Outgoing request payload <span class='chip'>" + (hasPayload ? (d.payload.messages ? (d.payload.messages.length + " messages") : "0 messages") : "not captured") + "</span></h4>" +
+      "<h4>Outgoing request payload <span class='chip'>" + (hasPayload ? (d.payload.messages ? (d.payload.messages.length + " messages" + (d.payload._truncated ? " (truncated)" : "")) : "0 messages") : "not captured") + "</span></h4>" +
       (hasPayload
         ? "<details open><summary>JSON</summary><pre class='detail-pre'>" + highlightJSON(d.payload) + "</pre></details>"
-        : '<div class="detail-empty">Payload not captured (body larger than 100 KB, or this request predates the detail store).</div>') +
+        : '<div class="detail-empty">Payload not captured.</div>') +
     "</div>" +
     '<div class="detail-section">' +
       "<h4>Response summary</h4>" +
@@ -1371,17 +1397,31 @@ function renderDetail(d) {
         ? '<div class="detail-pre preview">' + (preview != null ? esc(String(preview)) : "(no preview captured)") + "</div>"
         : '<div class="detail-empty">No response summary recorded.</div>') +
     "</div>" +
-    '<div class="detail-note">Detail records live in memory only (max 100, oldest dropped) and are never written to disk. Requests with bodies over 100 KB are not captured.</div>';
+    '<div class="detail-note">Detail records live in memory only (max 100, oldest dropped) and are never written to disk. Oversized request bodies are stored truncated.</div>';
 }
 
 // History row click (delegated so newly rendered rows work without rebinding).
 document.addEventListener("click", (ev) => {
+  // Copy button inside the Call cell: copy the id, do NOT open the detail.
+  const copyBtn = ev.target.closest(".call-copy");
+  if (copyBtn) {
+    ev.stopPropagation();
+    const id = copyBtn.getAttribute("data-call");
+    if (id) {
+      copyToClipboard(id).then((ok) => {
+        copyBtn.textContent = ok ? "✓" : "!";
+        setTimeout(() => { copyBtn.textContent = "⧉"; }, 1200);
+      });
+    }
+    return;
+  }
   const row = ev.target.closest("#historyBody tr.hist-row");
   if (row && row.dataset.t) {
     const t = parseInt(row.dataset.t, 10);
+    const callId = row.dataset.call || null;
     const entries = (state.history && state.history.entries) || [];
     const entry = entries.find((en) => en.t === t) || null;
-    openDetail(t, entry);
+    openDetail(t, entry, callId);
   }
 });
 
