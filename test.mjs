@@ -290,6 +290,31 @@ async function main() {
     );
     assert(Array.isArray(body.entries) && !!hit, "m) /api/history has a 200 deepseek-v4-flash entry with backend (entries=" + (body.entries || []).length + ", hit=" + JSON.stringify(hit) + ")");
 
+    // m2) /api/history/detail returns the stored deep-dive payload for a request.
+    const detailReqBody = { model: "deepseek-v4-flash", messages: [{ role: "user", content: "detail-check" }], max_tokens: 7 };
+    r = await api(base, "/v1/chat/completions", { body: detailReqBody });
+    assert(r.status === 200, "m2a) fresh request for detail lookup succeeds (status=" + r.status + ")");
+    const servedBackendM2 = r.headers.get("x-router-backend");
+    r = await api(base, "/api/history?limit=5", { method: "GET" });
+    body = await r.json();
+    const latest = (body.entries || [])[0];
+    assert(latest && latest.model === "deepseek-v4-flash" && latest.status === 200, "m2b) newest history entry is the fresh request (latest=" + JSON.stringify(latest) + ")");
+    r = await api(base, "/api/history/detail?t=" + latest.t, { method: "GET" });
+    const detailResp = await r.json();
+    const dr = detailResp && detailResp.detail;
+    assert(
+      r.status === 200 && dr && dr.payload && dr.payload.model === "deepseek-v4-flash" &&
+      dr.payload.messages && dr.payload.messages[0] && dr.payload.messages[0].content === "detail-check" &&
+      Array.isArray(dr.attempts) && dr.attempts.length >= 1 && dr.attempts[0].backend === servedBackendM2 &&
+      dr.attempts[0].status === 200 && dr.response && dr.response.status === 200 && dr.response.preview != null,
+      "m2c) detail endpoint returns stored payload + attempts + response summary (backend=" + servedBackendM2 + ", attempts=" + (dr && dr.attempts && dr.attempts.length) + ")"
+    );
+    r = await api(base, "/api/history/detail?t=" + (latest.t + 999999), { method: "GET" });
+    const missResp = await r.json();
+    assert(r.status === 404 && missResp.error === "not found", "m2d) detail endpoint 404s for unknown t (status=" + r.status + ")");
+    r = await api(base, "/api/history/detail", { method: "GET" });
+    assert(r.status === 404, "m2e) detail endpoint 404s when t is missing (status=" + r.status + ")");
+
     // n) manual cool / uncool via /admin/backend, then reflect in /health.
     const coolStates = [];
     for (const mid of ["go-primary", "go-alt", "direct"]) {
