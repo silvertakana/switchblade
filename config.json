@@ -131,6 +131,19 @@
         "contextWindow": 1000000,
         "pricing": { "inputPerM": 0.00000003, "outputPerM": 0.00000013 }
       }
+    },
+    "muse-spark-1.2-contributor": {
+      "providers": [
+        { "backend": "commandcode", "upstream": "meta/muse-spark-1.2-contributor" }
+      ],
+      "affinityPool": 1,
+      "params": { "reasoning_effort": "medium" },
+      "retry": { "maxRetries": 3, "baseMs": 2000, "maxMs": 30000, "multiplier": 2, "totalMs": 30000 },
+      "meta": {
+        "label": "Muse Spark 1.2 Contributor",
+        "contextWindow": 1048576,
+        "pricing": { "inputPerM": 0.0000001, "outputPerM": 0.0000002 }
+      }
     }
   },
   "presets": {
@@ -173,6 +186,10 @@
     "qwen3.7-flash": {
       "strategy": "failover",
       "models": ["qwen3.7-flash"]
+    },
+    "muse-spark-1.2-contributor": {
+      "strategy": "failover",
+      "models": ["muse-spark-1.2-contributor"]
     }
   },
   "backoff": {
