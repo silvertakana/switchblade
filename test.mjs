@@ -1308,6 +1308,72 @@ async function main() {
     }
   }
 
+  // z18) reasoning-key normalization: upstreams that emit OpenAI-Reasoning-API
+  // style delta.reasoning (+ reasoning_details) must expose reasoning_content
+  // to the client, because OpenCode's parser reads reasoning_content only.
+  {
+    const reasonSrv = http.createServer((req, res) => {
+      const chunks = [];
+      req.on("data", (c) => chunks.push(c));
+      req.on("end", () => {
+        const body = Buffer.concat(chunks).toString("utf8");
+        const wantStream = body.includes('"stream":true');
+        if (wantStream) {
+          res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+          res.write("data: " + JSON.stringify({ id: "r1", choices: [{ delta: { role: "assistant" } }] }) + "\n\n");
+          res.write("data: " + JSON.stringify({ id: "r1", choices: [{ delta: { reasoning: "Let", reasoning_details: [{ type: "reasoning.text", text: "Let me think", format: "unknown", index: 0 }] } }] }) + "\n\n");
+          res.write("data: " + JSON.stringify({ id: "r1", choices: [{ delta: { reasoning: " me think" } }] }) + "\n\n");
+          res.write("data: " + JSON.stringify({ id: "r1", choices: [{ delta: { content: "Answer: 391." } }] }) + "\n\n");
+          res.write("data: " + JSON.stringify({ id: "r1", choices: [{ delta: {} }], usage: { prompt_tokens: 10, completion_tokens: 12, completion_tokens_details: { reasoning_tokens: 8 } } }) + "\n\n");
+          res.write("data: [DONE]\n\n");
+          res.end();
+          return;
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          id: "r1",
+          choices: [{ message: { role: "assistant", content: "Answer: 391.", reasoning: "Let me think", reasoning_details: [{ type: "reasoning.text", text: "Let me think", format: "unknown", index: 0 }] } }],
+          usage: { prompt_tokens: 10, completion_tokens: 12, completion_tokens_details: { reasoning_tokens: 8 } },
+        }));
+      });
+    });
+    const reasonPort = await listen(reasonSrv);
+    const cfgZ18 = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "r18", baseURL: `http://${HOST}:${reasonPort}`, apiKeyEnv: "KEY_R18" }],
+      models: { "m18": { providers: [{ backend: "r18", upstream: "reason-model" }], affinityPool: 1 } },
+      presets: { "m18": { strategy: "affinity", models: ["m18"] } },
+      backoff: BO,
+    };
+    const { child: childZ18, base: baseZ18, dir: dirZ18 } = await startRouterCfg(cfgZ18, "KEY_R18=k\n");
+    try {
+      const rrStream = await api(baseZ18, "/v1/chat/completions", { body: { model: "m18", messages: [], stream: true } });
+      const sse = await rrStream.text();
+      const hasReasoning = sse.includes('"reasoning"');
+      const hasReasoningContent = sse.includes('"reasoning_content"');
+      const mergedDetail = sse.includes('"reasoning_content":"Let me think"');
+      const hasContent = sse.includes('Answer: 391.');
+      assert(
+        rrStream.status === 200 && hasReasoning && hasReasoningContent && hasContent,
+        "z18a) stream: delta.reasoning AND delta.reasoning_content both present (" +
+          "reasoning=" + hasReasoning + ", reasoning_content=" + hasReasoningContent + ")"
+      );
+      assert(mergedDetail, "z18b) stream: reasoning_details text merged into reasoning_content");
+
+      const rrMsg = await api(baseZ18, "/v1/chat/completions", { body: { model: "m18", messages: [] } });
+      const msg = await rrMsg.json();
+      const m = msg.choices && msg.choices[0] && msg.choices[0].message;
+      assert(
+        rrMsg.status === 200 && m && m.reasoning === "Let me think" && m.reasoning_content === "Let me think",
+        "z18c) non-stream: message.reasoning AND message.reasoning_content both present"
+      );
+    } finally {
+      childZ18.kill();
+      reasonSrv.close();
+      await rm(dirZ18, { recursive: true, force: true });
+    }
+  }
+
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
 }

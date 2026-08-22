@@ -175,12 +175,30 @@ function newHistoryEntry(f) {
     ttftMs: f.ttftMs ?? 0,                       // time to first upstream response (== latencyMs on success)
     promptTokens: f.promptTokens ?? 0,           // prompt usage tokens (0 if upstream did not report)
     completionTokens: f.completionTokens ?? 0,   // completion usage tokens (0 if upstream did not report)
+    reasoningTokens: f.reasoningTokens ?? 0,     // reasoning-only completion tokens (usage.completion_tokens_details.reasoning_tokens; 0 if not reported - "0" and "not reported" are indistinguishable)
     cacheHit: f.cacheHit,                          // tri-state: true (header/usage hit), false (miss reported), null (unknown - no signal)
     genMs: f.genMs ?? 0,                         // generation time: stream duration, or total - ttft for non-stream
     tps: f.tps ?? 0,                             // completion tokens per second (derived)
     session: f.session,
     routedModel: f.routedModel ?? null,          // resolved model id (success: serving attempt; failure: first candidate; null: none)
+    wireParams: f.wireParams ?? null,            // redacted summary of the params actually sent upstream (for explaining reasoning on/off per row)
   };
+}
+
+// Redacted wire-params summary for history: captures which reasoning-relevant
+// keys were actually sent upstream and their values (thinking type,
+// reasoning_effort, max_tokens), WITHOUT copying messages, tools, or any
+// key values. Used to explain per-request reasoning behavior.
+function extractWireParams(payload) {
+  if (!payload || typeof payload !== "object") return null;
+  const p = payload;
+  const out = {};
+  if (p.thinking && typeof p.thinking === "object") out.thinking = String(p.thinking.type || "?");
+  if (p.reasoning_effort != null) out.reasoning_effort = String(p.reasoning_effort);
+  if (p.max_tokens != null) out.max_tokens = p.max_tokens;
+  if (p.temperature != null) out.temperature = p.temperature;
+  if (Array.isArray(p.tools) && p.tools.length) out.tools = p.tools.length;
+  return Object.keys(out).length ? out : null;
 }
 
 function recordStats(entry) {
@@ -619,6 +637,18 @@ async function forward(req, cfg, backend, payload, incomingHeaders, stream) {
 
   const payloadText = JSON.stringify(payload);
 
+  // Debug wire format: log the exact outgoing request body (redacted - never
+  // print key values; the payload holds messages + params only) so operators
+  // can verify what the upstream actually receives.
+  if (process.env.ROUTER_DEBUG_WIRE === "1") {
+    try {
+      const p = JSON.parse(payloadText);
+      const dbg = { ...p };
+      if (Array.isArray(dbg.messages)) dbg.messages = dbg.messages.map((m) => ({ role: m.role, content: String(m.content || "").slice(0, 80) }));
+      console.error(`[wire] ${backend.id} -> ${dbg.model} params=${JSON.stringify(Object.keys(dbg).filter((k) => !["messages", "model", "stream"].includes(k)))} ${JSON.stringify(Object.fromEntries(Object.entries(dbg).filter(([k]) => !["messages", "model", "stream"].includes(k))))}`);
+    } catch {}
+  }
+
   let upstreamRes;
   try {
     upstreamRes = await fetch(upstream, {
@@ -743,7 +773,7 @@ async function handleChat(req, res, cfg, bodyText) {
       // Belt-and-suspenders: relay() already catches internally, but metric
       // collection must never crash the router.
       console.error("relay threw:", e && e.message);
-      metrics = { ttftMs: latencyMs, cacheHit: false, promptTokens: 0, completionTokens: 0, genMs: 0 };
+      metrics = { ttftMs: latencyMs, cacheHit: false, promptTokens: 0, completionTokens: 0, reasoningTokens: 0, genMs: 0 };
     }
     const genSec = (metrics.genMs || 0) / 1000;
     const entry = newHistoryEntry({
@@ -751,11 +781,13 @@ async function handleChat(req, res, cfg, bodyText) {
       ttftMs: metrics.ttftMs ?? latencyMs,
       promptTokens: metrics.promptTokens ?? 0,
       completionTokens: metrics.completionTokens ?? 0,
+      reasoningTokens: metrics.reasoningTokens ?? 0,
       cacheHit: metrics.cacheHit,
       genMs: metrics.genMs ?? 0,
       tps: genSec > 0 && (metrics.completionTokens || 0) > 0 ? Math.round((metrics.completionTokens / genSec) * 10) / 10 : 0,
       session: sessionKey,
       routedModel: attempt.model,
+      wireParams: extractWireParams(payload),
     });
     recordHistory(entry);
     recordStats(entry);
@@ -786,6 +818,7 @@ function makeUsageCollector() {
   let leftover = "";
   let promptTokens = 0;
   let completionTokens = 0;
+  let reasoningTokens = 0;
   let promptCacheHit = 0;
   let promptCacheMiss = 0;
   let cacheFieldSeen = false;
@@ -799,6 +832,10 @@ function makeUsageCollector() {
       if (obj && obj.usage) {
         promptTokens = Number(obj.usage.prompt_tokens) || 0;
         completionTokens = Number(obj.usage.completion_tokens) || 0;
+        // Reasoning token split: reasoning-only completion tokens. Not every
+        // upstream reports it; 0 means either "no reasoning" or "not reported".
+        const rt = obj.usage.completion_tokens_details && obj.usage.completion_tokens_details.reasoning_tokens;
+        reasoningTokens = Number(rt) || 0;
         // DeepSeek/OpenAI-style prompt-cache accounting. Some providers expose
         // prompt_cache_hit_tokens + prompt_cache_miss_tokens; others expose
         // prompt_tokens_details.cached_tokens. Either one means the upstream
@@ -827,7 +864,7 @@ function makeUsageCollector() {
     finalize() {
       if (leftover) consume(leftover);
       leftover = "";
-      return { promptTokens, completionTokens, promptCacheHit, promptCacheMiss, cacheFieldSeen };
+      return { promptTokens, completionTokens, reasoningTokens, promptCacheHit, promptCacheMiss, cacheFieldSeen };
     },
   };
 }
@@ -847,8 +884,86 @@ function usageTransform(collector) {
   });
 }
 
+// Reasoning-key normalization. OpenCode's client parser only reads
+// delta.reasoning_content (DeepSeek-native) while commandcode/OpenAI-Reasoning
+// API style upstreams emit delta.reasoning (+ reasoning_details). Without this,
+// reasoning generated through commandcode never renders in OpenCode. The router
+// keeps the original key AND exposes the normalized one - the playground reads
+// both, so nothing already working changes.
+// Works on a parsed chunk (choices[0].delta or .message) in place; returns the
+// object for convenience.
+function normalizeReasoningKey(obj) {
+  if (!obj || typeof obj !== "object") return obj;
+  for (const holder of ["delta", "message"]) {
+    const slot = obj[holder];
+    if (!slot || typeof slot !== "object") continue;
+    if (slot.reasoning != null && slot.reasoning_content == null) {
+      slot.reasoning_content = slot.reasoning;
+      // Merge the full reasoning_details text when present (commandcode sends
+      // reasoning as short per-token strings with details carrying the full
+      // block; OpenCode renders reasoning_content as one stream).
+      if (Array.isArray(slot.reasoning_details)) {
+        const detailText = slot.reasoning_details
+          .map((d) => (d && typeof d.text === "string" ? d.text : ""))
+          .join("");
+        if (detailText && slot.reasoning_content !== detailText) {
+          slot.reasoning_content = detailText;
+        }
+      }
+    }
+  }
+  return obj;
+}
+
+// SSE transform that normalizes the reasoning key on every data payload while
+// passing everything else through byte-for-byte. Line-boundary safe: it buffers
+// partial lines between chunks, exactly like the usage collector does.
+function reasoningNormalizeTransform() {
+  let leftover = "";
+  return new Transform({
+    transform(chunk, _enc, cb) {
+      try {
+        let text = leftover + (Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk));
+        const lines = text.split("\n");
+        leftover = lines.pop() || "";
+        let out = "";
+        for (const line of lines) {
+          const t = line.trim();
+          if (t.startsWith("data:")) {
+            const payload = t.slice(5).trim();
+            if (payload && payload !== "[DONE]") {
+              try {
+                const obj = JSON.parse(payload);
+                if (obj && obj.choices && obj.choices[0]) {
+                  normalizeReasoningKey(obj.choices[0]);
+                  // Re-serialize the normalized object back into the SSE line.
+                  out += "data: " + JSON.stringify(obj) + "\n";
+                  continue;
+                }
+              } catch {
+                /* non-JSON data line - pass through unchanged */
+              }
+            }
+          }
+          out += line + "\n";
+        }
+        cb(null, out);
+      } catch (e) {
+        // Never break the stream: fall back to passthrough.
+        cb(null, chunk);
+      }
+    },
+    flush(cb) {
+      if (leftover) cb(null, leftover);
+      else cb();
+    },
+  });
+}
+
 // Relay the upstream response to the client while capturing per-request
-// metrics. Returns { ttftMs, cacheHit, promptTokens, completionTokens, genMs }.
+// metrics and normalizing the reasoning key (delta.reasoning ->
+// delta.reasoning_content) for OpenCode compatibility. Returns
+// { ttftMs, cacheHit, promptTokens, completionTokens, genMs }.
 // Never throws: on any failure it closes the response and returns what it has.
 async function relay(res, upstreamRes, stream, backendId, started) {
   const ttftMs = Date.now() - started;
@@ -859,6 +974,7 @@ async function relay(res, upstreamRes, stream, backendId, started) {
   let cacheHit = null;   // tri-state: true / false / null (unknown - no signal)
   let promptTokens = 0;
   let completionTokens = 0;
+  let reasoningTokens = 0;
   let genMs = 0;
   try {
     if (upstreamRes.headers.get("x-request-id")) headers["x-request-id"] = upstreamRes.headers.get("x-request-id");
@@ -870,22 +986,30 @@ async function relay(res, upstreamRes, stream, backendId, started) {
       // accumulates usage data from the final SSE chunk.
       const collector = makeUsageCollector();
       const genStart = Date.now();
-      await pipeline(Readable.fromWeb(upstreamRes.body), usageTransform(collector), res);
+      await pipeline(
+        Readable.fromWeb(upstreamRes.body),
+        usageTransform(collector),
+        reasoningNormalizeTransform(),
+        res
+      );
       genMs = Date.now() - genStart;
       const usage = collector.finalize();
       promptTokens = usage.promptTokens;
       completionTokens = usage.completionTokens;
+      reasoningTokens = usage.reasoningTokens;
       if (cacheHit !== true) {
         cacheHit = usage.cacheFieldSeen ? usage.promptCacheHit > 0 : null;
       }
     } else {
-      const buf = Buffer.from(await upstreamRes.arrayBuffer());
+      let buf = Buffer.from(await upstreamRes.arrayBuffer());
       try {
         const parsed = JSON.parse(buf.toString("utf8"));
         const usage = parsed && parsed.usage;
         if (usage) {
           promptTokens = Number(usage.prompt_tokens) || 0;
           completionTokens = Number(usage.completion_tokens) || 0;
+          const rt = usage.completion_tokens_details && usage.completion_tokens_details.reasoning_tokens;
+          reasoningTokens = Number(rt) || 0;
           if (cacheHit !== true) {
             const hit = Number(usage.prompt_cache_hit_tokens);
             const miss = Number(usage.prompt_cache_miss_tokens);
@@ -895,6 +1019,11 @@ async function relay(res, upstreamRes, stream, backendId, started) {
             if (seen) cacheHit = (!Number.isNaN(hit) ? hit : cachedN) > 0;
             // else keep null (no signal)
           }
+        }
+        // Non-stream: normalize the reasoning key on the first choice message.
+        if (parsed && Array.isArray(parsed.choices) && parsed.choices[0]) {
+          normalizeReasoningKey(parsed.choices[0]);
+          buf = Buffer.from(JSON.stringify(parsed));
         }
       } catch {
         // Body not JSON (e.g. upstream proxy error) — keep token counts at 0.
@@ -911,7 +1040,7 @@ async function relay(res, upstreamRes, stream, backendId, started) {
       /* ignore */
     }
   }
-  return { ttftMs, cacheHit, promptTokens, completionTokens, genMs };
+  return { ttftMs, cacheHit, promptTokens, completionTokens, reasoningTokens, genMs };
 }
 
 function writeError(res, e) {

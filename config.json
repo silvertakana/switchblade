@@ -1,6 +1,5 @@
 {
   "port": 8787,
-  "host": "100.65.175.106",
   "prefix": "/v1",
   "masterKeyEnv": null,
   "backends": [
@@ -25,6 +24,7 @@
         { "backend": "direct", "upstream": "deepseek-v4-flash" }
       ],
       "affinityPool": 3,
+      "params": { "thinking": { "type": "enabled" }, "reasoning_effort": "high" },
       "meta": {
         "label": "DeepSeek V4 Flash",
         "contextWindow": 128000,
