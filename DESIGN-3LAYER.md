@@ -196,6 +196,15 @@ Design decisions worth stating plainly:
   default), `translateDeveloperRole`, `dropParams` remain legal backend fields.
   New optional `params` object (real request params only; `model` inside any
   params layer is ignored with a warning).
+  New optional timeout pair (also legal at top level):
+  `timeoutMs`/`connectTimeoutMs` bound only the HEADER wait (TTFT), default
+  45s; `idleTimeoutMs` bounds SILENCE during the body (stall detection),
+  default 120s. The body is never killed by a wall clock — a slow-but-alive
+  stream runs to completion while a stuck upstream still fails after
+  `idleTimeoutMs` (see section "Timeout semantics").
+- `backends[].timeoutMs`: retained for compatibility; now means the connect/header
+  bound (was: whole-request wall clock, which aborted long SSE relays mid-body).
+  `connectTimeoutMs` overrides it when present.
 - `models[id].providers[]`: `backend` MUST reference an existing backend id
   (else the provider is dropped with console.warn). `upstream` = the model
   string sent to that backend; resolution order: `provider.upstream` ->
@@ -642,6 +651,10 @@ Notes:
    (pure). `forward(req, cfg, backend, payload, incomingHeaders, stream)` now
    receives the built payload OBJECT and stringifies it; everything else in
    forward (headers, cache headers, timeout, error shapes) unchanged.
+   **Timeout semantics change**: `timeoutMs`/`connectTimeoutMs` now bound only
+   the header wait (TTFT), never the body. The body has an idle/stall watchdog
+   in `relay()` (`idleTimeoutMs`, default 120s) that aborts only on silence.
+   Motivation + evidence in the "Timeout semantics" section below.
 4. `handleChat`: resolve via `candidates`, apply the health filter + manual
    exclusion + fallback over the flattened attempt list, attempt loop calls
    buildPayload per attempt. `newHistoryEntry` gains `routedModel: f.
@@ -866,3 +879,40 @@ apiKeyEnv names only.
 - Dynamic model CRUD via API.
 - Sticky-weighted provider balancing (affinity covers sticky LB).
 - Per-model spend caps driven by meta.pricing.
+
+---
+
+## 13. Timeout semantics (connect vs idle)
+
+The router applies TWO independent timeouts per backend, split at the response
+boundary so a long-but-alive stream is never killed by a wall clock:
+
+| Field | Bound | Default | Fires when |
+|---|---|---|---|
+| `timeoutMs` / `connectTimeoutMs` | header wait (TTFT) | 45s | the upstream has not sent response headers within the bound |
+| `idleTimeoutMs` | body silence | 120s | no bytes arrive for that long during streaming/body read |
+
+Resolution: `backend.connectTimeoutMs ?? backend.timeoutMs ?? cfg.connectTimeoutMs ?? cfg.timeoutMs ?? 45000`; `backend.idleTimeoutMs ?? cfg.idleTimeoutMs ?? 120000`.
+
+- **forward()**: the fetch uses an AbortController armed only for the header
+  wait. The moment headers arrive the timer is cleared, so the body is NOT
+  bound to the connect wall clock. (Previously `AbortSignal.timeout(...)`
+  covered the whole exchange; undici also aborts the body on that signal, so
+  SSE relays were cut exactly at `timeoutMs`.)
+- **relay()** (stream + non-stream): an idle watchdog re-arms on every received
+  chunk/segment; if `idleTimeoutMs` of true silence elapses, the upstream body
+  is aborted (relay error, client gets an end without `[DONE]`). A slow stream
+  that keeps emitting resets the timer every chunk and runs to completion.
+- Non-stream bodies use the same stall semantics via a reader-based read
+  (`readBodyWithIdle`), preserving boundedness without a wall clock.
+
+Motivating evidence (2026-08-22/23): `router.log` recorded 98 "relay error: The
+operation was aborted due to timeout" + 34 "terminated" + 8 "Premature close".
+History showed 37 go-alt2 SSE streams with ttft+gen clustered in [42s,47s]
+(45s default) and 13 commandcode streams in [57s,62s] (its 60s timeout),
+clustered overnight rather than scattered; these were the router's own
+wall-clock cuts, distinct from genuine upstream `terminated` drops. Tests z23
+(slow-alive stream completes past a tiny timeoutMs) and z24 (stalled stream cut
+by idle watchdog) pin the new behavior.
+
+---

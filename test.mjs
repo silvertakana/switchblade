@@ -1716,6 +1716,130 @@ async function main() {
     }
   }
 
+  // z23) wall-clock kill removed: a slow-but-alive SSE stream that runs LONGER
+  //      than timeoutMs is no longer cut mid-body. The old AbortSignal.timeout
+  //      aborted the whole fetch (headers + body) at the wall clock, so a 150ms
+  //      timeout killed a ~480ms stream after ~2 chunks. Now timeoutMs bounds
+  //      only the HEADER wait (the stream's headers arrive fast) and the body
+  //      is guarded by an idle/stall watchdog, so all chunks + [DONE] arrive.
+  {
+    const slowSrv = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      const body = Buffer.concat(chunks).toString("utf8");
+      if (!body.includes('"stream":true')) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ id: "slow", choices: [{ message: { role: "assistant", content: "slow-ok" } }] }));
+        return;
+      }
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+      for (let i = 0; i < 6; i++) {
+        res.write("data: " + JSON.stringify({ id: "slow", choices: [{ delta: { content: "c" + i } }] }) + "\n\n");
+        await new Promise((r) => setTimeout(r, 80));
+      }
+      res.write("data: [DONE]\n\n");
+      res.end();
+    });
+    const slowPort = await listen(slowSrv);
+    const cfgZ23 = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "z23slow", baseURL: `http://${HOST}:${slowPort}`, apiKeyEnv: "KEY_Z23SLOW", timeoutMs: 150 },
+      ],
+      models: {
+        "m23": { providers: [{ backend: "z23slow", upstream: "u23" }], affinityPool: 1 },
+      },
+      presets: { "p23": { strategy: "affinity", models: ["m23"] } },
+      backoff: BO,
+    };
+    const { child: childZ23, base: baseZ23, dir: dirZ23 } = await startRouterCfg(cfgZ23, "KEY_Z23SLOW=k\n");
+    try {
+      const rr = await fetch(baseZ23 + "/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer local-master" },
+        body: JSON.stringify({ model: "p23", messages: [], stream: true }),
+        signal: AbortSignal.timeout(8000),
+      });
+      const text = await rr.text();
+      const gotDone = text.includes("[DONE]");
+      const gotAll = ["c0", "c1", "c2", "c3", "c4", "c5"].every((c) => text.includes(c));
+      assert(
+        rr.status === 200 && gotDone && gotAll,
+        "z23) slow-alive stream completes past wall clock (status=" + rr.status + ", done=" + gotDone + ", allChunks=" + gotAll + ")"
+      );
+    } finally {
+      childZ23.kill();
+      slowSrv.close();
+      await rm(dirZ23, { recursive: true, force: true });
+    }
+  }
+
+  // z24) genuine upstream stall is still cut: headers + one chunk then silence.
+  //      The idle watchdog aborts the stuck body after idleTimeoutMs, so the
+  //      client gets a short body with NO [DONE] and the request settles fast
+  //      (it does not hang until the harness-side 5s cap).
+  {
+    const stallSrv = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      const body = Buffer.concat(chunks).toString("utf8");
+      if (!body.includes('"stream":true')) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ id: "stall", choices: [{ message: { role: "assistant", content: "stall-ok" } }] }));
+        return;
+      }
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+      res.write("data: " + JSON.stringify({ id: "stall", choices: [{ delta: { content: "start" } }] }) + "\n\n");
+      // deliberately never end
+    });
+    const stallPort = await listen(stallSrv);
+    const cfgZ24 = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "z24stall", baseURL: `http://${HOST}:${stallPort}`, apiKeyEnv: "KEY_Z24STALL", idleTimeoutMs: 200 },
+      ],
+      models: {
+        "m24": { providers: [{ backend: "z24stall", upstream: "u24" }], affinityPool: 1 },
+      },
+      presets: { "p24": { strategy: "affinity", models: ["m24"] } },
+      backoff: BO,
+    };
+    const { child: childZ24, base: baseZ24, dir: dirZ24 } = await startRouterCfg(cfgZ24, "KEY_Z24STALL=k\n");
+    try {
+      const t0 = Date.now();
+      let cut = false;
+      try {
+        const rr = await fetch(baseZ24 + "/v1/chat/completions", {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: "Bearer local-master" },
+          body: JSON.stringify({ model: "p24", messages: [], stream: true }),
+          signal: AbortSignal.timeout(5000),
+        });
+        const text = await rr.text();
+        cut = !text.includes("[DONE]");
+      } catch {
+        cut = true; // client read aborted -> the relay cut the stuck stream
+      }
+      const elapsed = Date.now() - t0;
+      // Telemetry: the cut row must surface relayError in /api/history (a 200
+      // with relayError=idle timeout), so relays that were cut are traceable.
+      let relayErr = "no-history";
+      try {
+        const hist = await (await api(baseZ24, "/api/history?limit=1", { method: "GET" })).json();
+        if (Array.isArray(hist.entries) && hist.entries[0]) relayErr = hist.entries[0].relayError || null;
+      } catch { /* history read best-effort */ }
+      const telOk = typeof relayErr === "string" && /idle timeout/.test(relayErr || "");
+      assert(
+        cut && elapsed < 4000 && telOk,
+        "z24) stalled upstream cut by idle watchdog + relayError telemetry (cut=" + cut + ", elapsed=" + elapsed + "ms, relayError=" + JSON.stringify(relayErr) + ")"
+      );
+    } finally {
+      childZ24.kill();
+      stallSrv.close();
+      await rm(dirZ24, { recursive: true, force: true });
+    }
+  }
+
   // z21) unit-level: top-level strategy governs ordering over the EXPANDED
   //      list. failover through a nested preset's models in declared order;
   //      weighted keeps the top-level weight of the nested preset position.

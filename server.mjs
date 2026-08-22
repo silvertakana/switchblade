@@ -114,6 +114,40 @@ function isRetryableError(status, bodyText) {
   return false;
 }
 
+// ---- empty-completion detection --------------------------------------------
+
+// Whether a streaming result is "empty": status 200 but no usable assistant
+// output was produced. A legitimately tiny reply ("OK") has content and is
+// NOT empty; a tool_calls-only response is NOT empty.
+function isEmptyStreamResult({ hasContent, hasReasoning, hasToolCalls, completionTokens }) {
+  if (hasContent || hasReasoning || hasToolCalls) return false;
+  const ct = completionTokens == null ? 0 : Number(completionTokens) || 0;
+  return ct <= 1;
+}
+
+function hasUsableContentNonStream(parsed) {
+  if (!parsed || typeof parsed !== 'object') return false;
+  const choices = parsed.choices;
+  if (!Array.isArray(choices) || choices.length === 0) return false;
+  for (const ch of choices) {
+    const msg = (ch && (ch.message || ch.delta)) || {};
+    if (msg.content != null && String(msg.content).trim() !== '') return true;
+    if (msg.reasoning != null && String(msg.reasoning).trim() !== '') return true;
+    if (msg.reasoning_content != null && String(msg.reasoning_content).trim() !== '') return true;
+    if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) return true;
+    // also check choice-level tool_calls alias
+    if (Array.isArray(ch.tool_calls) && ch.tool_calls.length > 0) return true;
+  }
+  return false;
+}
+
+function isEmptyNonStreamResult(parsed, completionTokens, isJson) {
+  if (!isJson) return false;
+  if (hasUsableContentNonStream(parsed)) return false;
+  const ct = completionTokens == null ? 0 : Number(completionTokens) || 0;
+  return ct <= 1;
+}
+
 function markFailure(cfg, id, status, bodyText) {
   const h = health.get(id) || { state: "healthy", fails: 0, backoffMs: 0 };
   const kind = classify(status, bodyText);
@@ -296,6 +330,7 @@ function newHistoryEntry(f) {
     wireParams: f.wireParams ?? null,            // redacted summary of the params actually sent upstream (for explaining reasoning on/off per row)
     retries: f.retries ?? 0,                     // number of retry attempts performed on the serving provider (0 = none)
     retryWaitedMs: f.retryWaitedMs ?? 0,         // total ms spent waiting in backoff across retries
+    relayError: f.relayError ?? null,            // relay cut mid-body on a 200 row (idle timeout / upstream drop) - null = clean
   };
 }
 
@@ -885,21 +920,35 @@ async function forward(req, cfg, backend, payload, incomingHeaders, stream) {
       const p = JSON.parse(payloadText);
       const dbg = { ...p };
       if (Array.isArray(dbg.messages)) dbg.messages = dbg.messages.map((m) => ({ role: m.role, content: String(m.content || "").slice(0, 80) }));
-      console.error(`[wire] ${backend.id} -> ${dbg.model} params=${JSON.stringify(Object.keys(dbg).filter((k) => !["messages", "model", "stream"].includes(k)))} ${JSON.stringify(Object.fromEntries(Object.entries(dbg).filter(([k]) => !["messages", "model", "stream"].includes(k))))}`);
+      console.error(`[${new Date().toISOString()}] [wire] ${backend.id} -> ${dbg.model} params=${JSON.stringify(Object.keys(dbg).filter((k) => !["messages", "model", "stream"].includes(k)))} ${JSON.stringify(Object.fromEntries(Object.entries(dbg).filter(([k]) => !["messages", "model", "stream"].includes(k))))}`);
     } catch {}
   }
 
+  // Connect/header timeout only: bound how long we wait for the upstream to
+  // send response HEADERS (TTFT), NOT the whole body. A wall-clock signal on
+  // fetch() is also tied to the response body in undici, so a slow-but-alive
+  // SSE relay used to be aborted mid-stream exactly at timeoutMs (see router.log
+  // "relay error: The operation was aborted due to timeout" on long thinking
+  // generations). The body is instead protected by an idle/stall watchdog in
+  // relay() (idleTimeoutMs): it only fires when actual silence exceeds the
+  // bound, so healthy long streams run to completion while stuck ones still
+  // fail.
+  const connectTimeoutMs = backend.connectTimeoutMs ?? backend.timeoutMs ?? cfg.connectTimeoutMs ?? cfg.timeoutMs ?? 45000;
+  const connectController = new AbortController();
+  const connectTimer = setTimeout(() => connectController.abort(), connectTimeoutMs);
   let upstreamRes;
   try {
     upstreamRes = await fetch(upstream, {
       method: "POST",
       headers: outHeaders,
       body: payloadText,
-      signal: AbortSignal.timeout(backend.timeoutMs || cfg.timeoutMs || 45000),
+      signal: connectController.signal,
     });
   } catch (e) {
+    clearTimeout(connectTimer);
     return { err: newError(0, String(e && e.message)) };
   }
+  clearTimeout(connectTimer); // headers arrived: the wall clock no longer applies to the body
 
   if (!upstreamRes.ok) {
     let text = "";
@@ -1077,12 +1126,27 @@ async function handleChat(req, res, cfg, bodyText) {
     const latencyMs = Date.now() - started;
     let metrics;
     try {
-      metrics = await relay(res, result.res, stream, attempt.backend, started, callId);
+      // Stall bound per backend (idleTimeoutMs) with a 120s default; this is
+      // silence-based (see relay), never a wall-clock kill. modelId is threaded
+      // through so relay-cut log lines are request-scoped.
+      const idleTimeoutMs = backend.idleTimeoutMs ?? cfg.idleTimeoutMs ?? 120000;
+      metrics = await relay(res, result.res, stream, attempt.backend, started, callId, idleTimeoutMs, modelId);
     } catch (e) {
       // Belt-and-suspenders: relay() already catches internally, but metric
       // collection must never crash the router.
-      console.error("relay threw:", e && e.message);
-      metrics = { ttftMs: latencyMs, cacheHit: false, promptTokens: 0, completionTokens: 0, reasoningTokens: 0, genMs: 0 };
+      writeRelayLog({
+        level: "relay-threw",
+        time: new Date().toISOString(),
+        callId: callId || null,
+        backend: attempt.backend,
+        model: modelId,
+        stream: !!stream,
+        elapsedMs: Date.now() - started,
+        idleTimeoutMs: backend.idleTimeoutMs ?? cfg.idleTimeoutMs ?? 120000,
+        idleAborted: false,
+        error: String((e && e.message) || e),
+      });
+      metrics = { ttftMs: latencyMs, cacheHit: false, promptTokens: 0, completionTokens: 0, reasoningTokens: 0, genMs: 0, relayError: String((e && e.message) || e) };
     }
     const genSec = (metrics.genMs || 0) / 1000;
     const entry = newHistoryEntry({
@@ -1099,6 +1163,7 @@ async function handleChat(req, res, cfg, bodyText) {
       wireParams: extractWireParams(payload),
       retries,
       retryWaitedMs,
+      relayError: metrics.relayError || null, // relay cut (idle timeout / upstream drop) for a 200 row
     });
     recordHistory(entry);
     recordStats(entry);
@@ -1114,6 +1179,7 @@ async function handleChat(req, res, cfg, bodyText) {
       reasoningTokens: metrics.reasoningTokens ?? 0,
       cacheHit: metrics.cacheHit,
       preview: metrics.preview || null,
+      relayError: metrics.relayError || null,
     });
     return;
   }
@@ -1352,14 +1418,97 @@ function reasoningNormalizeTransform() {
   });
 }
 
+// Timestamped, structured relay/log line. Unlike the old "relay error:"
+// console.error (no timestamp, no request id), every entry carries an ISO
+// timestamp + callId + backend + model so a relay cut can be traced back to
+// the exact request via /api/history?call=<callId> or the JSONL detail rows.
+// Emitted as a single line for easy grep.
+function writeRelayLog(f) {
+  const tags = [
+    f.callId ? `call=${f.callId}` : "call=-",
+    f.backend ? `backend=${f.backend}` : "backend=-",
+    f.model ? `model=${f.model}` : "model=-",
+    `stream=${!!f.stream}`,
+    `elapsedMs=${f.elapsedMs ?? 0}`,
+    f.idleAborted ? "cause=idle-timeout" : "cause=relay-error",
+  ];
+  console.error(`[${f.time || new Date().toISOString()}] ${f.level || "relay"} ${tags.join(" ")} ${f.error ? ("err=" + String(f.error)) : ""}`);
+}
+
+// Idle/stall watchdog for the streaming path: if NO upstream bytes arrive for
+// idleTimeoutMs the relay is aborted (genuine stall), but a slow-but-alive
+// stream that keeps emitting resets the timer every chunk and is never cut.
+// Returns a Transform to insert into the relay pipeline plus the controller
+// whose signal bounds the upstream body read (fromWeb honors it).
+function makeIdleWatchdog(idleTimeoutMs) {
+  const controller = new AbortController();
+  let timer = null;
+  const arm = () => {
+    if (timer !== null) clearTimeout(timer);
+    timer = setTimeout(() => controller.abort(), idleTimeoutMs);
+  };
+  const clear = () => {
+    if (timer !== null) clearTimeout(timer);
+    timer = null;
+  };
+  arm();
+  const reset = new Transform({
+    transform(chunk, enc, cb) {
+      arm();
+      cb(null, chunk);
+    },
+    flush(cb) {
+      clear();
+      cb();
+    },
+    _destroy(err, cb) {
+      clear(); // never leave a post-error timer armed
+      cb(err);
+    },
+  });
+  return { controller, reset };
+}
+
+// Non-stream body read with the same stall semantics as the streaming
+// watchdog: reset on every chunk, abort (via reader.cancel) if idleTimeoutMs
+// passes with no data. A slow non-stream response completes; a stuck one is
+// cut. Returns a Buffer (the caller treats it as the response body bytes).
+async function readBodyWithIdle(webBody, idleTimeoutMs) {
+  if (!webBody) return Buffer.from(await webBody.arrayBuffer()); // throws like Response.arrayBuffer() on null body
+  const reader = webBody.getReader();
+  const chunks = [];
+  let timer = null;
+  const arm = () => {
+    if (timer !== null) clearTimeout(timer);
+    timer = setTimeout(() => reader.cancel("relay idle timeout"), idleTimeoutMs);
+  };
+  arm();
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(Buffer.from(value));
+      arm(); // any progress re-arms the stall bound
+    }
+    return Buffer.concat(chunks);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+    timer = null;
+  }
+}
+
 // Relay the upstream response to the client while capturing per-request
 // metrics and normalizing the reasoning key (delta.reasoning ->
 // delta.reasoning_content) for OpenCode compatibility. Returns
 // { ttftMs, cacheHit, promptTokens, completionTokens, genMs, preview } where
 // preview is the first content fragment (stream: first content delta;
-// non-stream: first choice's message content), truncated to 200 chars.
+// non-stream: first choice's message content), truncated to 200 chars, plus
+// relayError (string|null) when the upstream body was cut mid-relay so the
+// history row can expose truncations that otherwise look like HTTP 200.
 // Never throws: on any failure it closes the response and returns what it has.
-async function relay(res, upstreamRes, stream, backendId, started, callId) {
+// idleTimeoutMs bounds SILENCE (stall detection), never total wall time, so a
+// long-but-alive stream survives; the old wall-clock kill is gone (see forward).
+async function relay(res, upstreamRes, stream, backendId, started, callId, idleTimeoutMs = 120000, modelId = null) {
   const ttftMs = Date.now() - started;
   const headers = {
     "content-type": upstreamRes.headers.get("content-type") || "application/json",
@@ -1372,6 +1521,7 @@ async function relay(res, upstreamRes, stream, backendId, started, callId) {
   let reasoningTokens = 0;
   let genMs = 0;
   let preview = null;    // first content fragment, truncated to 200 chars
+  let relayError = null; // set when the upstream body was cut mid-relay
   const cap = (s) => (typeof s === "string" ? (s.length > 200 ? s.slice(0, 200) + "…" : s) : s);
   try {
     if (upstreamRes.headers.get("x-request-id")) headers["x-request-id"] = upstreamRes.headers.get("x-request-id");
@@ -1384,13 +1534,27 @@ async function relay(res, upstreamRes, stream, backendId, started, callId) {
       const collector = makeUsageCollector();
       const pv = previewTransform();
       const genStart = Date.now();
-      await pipeline(
-        Readable.fromWeb(upstreamRes.body),
-        usageTransform(collector),
-        pv,
-        reasoningNormalizeTransform(),
-        res
-      );
+      // Idle/stall bound: aborts the upstream body read only when NO bytes
+      // arrive for idleTimeoutMs. Alive streams (any chunk within the bound)
+      // run to completion regardless of total duration.
+      const idle = makeIdleWatchdog(idleTimeoutMs);
+      try {
+        await pipeline(
+          Readable.fromWeb(upstreamRes.body, { signal: idle.controller.signal }),
+          idle.reset,
+          usageTransform(collector),
+          pv,
+          reasoningNormalizeTransform(),
+          res
+        );
+      } catch (e) {
+        // Distinguish a stall-watchdog cut from an upstream/network drop so
+        // the history row + timestamped log attribute the right cause.
+        relayError = idle.controller.signal.aborted
+          ? `upstream idle timeout (no data for ${idleTimeoutMs}ms)`
+          : String(e && e.message);
+        throw e; // let the outer catch close the response + log once
+      }
       genMs = Date.now() - genStart;
       const usage = collector.finalize();
       promptTokens = usage.promptTokens;
@@ -1401,48 +1565,73 @@ async function relay(res, upstreamRes, stream, backendId, started, callId) {
         cacheHit = usage.cacheFieldSeen ? usage.promptCacheHit > 0 : null;
       }
     } else {
-      let buf = Buffer.from(await upstreamRes.arrayBuffer());
       try {
-        const parsed = JSON.parse(buf.toString("utf8"));
-        const usage = parsed && parsed.usage;
-        if (usage) {
-          promptTokens = Number(usage.prompt_tokens) || 0;
-          completionTokens = Number(usage.completion_tokens) || 0;
-          const rt = usage.completion_tokens_details && usage.completion_tokens_details.reasoning_tokens;
-          reasoningTokens = Number(rt) || 0;
-          if (cacheHit !== true) {
-            const hit = Number(usage.prompt_cache_hit_tokens);
-            const miss = Number(usage.prompt_cache_miss_tokens);
-            const cached = usage.prompt_tokens_details && usage.prompt_tokens_details.cached_tokens;
-            const cachedN = Number(cached);
-            const seen = !Number.isNaN(hit) || !Number.isNaN(miss) || !Number.isNaN(cachedN);
-            if (seen) cacheHit = (!Number.isNaN(hit) ? hit : cachedN) > 0;
-            // else keep null (no signal)
+        let buf = await readBodyWithIdle(upstreamRes.body, idleTimeoutMs);
+        try {
+          const parsed = JSON.parse(buf.toString("utf8"));
+          const usage = parsed && parsed.usage;
+          if (usage) {
+            promptTokens = Number(usage.prompt_tokens) || 0;
+            completionTokens = Number(usage.completion_tokens) || 0;
+            const rt = usage.completion_tokens_details && usage.completion_tokens_details.reasoning_tokens;
+            reasoningTokens = Number(rt) || 0;
+            if (cacheHit !== true) {
+              const hit = Number(usage.prompt_cache_hit_tokens);
+              const miss = Number(usage.prompt_cache_miss_tokens);
+              const cached = usage.prompt_tokens_details && usage.prompt_tokens_details.cached_tokens;
+              const cachedN = Number(cached);
+              const seen = !Number.isNaN(hit) || !Number.isNaN(miss) || !Number.isNaN(cachedN);
+              if (seen) cacheHit = (!Number.isNaN(hit) ? hit : cachedN) > 0;
+              // else keep null (no signal)
+            }
           }
+          // Non-stream: normalize the reasoning key on the first choice message.
+          if (parsed && Array.isArray(parsed.choices) && parsed.choices[0]) {
+            normalizeReasoningKey(parsed.choices[0]);
+            buf = Buffer.from(JSON.stringify(parsed));
+            const firstMsg = parsed.choices[0].message || parsed.choices[0].delta || {};
+            preview = cap(firstMsg.content != null ? firstMsg.content : (firstMsg.text != null ? firstMsg.text : null));
+          }
+        } catch {
+          // Body not JSON (e.g. upstream proxy error) — keep token counts at 0.
         }
-        // Non-stream: normalize the reasoning key on the first choice message.
-        if (parsed && Array.isArray(parsed.choices) && parsed.choices[0]) {
-          normalizeReasoningKey(parsed.choices[0]);
-          buf = Buffer.from(JSON.stringify(parsed));
-          const firstMsg = parsed.choices[0].message || parsed.choices[0].delta || {};
-          preview = cap(firstMsg.content != null ? firstMsg.content : (firstMsg.text != null ? firstMsg.text : null));
-        }
-      } catch {
-        // Body not JSON (e.g. upstream proxy error) — keep token counts at 0.
+        res.end(buf);
+        genMs = Math.max(0, Date.now() - started - ttftMs);
+      } catch (e) {
+        // Non-stream body stall/cut (readBodyWithIdle cancels on idle) or
+        // body read error: attribute the cause and let the outer catch log.
+        relayError = /idle timeout/.test(String(e && e.message))
+          ? `upstream idle timeout (no data for ${idleTimeoutMs}ms)`
+          : String(e && e.message);
+        throw e;
       }
-      res.end(buf);
-      genMs = Math.max(0, Date.now() - started - ttftMs);
     }
   } catch (e) {
-    // Relay must never crash the router: record what we have and close cleanly.
-    console.error("relay error:", e && e.message);
+    // Relay must never crash the router: record what we have, log a
+    // TIMESTAMPED, request-scoped line so relay cuts are traceable to a call
+    // (callId cross-references /api/history and the JSONL detail rows), then
+    // close cleanly. elapsedMs = wall time from request start; idleAborted =
+    // the stall watchdog fired vs an upstream/network drop.
+    const idleAborted = relayError && /idle timeout/.test(relayError);
+    writeRelayLog({
+      level: "relay-error",
+      time: new Date().toISOString(),
+      callId: callId || null,
+      backend: backendId || null,
+      model: modelId,
+      stream: !!stream,
+      elapsedMs: Date.now() - started,
+      idleTimeoutMs,
+      idleAborted,
+      error: relayError || String((e && e.message) || e),
+    });
     try {
       if (!res.writableEnded) res.end();
     } catch {
       /* ignore */
     }
   }
-  return { ttftMs, cacheHit, promptTokens, completionTokens, reasoningTokens, genMs, preview };
+  return { ttftMs, cacheHit, promptTokens, completionTokens, reasoningTokens, genMs, preview, relayError };
 }
 
 function writeError(res, e) {
@@ -1648,11 +1837,11 @@ async function main() {
     srv.listen(cfg.port, bindHost, () => {
       const addr = srv.address();
       const port = typeof addr === "object" && addr ? addr.port : cfg.port;
-      console.error(`switchblade listening on http://${bindHost}:${port}${cfg.prefix || "/v1"}`);
+      console.error(`[${new Date().toISOString()}] switchblade listening on http://${bindHost}:${port}${cfg.prefix || "/v1"}`);
     });
   }
-  console.error(`config: ${CONFIG_PATH}`);
-  console.error(`backends: ${cfg.backends.map((b) => `${b.id}(${mask(process.env[b.apiKeyEnv])})`).join(", ")}`);
+  console.error(`[${new Date().toISOString()}] config: ${CONFIG_PATH}`);
+  console.error(`[${new Date().toISOString()}] backends: ${cfg.backends.map((b) => `${b.id}(${mask(process.env[b.apiKeyEnv])})`).join(", ")}`);
 }
 
 // Running the file as a script starts the server; importing it (test.mjs

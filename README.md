@@ -63,6 +63,31 @@ Manual cools (from the UI or `POST /admin/backend`) are **sticky**: they never
 participate in the all-cooling fallback and are never cleared by a success.
 Only the Uncool action (or a timed `forMs`) restores the backend.
 
+### Timeouts (connect vs idle)
+
+Two independent per-backend bounds, set on the backend entry (or top-level):
+
+- `timeoutMs` / `connectTimeoutMs` — **header wait**: aborts only if the
+  upstream has not sent response headers (TTFT) within the bound. Default 45s.
+- `idleTimeoutMs` — **stall bound on the body**: aborts only if NO bytes
+  arrive for that long during streaming. Default 120s.
+
+A slow-but-alive stream (long thinking, long generation) that keeps emitting
+is never cut — the wall-clock body kill that used to terminate SSE relays
+exactly at `timeoutMs` is gone. A genuinely stuck upstream (headers then
+silence) still fails after `idleTimeoutMs`.
+
+```jsonc
+{ "id": "commandcode", "baseURL": "https://api.commandcode.ai/provider/v1",
+  "apiKeyEnv": "COMMANDCODE_API_KEY",
+  "timeoutMs": 60000, "idleTimeoutMs": 120000 }
+```
+
+The old `timeoutMs` value (45s default, 60s on commandcode) previously bounded
+the ENTIRE request incl. the body, so long reasoning/generation streams were
+aborted mid-flight exactly at the wall clock (see `router.log` "relay error:
+The operation was aborted due to timeout").
+
 ### Per-model retries
 
 On top of cooling, a model can retry a **transient** failure on the SAME

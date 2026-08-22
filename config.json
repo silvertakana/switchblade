@@ -5,18 +5,18 @@
   "masterKeyEnv": null,
   "backends": [
     { "id": "go-primary", "baseURL": "https://opencode.ai/zen/go/v1",
-      "apiKeyEnv": "OPENCODE_GO_KEY" },
+      "apiKeyEnv": "OPENCODE_GO_KEY", "idleTimeoutMs": 120000 },
     { "id": "go-alt", "baseURL": "https://opencode.ai/zen/go/v1",
-      "apiKeyEnv": "OPENCODE_GO_ALT_KEY" },
+      "apiKeyEnv": "OPENCODE_GO_ALT_KEY", "idleTimeoutMs": 120000 },
     { "id": "go-alt2", "baseURL": "https://opencode.ai/zen/go/v1",
-      "apiKeyEnv": "OPENCODE_GO_ALT2_KEY" },
+      "apiKeyEnv": "OPENCODE_GO_ALT2_KEY", "idleTimeoutMs": 120000 },
     { "id": "direct", "baseURL": "https://api.deepseek.com/v1",
-      "apiKeyEnv": "DEEPSEEK_API_KEY", "translateDeveloperRole": true },
+      "apiKeyEnv": "DEEPSEEK_API_KEY", "translateDeveloperRole": true, "idleTimeoutMs": 120000 },
     { "id": "commandcode", "baseURL": "https://api.commandcode.ai/provider/v1",
       "apiKeyEnv": "COMMANDCODE_API_KEY", "translateDeveloperRole": true,
-      "timeoutMs": 60000 },
+      "timeoutMs": 60000, "idleTimeoutMs": 120000 },
     { "id": "zai", "baseURL": "https://api.z.ai/api/coding/paas/v4",
-      "apiKeyEnv": "ZAI_API_KEY" }
+      "apiKeyEnv": "ZAI_API_KEY", "idleTimeoutMs": 120000 }
   ],
   "models": {
     "deepseek-v4-flash": {
@@ -62,9 +62,11 @@
       "providers": [
         { "backend": "zai", "upstream": "glm-5.3" },
         { "backend": "commandcode", "upstream": "zai-org/GLM-5.3" },
+        { "backend": "go-primary", "upstream": "glm-5.3" },
+        { "backend": "go-alt", "upstream": "glm-5.3" },
         { "backend": "go-alt2", "upstream": "glm-5.3" }
       ],
-      "affinityPool": 1,
+      "affinityPool": 2,
       "params": { "reasoning_effort": "medium" },
       "meta": {
         "label": "GLM 5.3",
@@ -115,9 +117,12 @@
     },
     "ox-alpha": {
       "providers": [
-        { "backend": "commandcode", "upstream": "stealth/ox-alpha" }
+        { "backend": "commandcode", "upstream": "stealth/ox-alpha" },
+        { "backend": "go-primary", "upstream": "ox-alpha-free" },
+        { "backend": "go-alt", "upstream": "ox-alpha-free" },
+        { "backend": "go-alt2", "upstream": "ox-alpha-free" }
       ],
-      "affinityPool": 1,
+      "affinityPool": 2,
       "params": { "reasoning_effort": "high" },
       "retry": { "maxRetries": 5, "baseMs": 2000, "maxMs": 30000, "multiplier": 2, "totalMs": 30000 },
       "meta": {
@@ -154,10 +159,14 @@
     },
     "qwen3.7-plus": {
       "providers": [
-        { "backend": "go-alt2", "upstream": "qwen3.7-plus" }
+        { "backend": "go-primary", "upstream": "qwen3.7-plus" },
+        { "backend": "go-alt", "upstream": "qwen3.7-plus" },
+        { "backend": "go-alt2", "upstream": "qwen3.7-plus" },
+        { "backend": "commandcode", "upstream": "Qwen/Qwen3.7-Plus" }
       ],
-      "affinityPool": 1,
+      "affinityPool": 2,
       "params": { "thinking": { "type": "enabled" }, "reasoning_effort": "high" },
+      "retry": { "maxRetries": 3, "baseMs": 2000, "maxMs": 30000, "multiplier": 2, "totalMs": 30000 },
       "meta": {
         "label": "Qwen 3.7 Plus",
         "contextWindow": 1000000,
@@ -166,10 +175,14 @@
     },
     "qwen3.8-max": {
       "providers": [
-        { "backend": "go-alt2", "upstream": "qwen3.8-max" }
+        { "backend": "go-primary", "upstream": "qwen3.8-max" },
+        { "backend": "go-alt", "upstream": "qwen3.8-max" },
+        { "backend": "go-alt2", "upstream": "qwen3.8-max" },
+        { "backend": "commandcode", "upstream": "Qwen/Qwen3.8-Max" }
       ],
-      "affinityPool": 1,
+      "affinityPool": 2,
       "params": { "thinking": { "type": "enabled" }, "reasoning_effort": "high" },
+      "retry": { "maxRetries": 3, "baseMs": 2000, "maxMs": 30000, "multiplier": 2, "totalMs": 30000 },
       "meta": {
         "label": "Qwen 3.8 Max",
         "contextWindow": 1000000,
@@ -178,9 +191,13 @@
     },
     "deepseek-v4-flash-vision-exp": {
       "providers": [
-        { "backend": "go-alt2", "upstream": "deepseek-v4-flash-vision-exp" }
+        { "backend": "go-primary", "upstream": "deepseek-v4-flash-vision-exp" },
+        { "backend": "go-alt", "upstream": "deepseek-v4-flash-vision-exp" },
+        { "backend": "go-alt2", "upstream": "deepseek-v4-flash-vision-exp" },
+        { "backend": "commandcode", "upstream": "deepseek/deepseek-v4-flash-vision-exp" },
+        { "backend": "direct", "upstream": "deepseek-v4-flash-vision-exp" }
       ],
-      "affinityPool": 1,
+      "affinityPool": 3,
       "params": { "thinking": { "type": "enabled" }, "reasoning_effort": "high" },
       "meta": {
         "label": "DeepSeek V4 Flash Vision Exp",
