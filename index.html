@@ -337,6 +337,8 @@
   @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(251,191,36,.45); } 70% { box-shadow: 0 0 0 7px rgba(251,191,36,0); } 100% { box-shadow: 0 0 0 0 rgba(251,191,36,0); } }
   @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
   .card, .statbar, .test-panel, details, table { animation: rise 300ms ease-out both; }
+  /* Entrance animation runs only on first paint; polling updates must not re-trigger it (the flicker bug) */
+  body.loaded .card, body.loaded .statbar, body.loaded .test-panel, body.loaded details, body.loaded table { animation: none; }
   @keyframes shimmer { 0% { background-position: -200% 0; } 100% { background-position: 200% 0; } }
   .skeleton { background: linear-gradient(90deg, var(--panel) 25%, var(--panel-2) 50%, var(--panel) 75%); background-size: 200% 100%; animation: shimmer 1.4s linear infinite; border-radius: var(--radius); height: 14px; margin: 6px 0; }
 
@@ -450,6 +452,7 @@
 
 <nav class="tabs" role="tablist" aria-label="Views">
   <button class="tab active" id="tab-dashboard" role="tab" aria-selected="true" data-view="dashboard" data-icon="grid">Dashboard</button>
+  <button class="tab" id="tab-history" role="tab" aria-selected="false" data-view="history" data-icon="clock">History</button>
   <button class="tab" id="tab-playground" role="tab" aria-selected="false" data-view="playground" data-icon="chat">Playground</button>
 </nav>
 
@@ -463,19 +466,6 @@
     <section>
       <h2 data-icon="activity">Traffic stats</h2>
       <div id="stats"><div class="skeleton"></div><div class="skeleton"></div></div>
-    </section>
-
-    <section>
-      <h2 data-icon="clock">Request history</h2>
-      <div id="historyCacheSummary" class="stat-overview" style="margin-bottom:10px;display:none"></div>
-      <div style="overflow-x:auto">
-        <table>
-          <thead>
-            <tr><th scope="col">Call</th><th scope="col">Time</th><th scope="col">Model</th><th scope="col">Backend</th><th scope="col">Stream</th><th scope="col">Status</th><th scope="col">Latency (ms)</th><th scope="col">TTFT (ms)</th><th scope="col">Tokens</th><th scope="col">Cache</th><th scope="col">Session</th></tr>
-          </thead>
-          <tbody id="historyBody"><tr><td colspan="11"><div class="skeleton"></div></td></tr></tbody>
-        </table>
-      </div>
     </section>
 
     <section>
@@ -502,6 +492,21 @@
       <summary>Config viewer</summary>
       <pre id="configView">Loading...</pre>
     </details>
+  </div>
+
+  <div id="view-history" class="view" role="tabpanel" aria-labelledby="tab-history">
+    <section>
+      <h2 data-icon="clock">Request history</h2>
+      <div id="historyCacheSummary" class="stat-overview" style="margin-bottom:10px;display:none"></div>
+      <div style="overflow-x:auto">
+        <table>
+          <thead>
+            <tr><th scope="col">Call</th><th scope="col">Time</th><th scope="col">Model</th><th scope="col">Backend</th><th scope="col">Stream</th><th scope="col">Status</th><th scope="col">Latency (ms)</th><th scope="col">TTFT (ms)</th><th scope="col">Tokens</th><th scope="col">Cache</th><th scope="col">Session</th></tr>
+          </thead>
+          <tbody id="historyBody"><tr><td colspan="11"><div class="skeleton"></div></td></tr></tbody>
+        </table>
+      </div>
+    </section>
   </div>
 
   <div id="view-playground" class="view" role="tabpanel" aria-labelledby="tab-playground">
@@ -2155,18 +2160,39 @@ $("pgDownloadMd").addEventListener("click", () => {
   setTimeout(() => URL.revokeObjectURL(url), 2000);
 });
 
-// ---- tabs ---------------------------------------------------------------------
+// ---- tabs (URL-hash driven) ---------------------------------------------------
+
+// Known views. Tab switches set location.hash so a reload/back/forward restores
+// the same tab; the hashchange listener keeps the UI in sync with the URL.
+const VIEWS = ["dashboard", "history", "playground"];
+
+function activateView(name) {
+  document.querySelectorAll(".tab").forEach((t) => {
+    const on = t.dataset.view === name;
+    t.classList.toggle("active", on);
+    t.setAttribute("aria-selected", on ? "true" : "false");
+  });
+  document.querySelectorAll(".view").forEach((v) => {
+    v.classList.toggle("active", v.id === "view-" + name);
+  });
+}
 
 document.querySelectorAll(".tab").forEach((tab) => {
   tab.addEventListener("click", () => {
-    document.querySelectorAll(".tab").forEach((t) => {
-      t.classList.toggle("active", t === tab);
-      t.setAttribute("aria-selected", t === tab ? "true" : "false");
-    });
-    document.querySelectorAll(".view").forEach((v) => {
-      v.classList.toggle("active", v.id === "view-" + tab.dataset.view);
-    });
+    activateView(tab.dataset.view);
+    location.hash = tab.dataset.view;
   });
+});
+
+function initViewFromHash() {
+  const raw = location.hash ? location.hash.slice(1) : "";
+  if (raw && VIEWS.includes(raw)) activateView(raw);
+}
+
+window.addEventListener("hashchange", () => {
+  const raw = location.hash ? location.hash.slice(1) : "";
+  if (raw && VIEWS.includes(raw)) activateView(raw);
+  else activateView("dashboard");
 });
 
 // ---- wiring: config viewer + countdown ticker + poll ---------------------------
@@ -2202,9 +2228,12 @@ $("autoRefresh").addEventListener("change", () => {
 });
 
 decorate();
+initViewFromHash();
 loadConfig();
 poll();
 syncPollTimer();
+// Entrance animations run only on first load; suppress on every later poll/update (the flicker bug).
+setTimeout(() => document.body.classList.add("loaded"), 800);
 </script>
 </body>
 </html>
