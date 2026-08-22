@@ -181,6 +181,54 @@ function recordHistory(entry) {
   }
 }
 
+// ---- request detail store (deep-dive side panel) -----------------------------
+//
+// Full per-request debug records live IN MEMORY ONLY, capped and size-guarded,
+// so the deep dive never touches disk and cannot grow unboundedly:
+// - DETAIL_CAP: at most 100 detail records (ring buffer, oldest dropped).
+// - Size guard: requests whose raw body exceeds DETAIL_MAX_BODY_BYTES (100 KB)
+//   are skipped - a detail record is only worth the memory when the payload is
+//   small enough to inspect comfortably anyway.
+// - The JSONL history file (router-history.jsonl) keeps ONLY the summary
+//   entries; detail records are never appended to disk. Persistent capture is a
+//   future change.
+// - Detail records are keyed by the summary entry's `t` timestamp, which is
+//   unique enough within the ring buffer (Date.now() per request).
+const DETAIL_CAP = 100;
+const DETAIL_MAX_BODY_BYTES = 100000;
+const DETAILS = []; // ring buffer (newest at tail): {t, payload, attempts, ...}
+
+// Record (or update) the deep-dive detail record for the request whose summary
+// entry timestamp is `t`. Pass the full outgoing request payload (what forward()
+// sent, never API keys - keys live only in env) and an append-style attempt
+// record. Retries may already exist on the detail record (a parallel thread can
+// call this per attempt), so this function merges into attempts[] by appending.
+function recordDetail(t, payload, attempt) {
+  if (!t || !payload || typeof payload !== "object") return;
+  let rec = DETAILS.find((d) => d.t === t);
+  if (!rec) {
+    rec = { t, payload, attempts: [] };
+    DETAILS.push(rec);
+    if (DETAILS.length > DETAIL_CAP) DETAILS.shift();
+  }
+  if (attempt) rec.attempts.push(attempt);
+}
+
+// Finalize a detail record once the attempt loop has run its course (success or
+// exhausted failure): attach the response summary. No-op when the request was
+// never captured (payload too large / no attempts) or already finalized.
+function finalizeDetail(t, summary) {
+  const rec = DETAILS.find((d) => d.t === t);
+  if (!rec || rec.finalized) return;
+  rec.finalized = true;
+  if (summary) rec.response = summary;
+}
+
+// Get a detail record by summary timestamp. Returns the record or null.
+function getDetail(t) {
+  return DETAILS.find((d) => d.t === t) || null;
+}
+
 // Canonical history entry shape with metric defaults, so every row (success
 // or failure) carries the same fields for the UI. Backward compatible: the
 // original fields (t, model, backend, stream, status, latencyMs, session)
@@ -876,8 +924,28 @@ async function handleChat(req, res, cfg, bodyText) {
     });
     if (pool.length === 0) {
       const latencyMs = Date.now() - started;
-      recordHistory(newHistoryEntry({ t: Date.now(), model: modelId, backend: "none", stream, status: 503, latencyMs, session: sessionKey, routedModel: c.ordered[0] ? c.ordered[0].model : null }));
+      const detailT = Date.now();
+      const entry = newHistoryEntry({ t: detailT, model: modelId, backend: "none", stream, status: 503, latencyMs, session: sessionKey, routedModel: c.ordered[0] ? c.ordered[0].model : null });
+      recordHistory(entry);
       recordStats({ backend: "none", model: modelId, status: 503, latencyMs });
+      // Detail record even with no attempts: captures the payload + a "no
+      // candidates were eligible" note so the empty-pool 503 is inspectable.
+      if (bodyText.length <= DETAIL_MAX_BODY_BYTES) {
+        recordDetail(detailT, { ...body }, null);
+        finalizeDetail(detailT, {
+          status: 503,
+          ttftMs: 0,
+          latencyMs,
+          genMs: 0,
+          promptTokens: 0,
+          completionTokens: 0,
+          reasoningTokens: 0,
+          cacheHit: null,
+          preview: null,
+          errorBody: `all available backends are cooling (${manualCooled.size} manually cooled - uncool to restore)`,
+          noEligibleBackends: true,
+        });
+      }
       res.setHeader("x-router-backend", "none");
       const msg = JSON.stringify({
         error: {
@@ -891,6 +959,8 @@ async function handleChat(req, res, cfg, bodyText) {
 
   let lastErr = null;
   let lastTried = null;
+  const captureDetail = bodyText.length <= DETAIL_MAX_BODY_BYTES; // size guard: skip huge payloads
+  const detailT = Date.now();
   for (const attempt of pool) {
     lastTried = attempt;
     const backend = cfg.backends.find((b) => b.id === attempt.backend);
@@ -898,7 +968,6 @@ async function handleChat(req, res, cfg, bodyText) {
     const provider = (model && (model.providers || []).find((p) => p.backend === attempt.backend)) || null;
     if (!backend || !model || !provider) continue; // defensive: candidates built the attempt
     const payload = buildPayload(body, cfg, c.preset, model, provider, backend);
-
     // Per-model retry: on retryable failures, retry the SAME provider with
     // exponential backoff before falling through to the next candidate. This
     // preserves the session's prompt cache (a fallback backend has zero cached
@@ -914,6 +983,7 @@ async function handleChat(req, res, cfg, bodyText) {
     let retries = 0;
     let retryWaitedMs = 0;
     let result = null;
+    const attemptStarted = Date.now();
     while (true) {
       result = await forward(req, cfg, backend, payload, req.headers, stream);
       if (result.err && isRetryableError(result.err.status, result.err.body) && retries < maxRetries) {
@@ -928,6 +998,17 @@ async function handleChat(req, res, cfg, bodyText) {
       }
       break;
     }
+    const attemptRec = {
+      backend: attempt.backend,
+      upstream: attempt.upstream || provider.upstream || null,
+      model: attempt.model,
+      startedAt: attemptStarted,
+      status: result.err ? (result.err.status || 0) : 200,
+      latencyMs: Date.now() - attemptStarted,
+      errorBody: result.err ? (result.err.body || null) : null,
+      retry: typeof attempt.retry === "number" ? attempt.retry : (attempt.attemptIndex != null ? attempt.attemptIndex : null),
+    };
+    if (captureDetail) recordDetail(detailT, payload, attemptRec);
     if (result.err) {
       lastErr = result.err;
       markFailure(cfg, attempt.backend, result.err.status, result.err.body);
@@ -950,7 +1031,7 @@ async function handleChat(req, res, cfg, bodyText) {
     }
     const genSec = (metrics.genMs || 0) / 1000;
     const entry = newHistoryEntry({
-      t: Date.now(), model: modelId, backend: attempt.backend, stream, status: 200, latencyMs,
+      t: detailT, model: modelId, backend: attempt.backend, stream, status: 200, latencyMs,
       ttftMs: metrics.ttftMs ?? latencyMs,
       promptTokens: metrics.promptTokens ?? 0,
       completionTokens: metrics.completionTokens ?? 0,
@@ -966,12 +1047,42 @@ async function handleChat(req, res, cfg, bodyText) {
     });
     recordHistory(entry);
     recordStats(entry);
+    // Finalize the deep-dive detail record (attempt already recorded above) with
+    // the response summary.
+    finalizeDetail(detailT, {
+      status: 200,
+      ttftMs: metrics.ttftMs ?? latencyMs,
+      latencyMs,
+      genMs: metrics.genMs ?? 0,
+      promptTokens: metrics.promptTokens ?? 0,
+      completionTokens: metrics.completionTokens ?? 0,
+      reasoningTokens: metrics.reasoningTokens ?? 0,
+      cacheHit: metrics.cacheHit,
+      preview: metrics.preview || null,
+    });
     return;
   }
 
+  // All attempts failed (or were skipped): record the exhausted failure with a
+  // 503. The detail record keyed by detailT holds every attempt's outcome.
   const latencyMs = Date.now() - started;
-  recordHistory(newHistoryEntry({ t: Date.now(), model: modelId, backend: lastTried ? lastTried.backend : "none", stream, status: 503, latencyMs, session: sessionKey, routedModel: c.ordered[0] ? c.ordered[0].model : null }));
+  const failEntry = newHistoryEntry({ t: detailT, model: modelId, backend: lastTried ? lastTried.backend : "none", stream, status: 503, latencyMs, session: sessionKey, routedModel: c.ordered[0] ? c.ordered[0].model : null });
+  recordHistory(failEntry);
   recordStats({ backend: lastTried ? lastTried.backend : "none", model: modelId, status: 503, latencyMs });
+  if (captureDetail) {
+    finalizeDetail(detailT, {
+      status: 503,
+      ttftMs: 0,
+      latencyMs,
+      genMs: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      reasoningTokens: 0,
+      cacheHit: null,
+      preview: null,
+      errorBody: lastErr ? lastErr.body : null,
+    });
+  }
   res.setHeader("x-router-backend", lastTried ? lastTried.backend : "none");
   const msg = lastErr ? lastErr.body : "all backends unavailable";
   return writeError(res, newError(503, typeof msg === "string" && msg ? msg : JSON.stringify({ error: { message: "all backends cooling", type: "router_unavailable" } })));
@@ -1059,6 +1170,56 @@ function usageTransform(collector) {
   });
 }
 
+// Pass-through transform that captures the FIRST content fragment from a
+// streaming SSE response (first delta.content or delta.reasoning_content,
+// truncated to 200 chars) for the request-detail preview. Never breaks the
+// stream; if nothing is captured the preview stays null.
+function previewTransform() {
+  let leftover = "";
+  let captured = false;
+  let preview = null;
+  const cap = (s) => (typeof s === "string" ? (s.length > 200 ? s.slice(0, 200) + "…" : s) : s);
+  const tr = new Transform({
+    transform(chunk, _enc, cb) {
+      try {
+        if (!captured) {
+          let text = leftover + (Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk));
+          const lines = text.split("\n");
+          leftover = lines.pop() || "";
+          for (const line of lines) {
+            const t = line.trim();
+            if (t.startsWith("data:")) {
+              const payload = t.slice(5).trim();
+              if (payload && payload !== "[DONE]") {
+                try {
+                  const obj = JSON.parse(payload);
+                  if (obj && obj.choices && obj.choices[0]) {
+                    const delta = obj.choices[0].delta || obj.choices[0].message || {};
+                    const frag = delta.content != null ? delta.content : (delta.reasoning_content != null ? delta.reasoning_content : null);
+                    if (frag != null) {
+                      preview = cap(frag);
+                      captured = true;
+                      break;
+                    }
+                  }
+                } catch {
+                  /* non-JSON data line - pass through unchanged */
+                }
+              }
+            }
+          }
+        }
+        cb(null, chunk);
+      } catch (e) {
+        // Never break the stream: fall back to passthrough.
+        cb(null, chunk);
+      }
+    },
+  });
+  tr.getPreview = () => preview;
+  return tr;
+}
+
 // Reasoning-key normalization. OpenCode's client parser only reads
 // delta.reasoning_content (DeepSeek-native) while commandcode/OpenAI-Reasoning
 // API style upstreams emit delta.reasoning (+ reasoning_details). Without this,
@@ -1138,7 +1299,9 @@ function reasoningNormalizeTransform() {
 // Relay the upstream response to the client while capturing per-request
 // metrics and normalizing the reasoning key (delta.reasoning ->
 // delta.reasoning_content) for OpenCode compatibility. Returns
-// { ttftMs, cacheHit, promptTokens, completionTokens, genMs }.
+// { ttftMs, cacheHit, promptTokens, completionTokens, genMs, preview } where
+// preview is the first content fragment (stream: first content delta;
+// non-stream: first choice's message content), truncated to 200 chars.
 // Never throws: on any failure it closes the response and returns what it has.
 async function relay(res, upstreamRes, stream, backendId, started) {
   const ttftMs = Date.now() - started;
@@ -1151,6 +1314,8 @@ async function relay(res, upstreamRes, stream, backendId, started) {
   let completionTokens = 0;
   let reasoningTokens = 0;
   let genMs = 0;
+  let preview = null;    // first content fragment, truncated to 200 chars
+  const cap = (s) => (typeof s === "string" ? (s.length > 200 ? s.slice(0, 200) + "…" : s) : s);
   try {
     if (upstreamRes.headers.get("x-request-id")) headers["x-request-id"] = upstreamRes.headers.get("x-request-id");
     res.writeHead(200, headers);
@@ -1160,10 +1325,12 @@ async function relay(res, upstreamRes, stream, backendId, started) {
       // Tee the stream: one branch goes to the client, the transform branch
       // accumulates usage data from the final SSE chunk.
       const collector = makeUsageCollector();
+      const pv = previewTransform();
       const genStart = Date.now();
       await pipeline(
         Readable.fromWeb(upstreamRes.body),
         usageTransform(collector),
+        pv,
         reasoningNormalizeTransform(),
         res
       );
@@ -1172,6 +1339,7 @@ async function relay(res, upstreamRes, stream, backendId, started) {
       promptTokens = usage.promptTokens;
       completionTokens = usage.completionTokens;
       reasoningTokens = usage.reasoningTokens;
+      preview = pv.getPreview() || null;
       if (cacheHit !== true) {
         cacheHit = usage.cacheFieldSeen ? usage.promptCacheHit > 0 : null;
       }
@@ -1199,6 +1367,8 @@ async function relay(res, upstreamRes, stream, backendId, started) {
         if (parsed && Array.isArray(parsed.choices) && parsed.choices[0]) {
           normalizeReasoningKey(parsed.choices[0]);
           buf = Buffer.from(JSON.stringify(parsed));
+          const firstMsg = parsed.choices[0].message || parsed.choices[0].delta || {};
+          preview = cap(firstMsg.content != null ? firstMsg.content : (firstMsg.text != null ? firstMsg.text : null));
         }
       } catch {
         // Body not JSON (e.g. upstream proxy error) — keep token counts at 0.
@@ -1215,7 +1385,7 @@ async function relay(res, upstreamRes, stream, backendId, started) {
       /* ignore */
     }
   }
-  return { ttftMs, cacheHit, promptTokens, completionTokens, reasoningTokens, genMs };
+  return { ttftMs, cacheHit, promptTokens, completionTokens, reasoningTokens, genMs, preview };
 }
 
 function writeError(res, e) {
@@ -1324,6 +1494,18 @@ function server() {
       const entries = [...HISTORY].reverse().slice(0, limit);
       res.writeHead(200, { "content-type": "application/json" });
       return res.end(JSON.stringify({ entries, limit }));
+    }
+
+    if (req.method === "GET" && url === "/api/history/detail") {
+      const raw = new URL(req.url, "http://localhost").searchParams.get("t");
+      const t = raw != null && raw !== "" ? Number(raw) : NaN;
+      const detail = !Number.isNaN(t) ? getDetail(t) : null;
+      if (!detail) {
+        res.writeHead(404, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ error: "not found" }));
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ detail }));
     }
 
     if (req.method === "GET" && url === "/api/stats") {

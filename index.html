@@ -223,6 +223,95 @@
   .status-miss { color: var(--faint); }
   .status-hit { color: var(--green); font-weight: 600; }
 
+  /* ---- request detail slide-out panel ---- */
+  .detail-overlay {
+    position: fixed; inset: 0; z-index: 50;
+    background: rgba(0, 0, 0, 0.55);
+    opacity: 0; pointer-events: none; transition: opacity 180ms ease;
+  }
+  .detail-overlay.open { opacity: 1; pointer-events: auto; }
+  .detail-panel {
+    position: fixed; top: 0; right: 0; bottom: 0; z-index: 51;
+    width: min(680px, 94vw); background: var(--bg);
+    border-left: 1px solid var(--border);
+    box-shadow: -12px 0 40px rgba(0, 0, 0, 0.5);
+    transform: translateX(100%); transition: transform 200ms ease;
+    display: flex; flex-direction: column;
+  }
+  .detail-panel.open { transform: translateX(0); }
+  .detail-head {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    padding: 14px 18px; border-bottom: 1px solid var(--border);
+    background: var(--panel); flex-shrink: 0;
+  }
+  .detail-head h3 { font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  .detail-head .close-x {
+    background: var(--panel-2); border: 1px solid var(--border); color: var(--muted);
+    border-radius: var(--radius); width: 30px; height: 30px; cursor: pointer;
+    font-size: 15px; line-height: 1; display: inline-flex; align-items: center; justify-content: center;
+  }
+  .detail-head .close-x:hover { color: var(--text); border-color: var(--faint); }
+  .detail-body { overflow-y: auto; padding: 14px 18px 40px; flex: 1; }
+  .detail-section { margin-bottom: 18px; }
+  .detail-section h4 {
+    font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.8px;
+    margin-bottom: 8px; font-weight: 600; display: flex; align-items: center; gap: 8px;
+  }
+  .detail-section h4 .chip {
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px;
+    padding: 1px 8px; font-size: 10px; font-weight: 600; text-transform: none; letter-spacing: 0.2px;
+    font-family: var(--mono); color: var(--muted);
+  }
+  .detail-meta {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 8px 16px;
+    padding: 10px 14px; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+  }
+  .detail-meta .dm { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .detail-meta .dm .k { font-size: 10px; color: var(--faint); text-transform: uppercase; letter-spacing: 0.5px; }
+  .detail-meta .dm .v { font-size: 12px; font-family: var(--mono); color: var(--text); word-break: break-all; }
+  .detail-pre {
+    background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 10px 12px; font-family: var(--mono); font-size: 12px; line-height: 1.5;
+    white-space: pre-wrap; word-break: break-word; overflow-x: auto; max-height: 320px; overflow-y: auto;
+  }
+  .detail-pre.preview { color: var(--text); }
+  .detail-attempt {
+    background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+    margin-bottom: 10px; overflow: hidden;
+  }
+  .detail-attempt summary {
+    display: flex; align-items: center; gap: 10px; padding: 10px 12px; cursor: pointer;
+    font-size: 13px; user-select: none;
+  }
+  .detail-attempt summary:hover { background: var(--panel-2); }
+  .detail-attempt summary .a-badge {
+    font-family: var(--mono); font-size: 11px; padding: 1px 8px; border-radius: 10px;
+    background: var(--panel-2); border: 1px solid var(--border); color: var(--muted);
+  }
+  .detail-attempt summary .a-badge.ok { color: var(--green); border-color: rgba(74, 222, 128, 0.35); }
+  .detail-attempt summary .a-badge.err { color: var(--red); border-color: rgba(248, 113, 113, 0.35); }
+  .detail-attempt .a-body { border-top: 1px solid var(--border); padding: 10px 12px; }
+  .detail-attempt .a-rows { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+  .detail-attempt .a-row { display: flex; gap: 10px; font-size: 12px; }
+  .detail-attempt .a-row .k { color: var(--faint); min-width: 90px; flex-shrink: 0; text-transform: uppercase; font-size: 10px; letter-spacing: 0.4px; padding-top: 2px; }
+  .detail-attempt .a-row .v { font-family: var(--mono); color: var(--text); word-break: break-all; }
+  .detail-attempt .a-err {
+    font-size: 12px; font-family: var(--mono); color: var(--red); white-space: pre-wrap; word-break: break-all;
+    background: var(--bg); border: 1px solid rgba(248, 113, 113, 0.25); border-radius: var(--radius);
+    padding: 8px 10px; max-height: 160px; overflow-y: auto;
+  }
+  .detail-note { font-size: 12px; color: var(--amber); margin-top: 8px; }
+  .detail-empty { font-size: 12px; color: var(--muted); padding: 10px 12px; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); }
+  .detail-err { font-size: 12px; color: var(--red); font-family: var(--mono); white-space: pre-wrap; word-break: break-all; }
+
+  @media (max-width: 640px) {
+    .detail-panel { width: 100vw; border-left: none; }
+  }
+
+  /* ---- history rows clickable ---- */
+  #historyBody tr.hist-row { cursor: pointer; }
+  #historyBody tr.hist-row:hover { background: var(--panel-2); }
+
   /* ---- polish ---- */
   :focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
   button, select, textarea, input, summary, label.check { transition: border-color 160ms cubic-bezier(.4,0,.2,1), background-color 160ms cubic-bezier(.4,0,.2,1), color 160ms cubic-bezier(.4,0,.2,1), transform 160ms cubic-bezier(.4,0,.2,1), opacity 160ms ease, box-shadow 160ms cubic-bezier(.4,0,.2,1); }
@@ -521,6 +610,18 @@
     </section>
   </div>
 </main>
+
+<!-- Request detail slide-out panel (deep dive per history row) -->
+<div id="detailOverlay" class="detail-overlay"></div>
+<aside id="detailPanel" class="detail-panel" role="dialog" aria-modal="true" aria-labelledby="detailTitle" aria-hidden="true">
+  <div class="detail-head">
+    <h3 id="detailTitle" data-icon="search">Request detail</h3>
+    <button class="close-x" id="detailClose" aria-label="Close detail" title="Close (Esc)">&times;</button>
+  </div>
+  <div class="detail-body" id="detailBody">
+    <div class="skeleton"></div><div class="skeleton"></div>
+  </div>
+</aside>
 
 <footer>
   <b>Manual:</b> config edits go in <code>config.json</code> (auto-reloads via <code>fs.watch</code>), API keys in <code>.env</code>. The router binds <code>127.0.0.1</code> only - no auth, localhost by design.
@@ -939,7 +1040,7 @@ function renderHistory() {
     "<span>Misses <b>" + misses + "</b></span>" +
     "<span>Known <b>" + known + "</b></span>";
   body.innerHTML = entries.slice(0, 100).map((e) =>
-    "<tr>" +
+    '<tr class="hist-row" data-t="' + e.t + '" title="Click for full request detail">' +
     '<td class="mono" data-label="Time">' + fmtTime(e.t) + "</td>" +
     '<td data-label="Model">' + esc(e.model) + "</td>" +
     '<td data-label="Backend">' + esc(e.backend) + "</td>" +
@@ -1133,6 +1234,163 @@ document.addEventListener("click", (ev) => {
     }
   }
 });
+
+// ---- request detail slide-out panel -------------------------------------------
+
+// Clicking a history row opens the deep-dive panel: full outgoing payload,
+// per-attempt outcomes, timing, usage, and the response preview. The panel
+// stays open across polls (it re-renders only when a new row is opened or the
+// polled row's data changes) and closes via the X, Escape, or click-outside.
+const detail = { t: null, fetching: false, entry: null };
+
+function detailOpen() {
+  return $("detailPanel").classList.contains("open");
+}
+
+function openDetail(t, entry) {
+  detail.t = t;
+  detail.entry = entry || null;
+  $("detailPanel").classList.add("open");
+  $("detailPanel").setAttribute("aria-hidden", "false");
+  $("detailOverlay").classList.add("open");
+  $("detailBody").innerHTML = '<div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>';
+  fetchDetail(t);
+}
+
+function closeDetail() {
+  detail.t = null;
+  detail.fetching = false;
+  $("detailPanel").classList.remove("open");
+  $("detailPanel").setAttribute("aria-hidden", "true");
+  $("detailOverlay").classList.remove("open");
+}
+
+async function fetchDetail(t) {
+  detail.fetching = true;
+  let body;
+  try {
+    const r = await fetch("/api/history/detail?t=" + encodeURIComponent(t));
+    body = await r.json();
+    if (r.status !== 200 || !body || !body.detail) {
+      $("detailBody").innerHTML = '<div class="detail-err">Detail not found for t=' + esc(t) + (body && body.error ? " (" + esc(body.error) + ")" : "") + '. The record may have been dropped by the retention cap or the request was too large to capture.</div>';
+      return;
+    }
+  } catch (e) {
+    $("detailBody").innerHTML = '<div class="detail-err">Failed to load detail: ' + esc(e && e.message) + "</div>";
+    return;
+  } finally {
+    detail.fetching = false;
+  }
+  // Only render if the panel still points at this row.
+  if (detail.t === t) renderDetail(body.detail);
+}
+
+function fmtMs(v) {
+  return v != null ? Math.round(v) + "ms" : "-";
+}
+
+function fmtNum(v) {
+  return v != null ? String(v) : "-";
+}
+
+function detailMetaRows(d) {
+  const e = detail.entry || {};
+  const resp = d.response || {};
+  const rows = [
+    ["Status", '<span class="' + (resp.status >= 400 ? "status-err" : "status-ok") + '">' + (resp.status != null ? resp.status : "?") + "</span>"],
+    ["Model (requested)", e.model != null ? esc(String(e.model)) : "-"],
+    ["Backend (served)", e.backend != null ? esc(String(e.backend)) : "-"],
+    ["Stream", e.stream != null ? (e.stream ? "yes" : "no") : "-"],
+    ["Latency", fmtMs(resp.latencyMs)],
+    ["TTFT", fmtMs(resp.ttftMs)],
+    ["Generation", fmtMs(resp.genMs)],
+    ["Prompt tokens", fmtNum(resp.promptTokens)],
+    ["Completion tokens", fmtNum(resp.completionTokens)],
+    ["Reasoning tokens", fmtNum(resp.reasoningTokens)],
+    ["Cache", resp.cacheHit == null ? "-" : (resp.cacheHit ? "hit" : "miss")],
+    ["Attempts", d.attempts ? d.attempts.length : 0],
+  ];
+  return rows.map(([k, v]) => '<div class="dm"><span class="k">' + esc(k) + "</span><span class=\"v\">" + v + "</span></div>").join("");
+}
+
+function renderDetail(d) {
+  const dBody = $("detailBody");
+  const e = detail.entry || {};
+  const hasPayload = !!(d.payload && typeof d.payload === "object");
+  const attempts = Array.isArray(d.attempts) ? d.attempts : [];
+  // Response preview: prefer d.response.preview; fall back to the last attempt's
+  // error body when the request failed.
+  const preview = d.response && d.response.preview != null
+    ? d.response.preview
+    : (attempts.length ? attempts[attempts.length - 1].errorBody || null : null);
+  const errBody = d.response && d.response.errorBody != null ? d.response.errorBody : null;
+  const attemptsHtml = attempts.length
+    ? attempts.map((a, i) => {
+        const ok = a.status >= 200 && a.status < 400;
+        const rows = [
+          ["Attempt", "#" + (i + 1)],
+          ["Backend", a.backend || "-"],
+          ["Upstream", a.upstream || "-"],
+          ["Model", a.model || "-"],
+          ["Status", a.status != null ? a.status : "-"],
+          ["Latency", fmtMs(a.latencyMs)],
+          ["Started", a.startedAt ? new Date(a.startedAt).toISOString() : "-"],
+          ["Retry", a.retry != null ? a.retry : "-"],
+        ].map(([k, v]) => '<div class="a-row"><span class="k">' + esc(k) + "</span><span class=\"v\">" + esc(String(v)) + "</span></div>").join("");
+        const errHtml = a.errorBody ? '<div class="a-err">' + esc(String(a.errorBody)) + "</div>" : "";
+        return (
+          "<details class='detail-attempt'" + (i === 0 ? " open" : "") + ">" +
+          "<summary><span class='a-badge " + (ok ? "ok" : "err") + "'>" + (ok ? "OK" : "ERR") + "</span>" +
+          "<span class='mono'>" + esc(a.backend || "?") + "</span>" +
+          "<span class='mono' style='color:var(--muted)'>" + fmtMs(a.latencyMs) + "</span>" +
+          "</summary><div class='a-body'>" +
+          '<div class="a-rows">' + rows + "</div>" + errHtml +
+          "</div></details>"
+        );
+      }).join("")
+    : '<div class="detail-empty">No attempts were made (e.g. all backends were cooling or unavailable).</div>';
+
+  dBody.innerHTML =
+    '<div class="detail-section">' +
+      "<h4>Overview</h4>" +
+      '<div class="detail-meta">' + detailMetaRows(d) + "</div>" +
+    "</div>" +
+    (errBody ? '<div class="detail-section"><h4>Final error body</h4><div class="detail-pre preview">' + esc(String(errBody)) + "</div></div>" : "") +
+    '<div class="detail-section">' +
+      "<h4>Attempts <span class='chip'>" + attempts.length + "</span></h4>" + attemptsHtml +
+    "</div>" +
+    '<div class="detail-section">' +
+      "<h4>Outgoing request payload <span class='chip'>" + (hasPayload ? (d.payload.messages ? (d.payload.messages.length + " messages") : "0 messages") : "not captured") + "</span></h4>" +
+      (hasPayload
+        ? "<details open><summary>JSON</summary><pre class='detail-pre'>" + highlightJSON(d.payload) + "</pre></details>"
+        : '<div class="detail-empty">Payload not captured (body larger than 100 KB, or this request predates the detail store).</div>') +
+    "</div>" +
+    '<div class="detail-section">' +
+      "<h4>Response summary</h4>" +
+      (d.response
+        ? '<div class="detail-pre preview">' + (preview != null ? esc(String(preview)) : "(no preview captured)") + "</div>"
+        : '<div class="detail-empty">No response summary recorded.</div>') +
+    "</div>" +
+    '<div class="detail-note">Detail records live in memory only (max 100, oldest dropped) and are never written to disk. Requests with bodies over 100 KB are not captured.</div>';
+}
+
+// History row click (delegated so newly rendered rows work without rebinding).
+document.addEventListener("click", (ev) => {
+  const row = ev.target.closest("#historyBody tr.hist-row");
+  if (row && row.dataset.t) {
+    const t = parseInt(row.dataset.t, 10);
+    const entries = (state.history && state.history.entries) || [];
+    const entry = entries.find((en) => en.t === t) || null;
+    openDetail(t, entry);
+  }
+});
+
+$("detailClose").addEventListener("click", closeDetail);
+$("detailOverlay").addEventListener("click", closeDetail);
+document.addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape" && detailOpen()) closeDetail();
+});
+
 
 // ---- actions: playground -----------------------------------------------------
 

@@ -220,6 +220,7 @@ three-layer shape at load, byte-identically for identical effective configs.
 | POST | `/v1/chat/completions` | chat completions (stream + non-stream) |
 | GET | `/api/stats` | traffic stats |
 | GET | `/api/history?limit=N` | request history (default 100, clamp 1..500) |
+| GET | `/api/history/detail?t=<timestamp>` | deep-dive detail for one history entry (payload, attempts, response summary) |
 | GET | `/api/config` | normalized config (env NAMES only, never key values) |
 | POST | `/admin/reset-health` | reset all cooling states |
 | POST | `/admin/backend` | `{id, action: "cool"\|"uncool", forMs?}` manual cool/uncool |
@@ -228,14 +229,34 @@ three-layer shape at load, byte-identically for identical effective configs.
 History lives in an in-memory ring buffer (500 entries) and appends to
 `router-history.jsonl` (override with `ROUTER_HISTORY`).
 
+### Request detail deep dive
+
+Click any row in the dashboard's request history to open a slide-out panel with
+the full debug picture for that request:
+
+- **Outgoing request payload** — the exact JSON sent upstream (messages
+  included, syntax-highlighted). API keys are never part of the payload, so
+  nothing sensitive is stored.
+- **Per-attempt details** — every backend tried, the upstream model string, the
+  status and latency of each attempt, and the raw upstream error body when an
+  attempt failed.
+- **Response summary** — status, timing (TTFT / total / generation), token
+  usage, cache state, and a first-content preview (truncated to 200 chars).
+
+Detail records are stored **in memory only** (never written to
+`router-history.jsonl`), capped at **100 records** (oldest dropped), and only
+for requests whose raw body is **≤ 100 KB**. Requests with larger bodies still
+appear in the history table but have no deep-dive record. The panel closes via
+the X button, the Escape key, or clicking outside.
+
 ## Web UI
 
 `index.html` — single file, inline CSS + JS, zero external assets, works
 offline. Dashboard: backend cards with live cooling countdowns, traffic stats
 with p50/p95/p99 and cache-hit %, presets table, models table, request history
-with TTFT/TPS/tokens/cache columns, config viewer, and a playground that can
-stream a chat, show reasoning, compare models side by side, and export the
-conversation.
+with TTFT/TPS/tokens/cache columns and a click-to-open detail panel per row,
+config viewer, and a playground that can stream a chat, show reasoning, compare
+models side by side, and export the conversation.
 
 ## Test
 
@@ -243,12 +264,12 @@ conversation.
 npm test   # node test.mjs
 ```
 
-The suite (91 assertions) spins up mock backends and router instances on temp
+The suite (100 assertions) spins up mock backends and router instances on temp
 configs — no keys, no network. It covers health, streaming, session affinity,
 failover, weighted selection, sticky/timed manual cools, fallback exclusion,
 dialect handling, synthesis from both legacy eras, the layered-params merge
-order, and preset-of-presets nesting (expansion, cycle detection, ordering
-rules).
+order, preset-of-presets nesting (expansion, cycle detection, ordering rules),
+per-model retry/backoff, and the request-detail endpoint.
 
 ## Design docs
 
