@@ -73,6 +73,10 @@ function backoffFor(kind, cfg, fails) {
   return Math.min(base * 2 ** (fails - 1), max);
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function markHealthy(id) {
   health.set(id, { state: "healthy", nextAvailableAt: 0, fails: 0, backoffMs: 0, lastError: null });
 }
@@ -94,6 +98,20 @@ function classify(status, bodyText) {
   if (status === 0) return "server"; // network error
   if (status === 400 || status === 422) return "client"; // our payload bug, not backend health
   return "server";
+}
+
+// Whether a failure is safe to RETRY on the same provider. Distinct from the
+// cooling classification: some failures are retryable (transient overload,
+// 5xx, network blip) without being a reason to abandon the provider for
+// everyone, and some cooling failures (429 weekly, auth) must never be retried
+// because retrying cannot succeed and only wastes the retry budget.
+function isRetryableError(status, bodyText) {
+  const kind = classify(status, bodyText);
+  if (kind === "weekly" || kind === "auth" || kind === "client") return false;
+  if (status === 429) return /overload/i.test(bodyText || "");
+  if (status === 502 || status === 503 || status === 504) return true;
+  if (status === 0) return true; // network error
+  return false;
 }
 
 function markFailure(cfg, id, status, bodyText) {
@@ -182,6 +200,8 @@ function newHistoryEntry(f) {
     session: f.session,
     routedModel: f.routedModel ?? null,          // resolved model id (success: serving attempt; failure: first candidate; null: none)
     wireParams: f.wireParams ?? null,            // redacted summary of the params actually sent upstream (for explaining reasoning on/off per row)
+    retries: f.retries ?? 0,                     // number of retry attempts performed on the serving provider (0 = none)
+    retryWaitedMs: f.retryWaitedMs ?? 0,         // total ms spent waiting in backoff across retries
   };
 }
 
@@ -304,6 +324,28 @@ function normalizeConfig(cfg) {
     if ("params" in m && (m.params === null || typeof m.params !== "object")) {
       console.warn(`config warning: model '${id}': params must be an object, ignored`);
       delete m.params;
+    }
+    if (m.retry !== undefined) {
+      if (m.retry === null || typeof m.retry !== "object") {
+        console.warn(`config warning: model '${id}': retry must be an object, ignored`);
+        delete m.retry;
+      } else {
+        const r = m.retry;
+        if (typeof r.maxRetries !== "number" || r.maxRetries < 0 || !Number.isInteger(r.maxRetries)) {
+          console.warn(`config warning: model '${id}': retry.maxRetries must be a non-negative integer, defaulting to 0`);
+          r.maxRetries = 0;
+        }
+        for (const k of ["baseMs", "maxMs", "totalMs"]) {
+          if (r[k] !== undefined && (typeof r[k] !== "number" || r[k] < 0)) {
+            console.warn(`config warning: model '${id}': retry.${k} must be a non-negative number, ignored`);
+            delete r[k];
+          }
+        }
+        if (r.multiplier !== undefined && (typeof r.multiplier !== "number" || r.multiplier < 1)) {
+          console.warn(`config warning: model '${id}': retry.multiplier must be a number >= 1, defaulting to 2`);
+          r.multiplier = 2;
+        }
+      }
     }
   }
 
@@ -754,7 +796,36 @@ async function handleChat(req, res, cfg, bodyText) {
     const provider = (model && (model.providers || []).find((p) => p.backend === attempt.backend)) || null;
     if (!backend || !model || !provider) continue; // defensive: candidates built the attempt
     const payload = buildPayload(body, cfg, c.preset, model, provider, backend);
-    const result = await forward(req, cfg, backend, payload, req.headers, stream);
+
+    // Per-model retry: on retryable failures, retry the SAME provider with
+    // exponential backoff before falling through to the next candidate. This
+    // preserves the session's prompt cache (a fallback backend has zero cached
+    // context) and gives chronically-overloaded free models a chance to catch
+    // a free slot. Retries NEVER re-cool the backend - markFailure runs once
+    // after retries are exhausted, exactly as before.
+    const rcfg = (model.retry && typeof model.retry === "object" ? model.retry : null) || { maxRetries: 0 };
+    const maxRetries = Math.max(0, Math.floor(rcfg.maxRetries || 0));
+    const retryBaseMs = rcfg.baseMs ?? 1000;
+    const retryMaxMs = rcfg.maxMs ?? 8000;
+    const retryMult = rcfg.multiplier ?? 2;
+    const retryTotalMs = rcfg.totalMs ?? 15000;
+    let retries = 0;
+    let retryWaitedMs = 0;
+    let result = null;
+    while (true) {
+      result = await forward(req, cfg, backend, payload, req.headers, stream);
+      if (result.err && isRetryableError(result.err.status, result.err.body) && retries < maxRetries) {
+        const retryCount = retries + 1;
+        const waitMs = Math.min(retryBaseMs * retryMult ** (retryCount - 1), retryMaxMs);
+        const budgetExceeded = retryWaitedMs + waitMs > retryTotalMs;
+        if (budgetExceeded) break;
+        retries = retryCount;
+        retryWaitedMs += waitMs;
+        await sleep(waitMs);
+        continue;
+      }
+      break;
+    }
     if (result.err) {
       lastErr = result.err;
       markFailure(cfg, attempt.backend, result.err.status, result.err.body);
@@ -788,6 +859,8 @@ async function handleChat(req, res, cfg, bodyText) {
       session: sessionKey,
       routedModel: attempt.model,
       wireParams: extractWireParams(payload),
+      retries,
+      retryWaitedMs,
     });
     recordHistory(entry);
     recordStats(entry);

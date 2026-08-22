@@ -63,6 +63,38 @@ Manual cools (from the UI or `POST /admin/backend`) are **sticky**: they never
 participate in the all-cooling fallback and are never cleared by a success.
 Only the Uncool action (or a timed `forMs`) restores the backend.
 
+### Per-model retries
+
+On top of cooling, a model can retry a **transient** failure on the SAME
+provider before falling through to the next candidate. This preserves the
+session's prompt cache (a fallback backend has zero cached context) and gives
+chronically-overloaded free models a chance to catch a free slot.
+
+```jsonc
+{
+  "models": {
+    "laguna-s-2.1-free": {
+      "providers": [{ "backend": "commandcode", "upstream": "poolside/laguna-s-2.1-free" }],
+      "retry": {
+        "maxRetries": 5,   // how many retries before falling through (default 0 = off)
+        "baseMs": 2000,    // first retry wait (default 1000)
+        "maxMs": 30000,    // per-wait cap (default 8000)
+        "multiplier": 2,   // exponential factor (default 2)
+        "totalMs": 30000   // total retry-wait budget for one provider (default 15000)
+      }
+    }
+  }
+}
+```
+
+Retryable failures: 502/503/504, 429 with an `overload` message, network
+errors (status 0). NOT retried: 429 weekly limits (GoUsageLimitError), auth
+errors, 400/422 client payload errors, and anything that has already started
+streaming (a partially-relayed response can never be retried without
+duplicating content). Retries never re-cool the backend; `markFailure` runs
+once after retries are exhausted, exactly as before. History entries carry
+`retries` (count) and `retryWaitedMs` (total ms waited).
+
 ### Layered parameters
 
 Params merge from six layers, highest priority last:

@@ -1374,6 +1374,196 @@ async function main() {
     }
   }
 
+  // z19) retryable 503 then success: same provider is retried (not failed over),
+  //      request returns 200, history records retries=1.
+  {
+    let hits = 0;
+    const flakySrv = http.createServer((req, res) => {
+      hits++;
+      if (hits <= 2) {
+        res.writeHead(503, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "upstream temporarily unavailable", type: "overloaded_error" } }));
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: "mock", object: "chat.completion", choices: [{ message: { role: "assistant", content: "mock:z19" } }], usage: { prompt_tokens: 5, completion_tokens: 5 } }));
+    });
+    const z19port = await listen(flakySrv);
+    const cfgZ19 = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "z19", baseURL: `http://${HOST}:${z19port}`, apiKeyEnv: "KEY_Z19" }],
+      models: {
+        "m19": {
+          providers: [{ backend: "z19", upstream: "u19" }], affinityPool: 1,
+          retry: { maxRetries: 3, baseMs: 10, maxMs: 50, multiplier: 2 },
+        },
+      },
+      presets: { "p19": { strategy: "affinity", models: ["m19"] } },
+      backoff: BO,
+    };
+    const { child: childZ19, base: baseZ19, dir: dirZ19 } = await startRouterCfg(cfgZ19, "KEY_Z19=k\n");
+    try {
+      const rr = await fetch(baseZ19 + "/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer local-master" },
+        body: JSON.stringify({ model: "p19", messages: [] }),
+        signal: AbortSignal.timeout(8000),
+      });
+      const body = await rr.json();
+      const hist = await (await api(baseZ19, "/api/history", { method: "GET" })).json();
+      const latest = hist.entries[0];
+      // Mock fails on hits 1 and 2, succeeds on hit 3 -> 1 initial + 2 retries.
+      assert(
+        rr.status === 200 && hits === 3 && latest && latest.retries === 2,
+        "z19) retryable 503 then success: same provider retried (hits=" + hits + ", status=" + rr.status + ", retries=" + (latest ? latest.retries : "?") + ")"
+      );
+    } finally {
+      childZ19.kill();
+      flakySrv.close();
+      await rm(dirZ19, { recursive: true, force: true });
+    }
+  }
+
+  // z20) non-retryable client error does NOT retry: one hit only, request fails.
+  {
+    let hits = 0;
+    const clientSrv = http.createServer((req, res) => {
+      hits++;
+      res.writeHead(422, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "bad payload", type: "invalid_request_error" } }));
+    });
+    const z20port = await listen(clientSrv);
+    const cfgZ20 = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "z20", baseURL: `http://${HOST}:${z20port}`, apiKeyEnv: "KEY_Z20" }],
+      models: {
+        "m20": {
+          providers: [{ backend: "z20", upstream: "u20" }], affinityPool: 1,
+          retry: { maxRetries: 3, baseMs: 10, maxMs: 50 },
+        },
+      },
+      presets: { "p20": { strategy: "affinity", models: ["m20"] } },
+      backoff: BO,
+    };
+    const { child: childZ20, base: baseZ20, dir: dirZ20 } = await startRouterCfg(cfgZ20, "KEY_Z20=k\n");
+    try {
+      const rr = await fetch(baseZ20 + "/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer local-master" },
+        body: JSON.stringify({ model: "p20", messages: [] }),
+        signal: AbortSignal.timeout(8000),
+      });
+      // Client errors are not retried (hits must stay 1). The router exhausts
+      // the pool and surfaces a 503 carrying the upstream's error body - that
+      // is pre-existing behavior, not a retry concern; what matters is no retry.
+      assert(
+        rr.status === 503 && hits === 1,
+        "z20) non-retryable client error does NOT retry (hits=" + hits + ", status=" + rr.status + ")"
+      );
+    } finally {
+      childZ20.kill();
+      clientSrv.close();
+      await rm(dirZ20, { recursive: true, force: true });
+    }
+  }
+
+  // z21) maxRetries exhausted -> falls through to next candidate provider.
+  {
+    let badHits = 0;
+    const badSrv = http.createServer((req, res) => {
+      badHits++;
+      res.writeHead(503, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "overloaded", type: "overloaded_error" } }));
+    });
+    const goodSrv = mockBackend("z21good", {});
+    const z21ports = await Promise.all([listen(badSrv), listen(goodSrv.srv)]);
+    goodSrv.port = z21ports[1];
+    const cfgZ21 = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "z21bad", baseURL: `http://${HOST}:${z21ports[0]}`, apiKeyEnv: "KEY_Z21BAD" },
+        { id: "z21good", baseURL: `http://${HOST}:${goodSrv.port}`, apiKeyEnv: "KEY_Z21GOOD" },
+      ],
+      models: {
+        "m21": {
+          providers: [{ backend: "z21bad", upstream: "u21" }, { backend: "z21good", upstream: "u21" }], affinityPool: 1,
+          retry: { maxRetries: 2, baseMs: 10, maxMs: 30, multiplier: 2 },
+        },
+      },
+      presets: { "p21": { strategy: "affinity", models: ["m21"] } },
+      backoff: BO,
+    };
+    const { child: childZ21, base: baseZ21, dir: dirZ21 } = await startRouterCfg(cfgZ21, "KEY_Z21BAD=k\nKEY_Z21GOOD=k\n");
+    try {
+      const rr = await fetch(baseZ21 + "/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer local-master" },
+        body: JSON.stringify({ model: "p21", messages: [] }),
+        signal: AbortSignal.timeout(8000),
+      });
+      const backend = rr.headers.get("x-router-backend");
+      const body = await rr.json();
+      assert(
+        rr.status === 200 && backend === "z21good" && badHits === 3,
+        "z21) retries exhausted then fallback: badSrv hit 3x (1 + 2 retries), served by good backend (backend=" + backend + ", badHits=" + badHits + ")"
+      );
+    } finally {
+      childZ21.kill();
+      badSrv.close(); goodSrv.srv.close();
+      await rm(dirZ21, { recursive: true, force: true });
+    }
+  }
+
+  // z22) totalMs budget stops retries mid-way: with baseMs large enough that
+  //      the second retry would exceed the budget, only 2 attempts happen
+  //      (1 initial + 1 retry) then failover to the good backend.
+  {
+    let badHits = 0;
+    const badSrv = http.createServer((req, res) => {
+      badHits++;
+      res.writeHead(503, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "overloaded", type: "overloaded_error" } }));
+    });
+    const goodSrv = mockBackend("z22good", {});
+    const z22ports = await Promise.all([listen(badSrv), listen(goodSrv.srv)]);
+    goodSrv.port = z22ports[1];
+    const cfgZ22 = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "z22bad", baseURL: `http://${HOST}:${z22ports[0]}`, apiKeyEnv: "KEY_Z22BAD" },
+        { id: "z22good", baseURL: `http://${HOST}:${goodSrv.port}`, apiKeyEnv: "KEY_Z22GOOD" },
+      ],
+      models: {
+        "m22": {
+          providers: [{ backend: "z22bad", upstream: "u22" }, { backend: "z22good", upstream: "u22" }], affinityPool: 1,
+          // maxRetries high, but totalMs budget tiny: after first retry (wait 40ms)
+          // the second retry's wait would blow the 60ms budget -> stop retrying.
+          retry: { maxRetries: 5, baseMs: 40, maxMs: 200, multiplier: 2, totalMs: 60 },
+        },
+      },
+      presets: { "p22": { strategy: "affinity", models: ["m22"] } },
+      backoff: BO,
+    };
+    const { child: childZ22, base: baseZ22, dir: dirZ22 } = await startRouterCfg(cfgZ22, "KEY_Z22BAD=k\nKEY_Z22GOOD=k\n");
+    try {
+      const rr = await fetch(baseZ22 + "/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer local-master" },
+        body: JSON.stringify({ model: "p22", messages: [] }),
+        signal: AbortSignal.timeout(8000),
+      });
+      const backend = rr.headers.get("x-router-backend");
+      assert(
+        rr.status === 200 && backend === "z22good" && badHits === 2,
+        "z22) totalMs budget stops retries: badSrv hit 2x (1 + 1 retry), fallback served (backend=" + backend + ", badHits=" + badHits + ")"
+      );
+    } finally {
+      childZ22.kill();
+      badSrv.close(); goodSrv.srv.close();
+      await rm(dirZ22, { recursive: true, force: true });
+    }
+  }
+
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
 }
