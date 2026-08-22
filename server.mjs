@@ -165,6 +165,9 @@ const STATS = {
   byModel: {}, // modelId -> count
 };
 const startedAt = Date.now();
+// Dedup set for preset-of-presets cycle warnings: warn once per cyclic path
+// (a repeated cycle on a hot path must not spam the router log).
+const cycleWarned = new Set();
 // JSONL history lands next to the config so tests write into their temp dir.
 const historyPath = process.env.ROUTER_HISTORY || join(dirname(CONFIG_PATH), "router-history.jsonl");
 
@@ -357,7 +360,9 @@ function normalizeConfig(cfg) {
       continue;
     }
     if (Array.isArray(p.models)) {
-      // NEW shape: normalize model refs to {model, weight} objects.
+      // NEW shape: normalize model refs to {model, weight} objects. A ref may
+      // name a MODEL id or another PRESET id (preset-of-presets): both
+      // namespaces are legal, unknown ids are dropped.
       const refs = [];
       for (const ref of p.models) {
         let mref = null;
@@ -371,7 +376,7 @@ function normalizeConfig(cfg) {
           console.warn(`config warning: preset '${id}': invalid model entry dropped`);
           continue;
         }
-        if (!cfg.models[mref]) {
+        if (!cfg.models[mref] && !cfg.presets[mref]) {
           console.warn(`config warning: preset '${id}': dropping unknown model '${mref}'`);
           continue;
         }
@@ -456,11 +461,34 @@ function normalizeConfig(cfg) {
   }
 
   // ---- 4. derived read-only preset members --------------------------------
-  for (const p of Object.values(cfg.presets)) {
+  // members = flattened provider backends of the preset's (recursively
+  // expanded) model list, first-occurrence order, deduped. Nested preset refs
+  // contribute their models' providers in place.
+  const flattenPresetModels = (pid, seenPresets) => {
+    const out = [];
+    const p = cfg.presets[pid];
+    if (!p || seenPresets.has(pid)) return out;
+    const nextSeen = new Set(seenPresets).add(pid);
+    for (const ref of p.models || []) {
+      // Identity case (path B): models: [{model: <same id>}] where the id is
+      // BOTH preset and model -> the ref is a MODEL, not a nested preset.
+      if (ref.model === pid && cfg.models[pid]) {
+        out.push(pid);
+        continue;
+      }
+      if (cfg.presets[ref.model]) {
+        out.push(...flattenPresetModels(ref.model, nextSeen));
+      } else {
+        out.push(ref.model);
+      }
+    }
+    return out;
+  };
+  for (const [pid, p] of Object.entries(cfg.presets)) {
     const members = [];
     const seen = new Set();
-    for (const ref of p.models || []) {
-      const m = cfg.models[ref.model];
+    for (const mid of flattenPresetModels(pid, new Set())) {
+      const m = cfg.models[mid];
       if (!m) continue;
       for (const pr of m.providers || []) {
         if (seen.has(pr.backend)) continue;
@@ -524,6 +552,73 @@ function hashStr(s) {
   return crypto.createHash("sha256").update(String(s)).digest().readUInt32BE(0);
 }
 
+// Recursively expand a preset's models list into a flat model-id list.
+// - A preset's models array may contain MODEL ids and/or PRESET ids
+//   (preset-of-presets). Preset refs are expanded in place, preserving
+//   declared order. A nested preset contributes ONLY its model list (flattened
+//   recursively); its own strategy/affinityPool/weights are ignored for
+//   ordering - the TOP-LEVEL preset's strategy governs the expanded list.
+// - Weights: the top-level ref carries the weight (nested preset ids use the
+//   weight of the position they were referenced from). Expansion itself is
+//   weight-less; weights only matter when the top-level strategy is weighted.
+// - Cycle handling: a visited set per expansion. On a cycle (a preset already
+//   in the current expansion path is referenced again), console.warn ONCE and
+//   stop expanding that path; the id that caused the cycle is kept as a MODEL
+//   id if it resolves to a model, else dropped.
+// - Unknown refs (neither preset nor model) are dropped (they are already
+//   warned about at normalizeConfig time; this is a defensive re-check).
+// Returns {modelIds, modelRefs} where modelRefs are the TOP-LEVEL refs
+// (weights kept, expanded ordering).
+function expandPresetModels(cfg, topPreset, topId) {
+  const presets = cfg.presets || {};
+  const models = cfg.models || {};
+  const modelIds = [];
+  const modelRefs = [];
+
+  const expand = (ref, visited) => {
+    const id = typeof ref === "string" ? ref : ref && ref.model;
+    if (!id) return;
+    const isPreset = !!presets[id];
+    const isModel = !!models[id];
+    if (!isPreset && !isModel) return; // unknown id (defensive; normalizeConfig warns)
+    if (isPreset) {
+      if (visited.has(id)) {
+        const pathKey = [...visited, id].join("->");
+        if (!cycleWarned.has(pathKey)) {
+          cycleWarned.add(pathKey);
+          console.warn(
+            `config warning: preset-of-presets cycle detected at '${id}' (path: ${[...visited, id].join(" -> ")}); keeping it as a model id if it resolves, else dropping`
+          );
+        }
+        if (isModel) modelIds.push(id); // keep as model if it resolves, else drop
+        return;
+      }
+      const sub = presets[id];
+      const subRefs = (sub.models || []).map((m) => (typeof m === "string" ? { model: m, weight: 1 } : m));
+      for (const sr of subRefs) expand(sr, new Set(visited).add(id));
+    } else {
+      modelIds.push(id);
+      modelRefs.push({ model: id, weight: ref && typeof ref === "object" ? ref.weight || 1 : 1 });
+    }
+  };
+
+  for (const ref of topPreset.models || []) {
+    const m = typeof ref === "string" ? { model: ref, weight: 1 } : ref;
+    const id = m.model;
+    // Identity case: a preset whose models list references its OWN colliding
+    // id (path B synthesis produces {models: [{model: <same id>}]} where the
+    // id is BOTH preset and model). That is a MODEL ref, not a nested preset:
+    // treat it as a model without recursion or cycle warning.
+    if (id === topId && models[id]) {
+      modelIds.push(id);
+      modelRefs.push({ model: id, weight: m.weight || 1 });
+      continue;
+    }
+    expand(m, new Set([topId]));
+  }
+  return { modelIds, modelRefs };
+}
+
 // Build the flattened, backend-deduped ordered attempt list for a request:
 // - preset-or-implicit-model resolution: a preset id uses its strategy; a bare
 //   model id acts as an implicit single-model preset
@@ -545,6 +640,11 @@ function hashStr(s) {
 // model), primary is ordered[0] or null, ordered is the attempt list. A preset
 // with zero valid models returns ordered: [] (not null) so handleChat can
 // produce the specific 404 message.
+// Preset-of-presets: when a preset's models list contains another preset id,
+// that nested preset's model list is EXPANDED in place (recursively, with
+// cycle detection). The TOP-LEVEL preset's strategy governs ordering over the
+// expanded list; a nested preset's own strategy is ignored (only its model
+// list is taken). See expandPresetModels() above.
 function candidates(cfg, requestedId, sessionKey, rng = Math.random) {
   const preset = (cfg.presets || {})[requestedId] || null;
   let kind;
@@ -552,8 +652,10 @@ function candidates(cfg, requestedId, sessionKey, rng = Math.random) {
   let modelRefs;
   if (preset) {
     kind = "preset";
-    modelRefs = (preset.models || []).map((m) => (typeof m === "string" ? { model: m, weight: 1 } : m));
-    modelIds = modelRefs.map((m) => m.model);
+    // Expand nested preset refs to a flat model list (cycle-safe).
+    const expanded = expandPresetModels(cfg, preset, requestedId);
+    modelIds = expanded.modelIds;
+    modelRefs = expanded.modelRefs;
   } else if ((cfg.models || {})[requestedId]) {
     kind = "model";
     modelIds = [requestedId];
@@ -562,7 +664,7 @@ function candidates(cfg, requestedId, sessionKey, rng = Math.random) {
     return null;
   }
 
-  // Preset-level model ordering.
+  // Preset-level model ordering over the (possibly expanded) model list.
   let orderedModels;
   if (!preset) {
     orderedModels = modelIds; // implicit model: single candidate

@@ -182,6 +182,26 @@ Top-level keys: `port`, `prefix`, `masterKeyEnv`, `backends`, `models`,
 - **presets** — routing policies: `strategy`, `models` (string shorthand or
   `{model, weight}`), optional `affinityPool`, `params`, `meta`.
 
+**Presets of presets (tier nesting):** a preset's `models` array may also
+reference other preset ids. The nested preset's model list is expanded in place
+at request time (recursively, with cycle detection), and the TOP-LEVEL preset's
+strategy governs ordering over the expanded list. A nested preset's own
+strategy is ignored — only its model list is taken. This lets you build tiers
+that reuse each other:
+
+```jsonc
+"presets": {
+  "glm":  { "strategy": "failover", "models": ["glm-5.3"] },
+  "os-alpha": { "strategy": "affinity", "models": ["deepseek-v4-flash", "mimo-v2.5-pro"] },
+  "super": { "strategy": "failover", "models": ["glm", "os-alpha"] }
+}
+```
+
+`super` routes through `[glm-5.3, deepseek-v4-flash, mimo-v2.5-pro]` in
+declared order (failover). Cycles (`A -> B -> A`) are cut with a one-time
+warning and never hang the router. See `DESIGN-3LAYER.md` section 3a for the
+full contract.
+
 Config hot-reloads via `fs.watch` (~300 ms) — no restart needed. Validate JSON
 before saving.
 
@@ -223,11 +243,12 @@ conversation.
 npm test   # node test.mjs
 ```
 
-The suite (80 assertions) spins up mock backends and router instances on temp
+The suite (91 assertions) spins up mock backends and router instances on temp
 configs — no keys, no network. It covers health, streaming, session affinity,
 failover, weighted selection, sticky/timed manual cools, fallback exclusion,
-dialect handling, synthesis from both legacy eras, and the layered-params merge
-order.
+dialect handling, synthesis from both legacy eras, the layered-params merge
+order, and preset-of-presets nesting (expansion, cycle detection, ordering
+rules).
 
 ## Design docs
 
