@@ -42,6 +42,18 @@
         "pricing": { "inputPerM": 0.18, "outputPerM": 0.87 }
       }
     },
+    "deepseek-v4-flash-commandcode": {
+      "providers": [
+        { "backend": "commandcode", "upstream": "deepseek/deepseek-v4-flash" }
+      ],
+      "affinityPool": 1,
+      "params": { "thinking": { "type": "enabled" }, "reasoning_effort": "high" },
+      "meta": {
+        "label": "DeepSeek V4 Flash (CommandCode only)",
+        "contextWindow": 128000,
+        "pricing": { "inputPerM": 0.18, "outputPerM": 0.87 }
+      }
+    },
     "glm-5.3": {
       "providers": [
         { "backend": "zai", "upstream": "glm-5.3" },
@@ -87,10 +99,37 @@
         { "backend": "commandcode", "upstream": "poolside/laguna-s-2.1-free" }
       ],
       "affinityPool": 1,
+      "retry": { "maxRetries": 5, "baseMs": 2000, "maxMs": 30000, "multiplier": 2, "totalMs": 30000 },
       "meta": {
         "label": "Laguna S 2.1 Free",
         "contextWindow": 256000,
         "pricing": { "inputPerM": 0, "outputPerM": 0 }
+      }
+    },
+    "ox-alpha": {
+      "providers": [
+        { "backend": "commandcode", "upstream": "stealth/ox-alpha" }
+      ],
+      "affinityPool": 1,
+      "params": { "reasoning_effort": "high" },
+      "retry": { "maxRetries": 5, "baseMs": 2000, "maxMs": 30000, "multiplier": 2, "totalMs": 30000 },
+      "meta": {
+        "label": "Ox Alpha (free, stealth)",
+        "contextWindow": 1048576,
+        "pricing": { "inputPerM": 0, "outputPerM": 0 }
+      }
+    },
+    "qwen3.7-flash": {
+      "providers": [
+        { "backend": "commandcode", "upstream": "Qwen/Qwen3.7-Flash" }
+      ],
+      "affinityPool": 1,
+      "params": { "thinking": { "type": "enabled" }, "reasoning_effort": "high" },
+      "retry": { "maxRetries": 3, "baseMs": 2000, "maxMs": 30000, "multiplier": 2, "totalMs": 30000 },
+      "meta": {
+        "label": "Qwen 3.7 Flash",
+        "contextWindow": 1000000,
+        "pricing": { "inputPerM": 0.00000003, "outputPerM": 0.00000013 }
       }
     }
   },
@@ -107,6 +146,10 @@
       "strategy": "failover",
       "models": ["deepseek-v4-flash-direct"]
     },
+    "deepseek-v4-flash-commandcode": {
+      "strategy": "failover",
+      "models": ["deepseek-v4-flash-commandcode"]
+    },
     "glm-5.3": {
       "strategy": "failover",
       "models": ["glm-5.3"]
@@ -122,6 +165,14 @@
     "laguna-s-2.1-free": {
       "strategy": "failover",
       "models": ["laguna-s-2.1-free"]
+    },
+    "super": {
+      "strategy": "failover",
+      "models": ["ox-alpha", "glm-5.3"]
+    },
+    "qwen3.7-flash": {
+      "strategy": "failover",
+      "models": ["qwen3.7-flash"]
     }
   },
   "backoff": {
