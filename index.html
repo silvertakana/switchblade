@@ -157,6 +157,42 @@
   .banner { display: flex; align-items: center; gap: 8px; background: rgba(248,113,113,.1); border: 1px solid rgba(248,113,113,.4); color: var(--red); border-radius: var(--radius); padding: 14px; margin-bottom: 16px; font-size: 13px; }
   .banner svg { width: 16px; height: 16px; flex-shrink: 0; }
   .banner button { margin-left: auto; }
+  .banner.authed { background: rgba(251,191,36,.1); border-color: rgba(251,191,36,.4); color: var(--amber); }
+  .banner.authed button { margin-left: 0; }
+
+  /* ---- dashboard login overlay (password gate) ---- */
+  .login-overlay { position: fixed; inset: 0; z-index: 60; background: var(--bg); display: flex; align-items: center; justify-content: center; padding: 24px; }
+  /* The `hidden` attribute must beat the class's display:flex, or the overlay
+     stays full-screen and swallows every click after login. */
+  .login-overlay[hidden] { display: none; }
+  .login-box { width: 100%; max-width: 360px; }
+  .login-box h2 { margin-bottom: 6px; }
+  .login-box p { color: var(--muted); font-size: 13px; margin-bottom: 16px; }
+  .login-form { display: flex; flex-direction: column; gap: 10px; }
+  .login-error { color: var(--red); font-size: 12px; min-height: 16px; }
+  .login-master { display: flex; align-items: center; gap: 6px; color: var(--faint); font-size: 12px; margin-top: 2px; }
+  .login-master svg { width: 11px; height: 11px; flex-shrink: 0; }
+  .login-master input { width: 100%; }
+
+  /* ---- api keys tab ---- */
+  .keys-header { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 14px; }
+  .keys-form { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .keys-form input { min-width: 220px; }
+  .master-key { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; color: var(--muted); font-size: 12px; }
+  .master-key input { width: 300px; font-family: var(--mono); }
+  .master-hint { color: var(--faint); font-size: 11px; }
+  .keys-list { display: flex; flex-direction: column; gap: 8px; }
+  .key-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 14px; font-size: 13px; }
+  .key-row.revoked { opacity: 0.5; }
+  .key-name { font-weight: 500; }
+  .key-meta { color: var(--muted); font-size: 12px; font-family: var(--mono); }
+  .key-row .badge { text-transform: uppercase; }
+  .badge.revoked { background: rgba(154, 154, 154, 0.15); color: var(--muted); }
+  .key-row button { margin-left: auto; }
+  .key-empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
+  .key-created { color: var(--faint); font-size: 12px; padding: 10px 14px; }
+  .raw-key { display: flex; align-items: center; gap: 8px; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 14px; font-size: 13px; margin-bottom: 10px; }
+  .raw-key code { flex: 1; font-family: var(--mono); font-size: 12px; word-break: break-all; color: var(--green); }
   .note.err { color: var(--red); }
   .status-dot.down { background: var(--red); box-shadow: 0 0 0 0 rgba(248,113,113,.5); animation: pulse-red 2s ease-in-out infinite; }
   @keyframes pulse-red { 0% { box-shadow: 0 0 0 0 rgba(248,113,113,.45); } 70% { box-shadow: 0 0 0 7px rgba(248,113,113,0); } 100% { box-shadow: 0 0 0 0 rgba(248,113,113,0); } }
@@ -444,16 +480,19 @@
   <div class="header-controls">
     <label><input type="checkbox" id="autoRefresh" checked> Auto-refresh</label>
     <button id="resetHealth" data-icon="refresh">Reset health</button>
+    <button id="logoutBtn" data-icon="logout" style="display:none" title="Sign out of the dashboard">Log out</button>
   </div>
 </header>
 
 <div id="unreachable" class="unreachable" style="display:none">Router unreachable. Is <span class="mono">server.mjs</span> running on port 8787? Retrying...</div>
 <div id="allDown" class="banner" style="display:none" role="alert"></div>
+<div id="authBanner" class="banner" style="display:none" role="alert"></div>
 
 <nav class="tabs" role="tablist" aria-label="Views">
   <button class="tab active" id="tab-dashboard" role="tab" aria-selected="true" data-view="dashboard" data-icon="grid">Dashboard</button>
   <button class="tab" id="tab-history" role="tab" aria-selected="false" data-view="history" data-icon="clock">History</button>
   <button class="tab" id="tab-playground" role="tab" aria-selected="false" data-view="playground" data-icon="chat">Playground</button>
+  <button class="tab" id="tab-keys" role="tab" aria-selected="false" data-view="keys" data-icon="key">API Keys</button>
 </nav>
 
 <main>
@@ -628,6 +667,28 @@
       </div>
     </section>
   </div>
+
+  <div id="view-keys" class="view" role="tabpanel" aria-labelledby="tab-keys">
+    <section>
+      <h2 data-icon="key">API Keys</h2>
+      <div class="keys-header">
+        <form id="keyCreateForm" class="keys-form">
+          <label>Name
+            <input type="text" id="keyName" placeholder="e.g. opencode, cli script..." maxlength="64" spellcheck="false">
+          </label>
+          <button class="primary" id="keyCreate" data-icon="key" type="submit">Issue key</button>
+        </form>
+        <label class="master-key" title="Optional: only needed if you are not logged into the dashboard. Logging in with the password unlocks admin actions and key management. Stored in this browser only.">
+          <span>Master key <em>(optional if logged in)</em></span>
+          <input type="password" id="masterKeyInput" placeholder="(none)" autocomplete="off" spellcheck="false">
+          <span class="master-hint">local only</span>
+        </label>
+      </div>
+      <div id="rawKeyBox" class="raw-key" style="display:none"></div>
+      <div id="keysStatus" class="login-error" role="alert"></div>
+      <div id="keysList" class="keys-list"><p class="key-empty">Loading keys...</p></div>
+    </section>
+  </div>
 </main>
 
 <!-- Request detail slide-out panel (deep dive per history row) -->
@@ -643,8 +704,25 @@
 </aside>
 
 <footer>
-  <b>Manual:</b> config edits go in <code>config.json</code> (auto-reloads via <code>fs.watch</code>), API keys in <code>.env</code>. The router binds <code>127.0.0.1</code> only - no auth, localhost by design.
+  <b>Manual:</b> config edits go in <code>config.json</code> (auto-reloads via <code>fs.watch</code>), API keys in <code>.env</code>. The router binds <code>127.0.0.1</code> only - localhost by design.
 </footer>
+
+<!-- Dashboard login gate: shown when LMR_UI_PASSWORD is set and no valid session cookie -->
+<div id="loginOverlay" class="login-overlay" hidden role="dialog" aria-modal="true" aria-labelledby="loginTitle">
+  <div class="login-box">
+    <h2 id="loginTitle" data-icon="key">Locked</h2>
+    <p>This dashboard is password-protected. Sign in to continue.</p>
+    <form id="loginForm" class="login-form">
+      <input type="password" id="loginPass" placeholder="Dashboard password" autocomplete="current-password" spellcheck="false" autofocus>
+      <button class="primary" id="loginSubmit" data-icon="key" type="submit">Unlock</button>
+      <div id="loginError" class="login-error" role="alert"></div>
+      <label class="login-master" title="Used for /admin/* and /api/keys. The dashboard password does not unlock these. Stored in this browser only.">
+        <span>Master key (optional, local only)</span>
+        <input type="password" id="loginMasterKey" placeholder="(optional)" autocomplete="off" spellcheck="false">
+      </label>
+    </form>
+  </div>
+</div>
 
 <script>
 "use strict";
@@ -655,6 +733,9 @@ const state = {
   history: null,
   cfg: null,
   unreachable: false,
+  passwordSet: false,
+  uiAuthed: false,
+  masterKey: null, // in-memory master key; set from login or the override field
 };
 
 // Last-rendered snapshot per section. A section only redraws when its source
@@ -664,6 +745,76 @@ const lastRender = {};
 
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+// Safe localStorage wrapper. Some contexts (sandboxed iframes, strict privacy
+// modes, storage-blocked origins) throw on ANY access to localStorage - even
+// referencing the global. Probe once; when blocked, degrade to an in-memory
+// store so login/persist never break the page.
+const memStore = {};
+let storeOk = true;
+try {
+  const t = "__lmr_probe__";
+  localStorage.setItem(t, "1");
+  localStorage.removeItem(t);
+} catch {
+  storeOk = false;
+}
+function safeGet(k) { try { return storeOk ? localStorage.getItem(k) : (k in memStore ? memStore[k] : null); } catch { return k in memStore ? memStore[k] : null; } }
+function safeSet(k, v) { memStore[k] = v; if (storeOk) { try { localStorage.setItem(k, v); } catch {} } }
+function safeRemove(k) { delete memStore[k]; if (storeOk) { try { localStorage.removeItem(k); } catch {} } }
+
+// ---- dashboard auth + master key plumbing ----------------------------------
+
+// Master key for /admin/* and /api/keys: in-memory first, then the
+// localStorage convenience copy, else null (calls will 401 until one is set).
+const MASTER_STORAGE_KEY = "lmr_master";
+function masterKey() {
+  if (state.masterKey) return state.masterKey;
+  const v = safeGet(MASTER_STORAGE_KEY);
+  if (v) return v;
+  return null;
+}
+
+function setMasterKey(v) {
+  state.masterKey = v || null;
+  const input = $("masterKeyInput");
+  if (input) input.value = v || "";
+  if (v) safeSet(MASTER_STORAGE_KEY, v);
+  else safeRemove(MASTER_STORAGE_KEY);
+}
+
+// The keys API only speaks the master key (issued keys are chat-only).
+function keysApiAuth() {
+  const k = masterKey();
+  return k ? { "authorization": "Bearer " + k } : null;
+}
+
+function showAuthBanner(msg, authed) {
+  const host = $("authBanner");
+  host.innerHTML = ICONS.warn + "<span>" + esc(msg) + "</span>";
+  host.classList.toggle("authed", !!authed);
+  host.style.display = "flex";
+}
+
+function hideAuthBanner() {
+  $("authBanner").style.display = "none";
+}
+
+function setLoginError(msg) {
+  $("loginError").textContent = msg || "";
+}
+
+function showLoginOverlay() {
+  $("loginOverlay").hidden = false;
+  const p = $("loginPass");
+  if (p) { p.focus(); p.select(); }
+}
+
+function hideLoginOverlay() {
+  $("loginOverlay").hidden = true;
+  const btn = $("logoutBtn");
+  if (btn) btn.style.display = (state.passwordSet && state.uiAuthed) ? "" : "none";
+}
 
 // Lightweight inline markdown: bold **text** -> <strong>text</strong>.
 // Runs AFTER escaping so model/user text can never inject HTML.
@@ -895,6 +1046,8 @@ const ICONS = {
   pie: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.21 15.89A10 10 0 1 1 8 2.83"/><path d="M22 12A10 10 0 0 0 12 2v10z"/></svg>',
   columns: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="12" y1="3" x2="12" y2="21"/></svg>',
   download: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>',
+  key: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0 3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>',
+  logout: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>',
 };
 
 // Inject icons into static elements tagged with data-icon (single source of truth).
@@ -1234,9 +1387,24 @@ async function loadConfig() {
 // ---- actions: dashboard ------------------------------------------------------
 
 async function doAdmin(path, opts) {
+  const o = Object.assign({ method: "POST" }, opts || {});
+  // Attach the master key when set (optional override); the dashboard session
+  // cookie authorizes admin actions when logged in with the password.
+  o.headers = Object.assign(keysApiAuth() || {}, o.headers || {});
+  let r;
   try {
-    await fetch(path, Object.assign({ method: "POST" }, opts));
-  } catch {}
+    r = await fetch(path, o);
+  } catch {
+    r = null;
+  }
+  if (r && r.status === 401) {
+    console.warn(path + " -> 401 (master key rejected or missing)");
+    showAuthBanner("Master key rejected (401). Check the master key in the API Keys tab, or log in with the matching password.", true);
+    $("masterKeyInput").focus();
+    await poll();
+    return;
+  }
+  hideAuthBanner();
   await poll();
 }
 
@@ -1269,6 +1437,206 @@ document.addEventListener("click", (ev) => {
       errline.textContent = errline.dataset.full;
     }
   }
+});
+
+// ---- auth: status, login, logout -------------------------------------------
+
+async function fetchAuthStatus() {
+  let body;
+  try {
+    const r = await fetch("/api/auth/status");
+    body = await r.json();
+  } catch {
+    body = null;
+  }
+  return body && typeof body.passwordSet === "boolean"
+    ? body
+    : { passwordSet: false, uiAuthed: false };
+}
+
+function applyAuthStatus(status) {
+  state.passwordSet = !!status.passwordSet;
+  state.uiAuthed = !!status.uiAuthed;
+  const btn = $("logoutBtn");
+  if (btn) btn.style.display = (state.passwordSet && state.uiAuthed) ? "" : "none";
+  if (!status.passwordSet || status.uiAuthed) {
+    hideLoginOverlay();
+    // Login sets the master key to the password by default; an explicit stored
+    // override (different master key) takes precedence.
+    if (status.uiAuthed && !state.masterKey) {
+      const stored = safeGet(MASTER_STORAGE_KEY);
+      if (stored) state.masterKey = stored;
+    }
+    if (status.uiAuthed) $("masterKeyInput").value = masterKey() || "";
+    startPolling();
+    // Reload-safe: if we booted straight into #keys, loadKeys() may have run
+    // before auth was confirmed (and 401'd). Reload it now that the session is
+    // known valid. Idempotent — no-op for other tabs.
+    if ($("view-keys").classList.contains("active")) loadKeys();
+  } else {
+    showLoginOverlay();
+  }
+}
+
+$("loginForm").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const pass = $("loginPass").value;
+  const override = $("loginMasterKey").value.trim();
+  if (!pass) { setLoginError("Enter the dashboard password."); return; }
+  const btn = $("loginSubmit");
+  btn.disabled = true;
+  try {
+    const r = await fetch("/api/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ password: pass }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (r.status === 429) { setLoginError("Too many attempts, wait a moment"); return; }
+    if (r.status !== 200 || !body.ok) { setLoginError("Wrong password"); return; }
+    $("loginPass").value = "";
+    $("loginError").textContent = "";
+    state.uiAuthed = true;
+    // The dashboard password is NOT the master key (they gate different
+    // things). Only an explicit master key (stored locally only) is used for
+    // /admin/* and /api/keys; leave it unset to be prompted later.
+    if (override) setMasterKey(override);
+    hideLoginOverlay();
+    startPolling();
+    if (location.hash.slice(1) === "keys") loadKeys();
+  } catch {
+    setLoginError("Could not reach the router.");
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$("logoutBtn").addEventListener("click", async () => {
+  try { await fetch("/api/auth/logout", { method: "POST" }); } catch {}
+  location.reload();
+});
+
+// ---- api keys tab -----------------------------------------------------------
+
+function setKeysStatus(msg) {
+  $("keysStatus").textContent = msg || "";
+}
+
+function keyRowHtml(k) {
+  const created = k.createdAt ? new Date(k.createdAt).toLocaleString() : "-";
+  const revoke = k.revoked
+    ? ""
+    : '<button class="danger" data-revoke="' + esc(k.id) + '" data-revoke-name="' + esc(k.name) + '">' + ICONS.trash + "Revoke</button>";
+  return (
+    '<div class="key-row' + (k.revoked ? " revoked" : "") + '">' +
+    '<span class="key-name">' + esc(k.name) + "</span>" +
+    '<span class="key-meta">' + esc((k.id || "").slice(0, 8)) + " &middot; " + esc(created) + "</span>" +
+    (k.revoked ? '<span class="badge revoked">Revoked</span>' : "") +
+    revoke +
+    "</div>"
+  );
+}
+
+function renderKeysList(keys) {
+  const host = $("keysList");
+  if (!Array.isArray(keys) || keys.length === 0) {
+    host.innerHTML = '<p class="key-empty">No keys issued yet.</p>';
+    return;
+  }
+  host.innerHTML = keys.map(keyRowHtml).join("");
+}
+
+async function loadKeys() {
+  const host = $("keysList");
+  host.innerHTML = '<p class="key-empty">Loading keys...</p>';
+  try {
+    // Session cookie authenticates when logged in; master key is an optional
+    // override (keysApiAuth() attaches Bearer only when one is set).
+    const r = await fetch("/api/keys", { headers: keysApiAuth() || {} });
+    if (r.status === 401) {
+      setKeysStatus("Not authorized. Log in with the dashboard password, or enter the master key.");
+      host.innerHTML = '<p class="key-empty">Log in with the dashboard password to manage API keys.</p>';
+      $("masterKeyInput").focus();
+      return;
+    }
+    if (r.status !== 200) { setKeysStatus("Failed to load keys (HTTP " + r.status + ")."); return; }
+    const body = await r.json();
+    setKeysStatus("");
+    renderKeysList(body.keys || []);
+  } catch {
+    setKeysStatus("Could not reach the router.");
+  }
+}
+
+function showRawKey(raw) {
+  const host = $("rawKeyBox");
+  host.style.display = "flex";
+  host.innerHTML = '<span class="badge healthy">' + ICONS.check + "Copy now</span>" +
+    "<code>" + esc(raw) + "</code>" +
+    '<button data-copy-key="' + esc(raw) + '">' + ICONS.copy + "Copy</button>";
+}
+
+$("keyCreateForm").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const name = $("keyName").value.trim();
+  if (!name) { setKeysStatus("Enter a name for the key."); return; }
+  const btn = $("keyCreate");
+  btn.disabled = true;
+  try {
+    const r = await fetch("/api/keys", {
+      method: "POST",
+      headers: Object.assign({ "content-type": "application/json" }, keysApiAuth()),
+      body: JSON.stringify({ name: name.slice(0, 64) }),
+    });
+    if (r.status === 401) {
+      setKeysStatus("Not authorized. Log in with the dashboard password, or enter the master key.");
+      $("masterKeyInput").focus();
+      return;
+    }
+    if (r.status !== 200) { setKeysStatus("Failed to issue key (HTTP " + r.status + ")."); return; }
+    const body = await r.json();
+    const raw = body && body.key && body.key.raw;
+    if (raw) showRawKey(raw);
+    $("keyName").value = "";
+    setKeysStatus("");
+    loadKeys();
+  } catch {
+    setKeysStatus("Could not reach the router.");
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+document.addEventListener("click", (ev) => {
+  const revoke = ev.target.closest("[data-revoke]");
+  if (revoke) {
+    const id = revoke.getAttribute("data-revoke");
+    const name = revoke.getAttribute("data-revoke-name") || "this key";
+    if (!confirm("Revoke \"" + name + "\"? It will stop working immediately.")) return;
+    revoke.disabled = true;
+    fetch("/api/keys?id=" + encodeURIComponent(id), { method: "DELETE", headers: keysApiAuth() || {} })
+      .then((r) => {
+        if (r.status === 401) { setKeysStatus("Not authorized. Log in with the dashboard password, or enter the master key."); $("masterKeyInput").focus(); return; }
+        if (r.status !== 200) { setKeysStatus("Failed to revoke key (HTTP " + r.status + ")."); return; }
+        setKeysStatus("");
+        loadKeys();
+      })
+      .catch(() => setKeysStatus("Could not reach the router."));
+    return;
+  }
+  const copyKey = ev.target.closest("[data-copy-key]");
+  if (copyKey) {
+    const raw = copyKey.getAttribute("data-copy-key");
+    copyToClipboard(raw).then((ok) => {
+      copyKey.textContent = ok ? "✓ Copied" : "! Failed";
+      setTimeout(() => { copyKey.innerHTML = ICONS.copy + "Copy"; }, 1600);
+    });
+    return;
+  }
+});
+
+$("masterKeyInput").addEventListener("input", (ev) => {
+  setMasterKey(ev.target.value.trim());
 });
 
 // ---- request detail slide-out panel -------------------------------------------
@@ -1556,7 +1924,7 @@ function savePlaygroundState() {
         lastRaw: pg.lastRaw || null,
       },
     };
-    localStorage.setItem(PG_STORAGE_KEY, JSON.stringify(state_));
+    safeSet(PG_STORAGE_KEY, JSON.stringify(state_));
   } catch {}
 }
 
@@ -1576,7 +1944,7 @@ window.addEventListener("beforeunload", () => {
 
 function loadPlaygroundState() {
   try {
-    const saved = JSON.parse(localStorage.getItem(PG_STORAGE_KEY));
+    const saved = JSON.parse(safeGet(PG_STORAGE_KEY));
     if (!saved) return;
     if (Array.isArray(saved.msgs)) pg.msgs = saved.msgs;
     if (saved.model) {
@@ -2185,7 +2553,7 @@ $("pgDownloadMd").addEventListener("click", () => {
 
 // Known views. Tab switches set location.hash so a reload/back/forward restores
 // the same tab; the hashchange listener keeps the UI in sync with the URL.
-const VIEWS = ["dashboard", "history", "playground"];
+const VIEWS = ["dashboard", "history", "playground", "keys"];
 
 function activateView(name) {
   document.querySelectorAll(".tab").forEach((t) => {
@@ -2196,6 +2564,10 @@ function activateView(name) {
   document.querySelectorAll(".view").forEach((v) => {
     v.classList.toggle("active", v.id === "view-" + name);
   });
+  // Load keys whenever the keys view is shown (tab click, hash nav, or a
+  // reload straight into #keys). loadKeys() is idempotent and needs a valid
+  // session/master key; if not authed it will show the 401 prompt instead.
+  if (name === "keys") loadKeys();
 }
 
 document.querySelectorAll(".tab").forEach((tab) => {
@@ -2248,12 +2620,25 @@ $("autoRefresh").addEventListener("change", () => {
   if ($("autoRefresh").checked) poll();
 });
 
+// Kick off read-only polling only once the app is visible (not behind the
+// login overlay). Restarting the interval on login is harmless and idempotent.
+let pollingStarted = false;
+function startPolling() {
+  if (pollingStarted) return;
+  pollingStarted = true;
+  loadConfig();
+  poll();
+  syncPollTimer();
+}
+
 decorate();
 initViewFromHash();
-loadConfig();
-poll();
-syncPollTimer();
-// Entrance animations run only on first load; suppress on every later poll/update (the flicker bug).
+
+// Boot gate: check auth before showing the app. When a dashboard password is
+// set and the session is not authed, the login overlay covers everything and
+// polling stays paused; the poll has no side effects besides rendering, so it
+// is safe to leave it off. The countdown/uptime ticker runs regardless.
+fetchAuthStatus().then(applyAuthStatus);
 setTimeout(() => document.body.classList.add("loaded"), 800);
 </script>
 </body>

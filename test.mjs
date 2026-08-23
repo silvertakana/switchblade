@@ -2172,6 +2172,246 @@ async function main() {
     }
   }
 
+  // zK) dashboard UI login: /api/auth/status + /api/auth/login + logout.
+  //  No uiPasswordEnv -> open UI; with it -> login gates, cookie session,
+  //  wrong password 401 with no cookie, per-IP brute-force throttle (5 per
+  //  10s -> 429 on the 6th), logout clears the session.
+  {
+    const chatBody = { model: "pauth", messages: [] };
+    const bringUp = async (uiPasswordEnv, envLines) => {
+      const srv = mockBackend("auth", {});
+      const port = await listen(srv.srv);
+      const cfg = {
+        port: 0, prefix: "/v1", masterKeyEnv: null, uiPasswordEnv,
+        backends: [{ id: "auth", baseURL: `http://${HOST}:${port}`, apiKeyEnv: "KEY_AUTH" }],
+        models: { "mauth": { providers: [{ backend: "auth", upstream: "u" }], affinityPool: 1 } },
+        presets: { "pauth": { strategy: "affinity", models: ["mauth"] } },
+        backoff: BO,
+      };
+      // Temp keys file (separate dir) so these children never touch a real
+      // api-keys.json; closeUp removes both dirs.
+      const keysDir = await mkdtemp(join(tmpdir(), "lmr-k-"));
+      const keysPath = join(keysDir, "keys.json");
+      return { ...(await startRouterCfg(cfg, envLines, { LMR_KEYS_FILE: keysPath })), srv, keysDir };
+    };
+    const closeUp = async ({ child, srv, dir, keysDir }) => {
+      child.kill();
+      srv.srv.close();
+      await rm(dir, { recursive: true, force: true });
+      await rm(keysDir, { recursive: true, force: true });
+    };
+
+    // zK1) no uiPasswordEnv -> open UI.
+    let h = await bringUp(null, "KEY_AUTH=k\n");
+    try {
+      let rr = await api(h.base, "/api/auth/status", { method: "GET" });
+      let bb = await rr.json();
+      assert(rr.status === 200 && bb.passwordSet === false && bb.uiAuthed === true, "zK1a) no uiPasswordEnv -> passwordSet:false, uiAuthed:true (status=" + rr.status + ")");
+      rr = await api(h.base, "/", { method: "GET" });
+      assert(rr.status === 200, "zK1b) / serves the dashboard without login (status=" + rr.status + ")");
+    } finally {
+      await closeUp(h);
+    }
+
+    // zK2) password set: status false -> login with the correct password sets
+    //      the cookie -> status true with the cookie.
+    h = await bringUp("LMR_UI_PASS", "KEY_AUTH=k\nLMR_UI_PASS=secret-pass-1\n");
+    try {
+      let rr = await api(h.base, "/api/auth/status", { method: "GET" });
+      let bb = await rr.json();
+      assert(rr.status === 200 && bb.passwordSet === true && bb.uiAuthed === false, "zK2a) passwordSet:true, uiAuthed:false before login (status=" + rr.status + ")");
+
+      rr = await api(h.base, "/api/auth/login", { body: { password: "secret-pass-1" } });
+      bb = await rr.json();
+      const setCookie = rr.headers.get("set-cookie") || "";
+      const cookieMatch = /lmr_ui=([^;]+)/.exec(setCookie);
+      assert(rr.status === 200 && bb.ok === true && bb.uiAuthed === true && !!cookieMatch, "zK2b) correct password -> 200 uiAuthed:true with session cookie (status=" + rr.status + ")");
+      const cookieHeader = cookieMatch ? "lmr_ui=" + cookieMatch[1] : "";
+
+      rr = await api(h.base, "/api/auth/status", { method: "GET", headers: { cookie: cookieHeader } });
+      bb = await rr.json();
+      assert(rr.status === 200 && bb.uiAuthed === true, "zK2c) /api/auth/status with session cookie -> uiAuthed:true (status=" + rr.status + ")");
+    } finally {
+      await closeUp(h);
+    }
+
+    // zK3) wrong password -> 401, no cookie set.
+    h = await bringUp("LMR_UI_PASS", "KEY_AUTH=k\nLMR_UI_PASS=secret-pass-1\n");
+    try {
+      const rr = await api(h.base, "/api/auth/login", { body: { password: "wrong-pass" } });
+      const bb = await rr.json();
+      assert(rr.status === 401 && bb.ok === false && !(rr.headers.get("set-cookie") || "").includes("lmr_ui="), "zK3) wrong password -> 401, no cookie set (status=" + rr.status + ")");
+    } finally {
+      await closeUp(h);
+    }
+
+    // zK4) throttle: 5 wrong attempts allowed, 6th within the 10s window -> 429.
+    h = await bringUp("LMR_UI_PASS", "KEY_AUTH=k\nLMR_UI_PASS=secret-pass-1\n");
+    try {
+      let all401 = true;
+      for (let i = 0; i < 5; i++) {
+        const rr = await api(h.base, "/api/auth/login", { body: { password: "wrong-pass" } });
+        if (rr.status !== 401) all401 = false;
+      }
+      assert(all401, "zK4a) first 5 wrong attempts -> 401 each");
+      const rr6 = await api(h.base, "/api/auth/login", { body: { password: "wrong-pass" } });
+      assert(rr6.status === 429, "zK4b) 6th wrong attempt within window -> 429 (status=" + rr6.status + ")");
+    } finally {
+      await closeUp(h);
+    }
+
+    // zK5) logout clears the session -> status back to uiAuthed:false.
+    h = await bringUp("LMR_UI_PASS", "KEY_AUTH=k\nLMR_UI_PASS=secret-pass-1\n");
+    try {
+      let rr = await api(h.base, "/api/auth/login", { body: { password: "secret-pass-1" } });
+      const setCookie = rr.headers.get("set-cookie") || "";
+      const cookieHeader = "lmr_ui=" + (/lmr_ui=([^;]+)/.exec(setCookie) || [])[1];
+      rr = await api(h.base, "/api/auth/logout", { method: "POST", headers: { cookie: cookieHeader } });
+      const bbLogout = await rr.json();
+      assert(rr.status === 200 && bbLogout.ok === true, "zK5a) logout -> 200 ok:true (status=" + rr.status + ")");
+      rr = await api(h.base, "/api/auth/status", { method: "GET", headers: { cookie: cookieHeader } });
+      const bb = await rr.json();
+      assert(rr.status === 200 && bb.uiAuthed === false, "zK5b) status after logout with old cookie -> uiAuthed:false (status=" + rr.status + ")");
+    } finally {
+      await closeUp(h);
+    }
+  }
+
+  // zL) issued chat-only API keys: /api/keys management is master-gated,
+  //  issued keys unlock only /v1/chat/completions (never /admin/*), revoke
+  //  kills the key, GET never leaks hashes/raw, and a missing keys file is
+  //  tolerated (empty list).
+  {
+    const chatBody = { model: "pkeys", messages: [] };
+    const master = "master-secret-123";
+    const bringUp = async (keysPath) => {
+      const srv = mockBackend("keys", {});
+      const port = await listen(srv.srv);
+      const cfg = {
+        port: 0, prefix: "/v1", masterKeyEnv: "LMR_MASTER",
+        backends: [{ id: "keys", baseURL: `http://${HOST}:${port}`, apiKeyEnv: "KEY_KEYS" }],
+        models: { "mkeys": { providers: [{ backend: "keys", upstream: "u" }], affinityPool: 1 } },
+        presets: { "pkeys": { strategy: "affinity", models: ["mkeys"] } },
+        backoff: BO,
+      };
+      return { ...(await startRouterCfg(cfg, "KEY_KEYS=k\nLMR_MASTER=" + master + "\n", { LMR_KEYS_FILE: keysPath })), srv };
+    };
+    const closeUp = async ({ child, srv, dir }) => {
+      child.kill();
+      srv.srv.close();
+      await rm(dir, { recursive: true, force: true });
+    };
+    const newKeysDir = async () => {
+      const d = await mkdtemp(join(tmpdir(), "lmr-l-"));
+      return { dir: d, path: join(d, "keys.json") };
+    };
+
+    // zL1) /api/keys without the master bearer -> 401 (gated).
+    let kd = await newKeysDir();
+    let h = await bringUp(kd.path);
+    try {
+      const rr = await api(h.base, "/api/keys"); // api default: Bearer local-master (wrong)
+      assert(rr.status === 401, "zL1) POST /api/keys without master bearer -> 401 (status=" + rr.status + ")");
+    } finally {
+      await closeUp(h);
+      await rm(kd.dir, { recursive: true, force: true });
+    }
+
+    // zL2) with master: create a key -> raw sk-lmr-...; the raw key works on chat.
+    kd = await newKeysDir();
+    h = await bringUp(kd.path);
+    try {
+      let rr = await api(h.base, "/api/keys", { body: { name: "test-key" }, headers: { authorization: "Bearer " + master } });
+      let bb = await rr.json();
+      assert(rr.status === 200 && bb.key && typeof bb.key.raw === "string" && bb.key.raw.startsWith("sk-lmr-"), "zL2a) POST /api/keys with master -> 200, raw starts sk-lmr- (status=" + rr.status + ")");
+      const raw = bb.key.raw;
+      const hitsBefore = h.srv.hits.length;
+      rr = await api(h.base, "/v1/chat/completions", { body: chatBody, headers: { authorization: "Bearer " + raw } });
+      bb = await rr.json();
+      assert(rr.status === 200 && /^mock:keys/.test(bb.choices[0].message.content), "zL2b) issued raw key works on /v1/chat/completions (status=" + rr.status + ")");
+      assert(h.srv.hits.length === hitsBefore + 1, "zL2c) the issued-key chat hit the backend");
+    } finally {
+      await closeUp(h);
+      await rm(kd.dir, { recursive: true, force: true });
+    }
+
+    // zL3) GET /api/keys never exposes hash or raw.
+    kd = await newKeysDir();
+    h = await bringUp(kd.path);
+    try {
+      let rr = await api(h.base, "/api/keys", { body: { name: "leak-check" }, headers: { authorization: "Bearer " + master } });
+      const created = await rr.json();
+      rr = await api(h.base, "/api/keys", { method: "GET", headers: { authorization: "Bearer " + master } });
+      const bb = await rr.json();
+      const leak = bb.keys.some((k) => "hash" in k || "raw" in k);
+      assert(rr.status === 200 && Array.isArray(bb.keys) && bb.keys.length === 1 && !leak, "zL3) GET /api/keys -> 200, one key, no hash/raw leaked (status=" + rr.status + ")");
+      assert(bb.keys[0].id === created.key.id && bb.keys[0].name === "leak-check" && bb.keys[0].revoked === false, "zL3b) listing carries id/name/createdAt/revoked metadata only");
+    } finally {
+      await closeUp(h);
+      await rm(kd.dir, { recursive: true, force: true });
+    }
+
+    // zL4) revoke -> raw key 401s on chat; master still works.
+    kd = await newKeysDir();
+    h = await bringUp(kd.path);
+    try {
+      let rr = await api(h.base, "/api/keys", { body: { name: "revoke-me" }, headers: { authorization: "Bearer " + master } });
+      const { key } = await rr.json();
+      rr = await api(h.base, "/api/keys?id=" + key.id, { method: "DELETE", headers: { authorization: "Bearer " + master } });
+      const bbDel = await rr.json();
+      assert(rr.status === 200 && bbDel.ok === true, "zL4a) DELETE /api/keys?id= -> 200 ok:true (status=" + rr.status + ")");
+      rr = await api(h.base, "/v1/chat/completions", { body: chatBody, headers: { authorization: "Bearer " + key.raw } });
+      assert(rr.status === 401, "zL4b) revoked key -> 401 on chat (status=" + rr.status + ")");
+      rr = await api(h.base, "/v1/chat/completions", { body: chatBody, headers: { authorization: "Bearer " + master } });
+      assert(rr.status === 200, "zL4c) master key still works after revoke (status=" + rr.status + ")");
+    } finally {
+      await closeUp(h);
+      await rm(kd.dir, { recursive: true, force: true });
+    }
+
+    // zL5) issued key accepted on chat while masterKeyEnv is set (zL2b covers
+    //      the same path; a second fresh key proves it independently).
+    kd = await newKeysDir();
+    h = await bringUp(kd.path);
+    try {
+      const rr = await api(h.base, "/api/keys", { body: { name: "chat-only" }, headers: { authorization: "Bearer " + master } });
+      const { key } = await rr.json();
+      const rrChat = await api(h.base, "/v1/chat/completions", { body: chatBody, headers: { authorization: "Bearer " + key.raw } });
+      assert(rrChat.status === 200, "zL5) chat with a valid issued key while masterKeyEnv set -> 200 (status=" + rrChat.status + ")");
+    } finally {
+      await closeUp(h);
+      await rm(kd.dir, { recursive: true, force: true });
+    }
+
+    // zL6) admin endpoint with an issued key -> 401 (master-only).
+    kd = await newKeysDir();
+    h = await bringUp(kd.path);
+    try {
+      const rr = await api(h.base, "/api/keys", { body: { name: "admin-try" }, headers: { authorization: "Bearer " + master } });
+      const { key } = await rr.json();
+      const rrAdmin = await api(h.base, "/admin/reset-health", { method: "POST", headers: { authorization: "Bearer " + key.raw } });
+      assert(rrAdmin.status === 401, "zL6) /admin/reset-health with issued key -> 401 (status=" + rrAdmin.status + ")");
+    } finally {
+      await closeUp(h);
+      await rm(kd.dir, { recursive: true, force: true });
+    }
+
+    // zL7) missing api-keys.json file -> endpoints still work (empty list).
+    kd = await newKeysDir();
+    h = await bringUp(join(kd.dir, "missing-keys.json")); // file never created
+    try {
+      let rr = await api(h.base, "/api/keys", { method: "GET", headers: { authorization: "Bearer " + master } });
+      let bb = await rr.json();
+      assert(rr.status === 200 && Array.isArray(bb.keys) && bb.keys.length === 0, "zL7a) GET /api/keys with missing keys file -> 200 empty list (status=" + rr.status + ")");
+      rr = await api(h.base, "/api/keys", { body: { name: "first" }, headers: { authorization: "Bearer " + master } });
+      bb = await rr.json();
+      assert(rr.status === 200 && bb.key && bb.key.raw.startsWith("sk-lmr-"), "zL7b) creating a key works when the file was missing (status=" + rr.status + ")");
+    } finally {
+      await closeUp(h);
+      await rm(kd.dir, { recursive: true, force: true });
+    }
+  }
+
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
 }

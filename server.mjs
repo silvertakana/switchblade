@@ -13,8 +13,8 @@
 // participate in the all-cooling fallback and a success never clears them.
 
 import http from "node:http";
-import { readFileSync, watch as watchF, appendFileSync } from "node:fs";
-import { readFile as readFileP } from "node:fs/promises";
+import { readFileSync, statSync, watch as watchF, appendFileSync } from "node:fs";
+import { readFile as readFileP, rename as renameP, writeFile as writeFileP } from "node:fs/promises";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { dirname, join } from "node:path";
@@ -1659,22 +1659,129 @@ function safeEqual(a, b) {
   return crypto.timingSafeEqual(ha, hb);
 }
 
-// Inbound gate for `/v1/chat/completions` and `/admin/*`. `masterKeyEnv` names
-// an env var whose value the client must echo as `Authorization: Bearer <v>`
-// (scheme matched case-insensitively). `masterKeyEnv` is read from the LIVE
-// cfg object at request time, exactly like cfg.backoff / cfg.prefix, so a
-// config hot-reload toggles the gate without a restart. Unset masterKeyEnv
-// keeps today's open posture for every endpoint. A set name whose env value is
-// empty at request time FAILS CLOSED: the gated endpoints reject every request
-// rather than silently treating a missing expected key as "no auth". Read-only
-// endpoints (health, models, stats, history, config, UI) never pass through
-// here, so they stay open.
+function hashSecret(s) {
+  return crypto.createHash("sha256").update(String(s)).digest("hex");
+}
+
+// ---- issued API keys -------------------------------------------------------
+// Chat-only keys, persisted as SHA-256 hashes in a gitignored api-keys.json
+// (LMR_KEYS_FILE overrides the path). The raw key is shown exactly once at
+// creation; everything stored or served later is hash-only.
+const ISSUED_KEYS_PATH = process.env.LMR_KEYS_FILE || join(__dirname, "api-keys.json");
+const ISSUED_KEYS_MAX_NAME = 64;
+let issuedKeys = null; // { mtimeMs, keys: [...] }; null = not loaded yet
+let issuedKeysWriteChain = Promise.resolve(); // serializes atomic writes
+
+function loadIssuedKeys() {
+  // mtime-aware cache: the keys file may be edited by the UI, so a fresh stat
+  // decides whether the in-memory copy is still current (cheap: one stat).
+  try {
+    const st = statSync(ISSUED_KEYS_PATH);
+    if (issuedKeys && issuedKeys.mtimeMs === st.mtimeMs) return issuedKeys;
+    const raw = readFileSync(ISSUED_KEYS_PATH, "utf8");
+    const parsed = JSON.parse(raw);
+    issuedKeys = { mtimeMs: st.mtimeMs, keys: Array.isArray(parsed.keys) ? parsed.keys : [] };
+  } catch {
+    issuedKeys = { mtimeMs: 0, keys: [] };
+  }
+  return issuedKeys;
+}
+
+function persistIssuedKeys(keys) {
+  // Chain writes so two rapid mutations (issue then revoke) cannot interleave
+  // temp-file renames; write-then-rename keeps the file atomic for readers.
+  issuedKeysWriteChain = issuedKeysWriteChain.then(async () => {
+    const tmp = ISSUED_KEYS_PATH + ".tmp";
+    await writeFileP(tmp, JSON.stringify({ keys }, null, 2) + "\n", "utf8");
+    await renameP(tmp, ISSUED_KEYS_PATH);
+  });
+  return issuedKeysWriteChain;
+}
+
+function issuedKeyValid(token) {
+  if (!token) return null;
+  const { keys } = loadIssuedKeys();
+  const want = hashSecret(token);
+  for (const k of keys) {
+    if (k.revoked) continue;
+    if (safeEqual(k.hash, want)) return k;
+  }
+  return null;
+}
+
+async function issueKey(name) {
+  const raw = "sk-lmr-" + crypto.randomBytes(24).toString("base64url");
+  const rec = { id: crypto.randomBytes(6).toString("hex"), name, hash: hashSecret(raw), createdAt: Date.now(), revoked: false };
+  const { keys } = loadIssuedKeys();
+  keys.push(rec);
+  await persistIssuedKeys(keys);
+  return { id: rec.id, name: rec.name, raw, createdAt: rec.createdAt };
+}
+
+async function revokeKey(id) {
+  const { keys } = loadIssuedKeys();
+  const rec = keys.find((k) => k.id === id);
+  if (!rec) return false;
+  rec.revoked = true;
+  await persistIssuedKeys(keys);
+  return true;
+}
+
+// ---- UI session (dashboard login) ------------------------------------------
+// In-memory session tokens; logout removes them, restart invalidates all. The
+// cookie is HttpOnly + SameSite=Strict, no Secure so plain-http localhost/LAN
+// works. Login throttled per client IP: 5 attempts per 10s window.
+const UI_LOGIN_MAX_ATTEMPTS = 5;
+const UI_LOGIN_WINDOW_MS = 10000;
+const uiSessions = new Set();
+const loginAttempts = new Map(); // ip -> [timestamps of failed attempts]
+const UI_SESSION_COOKIE = "lmr_ui";
+
+function uiPasswordValue(cfg) {
+  const name = cfg.uiPasswordEnv;
+  if (!name) return null; // unset -> UI open
+  return process.env[name] || ""; // set but empty -> fail closed
+}
+
+function uiAuthed(cfg, req) {
+  if (!cfg.uiPasswordEnv) return true;
+  const m = /(?:^|;\s*)lmr_ui=([^;\s]+)/.exec(req.headers.cookie || "");
+  return !!(m && uiSessions.has(m[1]));
+}
+
+function loginRateLimited(ip) {
+  const now = Date.now();
+  const hits = (loginAttempts.get(ip) || []).filter((t) => now - t < UI_LOGIN_WINDOW_MS);
+  loginAttempts.set(ip, hits);
+  return hits.length >= UI_LOGIN_MAX_ATTEMPTS;
+}
+
+function recordLoginAttempt(ip) {
+  const now = Date.now();
+  const hits = (loginAttempts.get(ip) || []).filter((t) => now - t < UI_LOGIN_WINDOW_MS);
+  hits.push(now);
+  loginAttempts.set(ip, hits);
+}
+
+// ---- inbound gate -----------------------------------------------------------
+// Gated paths: `/v1/chat/completions`, `/admin/*`, `/api/keys`. `masterKeyEnv`
+// names an env var whose value the client must echo as `Authorization: Bearer
+// <v>` (scheme matched case-insensitively); chat additionally accepts valid
+// issued keys. Both config keys are read from the LIVE cfg object at request
+// time, exactly like cfg.backoff / cfg.prefix, so a config hot-reload toggles
+// the gate without a restart. Unset masterKeyEnv keeps today's open posture
+// for every endpoint. A set name whose env value is empty at request time
+// FAILS CLOSED: the gated endpoints reject every request rather than silently
+// treating a missing expected key as "no auth". Read-only endpoints (health,
+// models, stats, history, config, UI) never pass through here, so they stay
+// open. `/api/auth/*` are the login itself and are deliberately NOT gated.
 function requireAuth(cfg, req) {
   const name = cfg.masterKeyEnv;
   if (!name) return null;
   const url = req.url.split("?")[0];
   const p = (cfg.prefix || "/v1").replace(/\/$/, "");
-  if (url !== p + "/chat/completions" && !url.startsWith("/admin")) return null;
+  const isChat = url === p + "/chat/completions";
+  if (!isChat && !url.startsWith("/admin") && !url.startsWith("/api/keys")) return null;
   const expected = process.env[name];
   const unauthorized = newError(401, JSON.stringify({ error: { message: "authentication required", type: "authentication_error" } }));
   if (!expected) {
@@ -1682,8 +1789,18 @@ function requireAuth(cfg, req) {
     return unauthorized;
   }
   const m = /^Bearer\s+(.+)$/i.exec(req.headers["authorization"] || "");
-  if (!m || !safeEqual(m[1].trim(), expected)) return unauthorized;
-  return null;
+  if (m && safeEqual(m[1].trim(), expected)) return null;
+  // Chat only: a non-revoked issued key also unlocks /v1/chat/completions.
+  // Admin and /api/keys master-only, EXCEPT a logged-in dashboard session
+  // (the lmr_ui cookie, set by POST /api/auth/login) counts as the admin
+  // credential too -- the password IS the admin identity. Only when a
+  // dashboard password is actually configured (uiPasswordEnv set AND its env
+  // value non-empty); otherwise a session cannot exist and the master gate
+  // stays authoritative. Machines keep using the master key; humans use the
+  // password they logged in with.
+  if (isChat && m && issuedKeyValid(m[1].trim())) return null;
+  if (!isChat && cfg.uiPasswordEnv && process.env[cfg.uiPasswordEnv] && uiAuthed(cfg, req)) return null;
+  return unauthorized;
 }
 
 // ---- server ---------------------------------------------------------------
@@ -1703,6 +1820,11 @@ async function loadConfig() {
   if (cfg.masterKeyEnv && !process.env[cfg.masterKeyEnv]) {
     console.error(
       `[${new Date().toISOString()}] config warning: masterKeyEnv '${cfg.masterKeyEnv}' set but process.env['${cfg.masterKeyEnv}'] is empty; auth-gated endpoints will reject all requests (fail closed)`
+    );
+  }
+  if (cfg.uiPasswordEnv && !process.env[cfg.uiPasswordEnv]) {
+    console.error(
+      `[${new Date().toISOString()}] config warning: uiPasswordEnv '${cfg.uiPasswordEnv}' set but process.env['${cfg.uiPasswordEnv}'] is empty; dashboard login will reject all passwords (fail closed)`
     );
   }
   ensureBackends(cfg);
@@ -1856,6 +1978,117 @@ function server() {
       const state = h.state === "cooling" && h.nextAvailableAt > Date.now() ? "cooling" : "healthy";
       res.writeHead(200, { "content-type": "application/json" });
       return res.end(JSON.stringify({ ok: true, id, state }));
+    }
+
+    // ---- dashboard login (never gated: these ARE the login) ----------------
+
+    if (req.method === "GET" && url === "/api/auth/status") {
+      // passwordSet reflects the config key (set = login required), NOT the
+      // env value, so a password left empty still reports "required" and the
+      // login endpoint fails closed. Never echoes the password.
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ passwordSet: !!cfg.uiPasswordEnv, uiAuthed: uiAuthed(cfg, req) }));
+    }
+
+    if (req.method === "POST" && url === "/api/auth/login") {
+      if (!cfg.uiPasswordEnv) {
+        res.writeHead(200, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ ok: true, uiAuthed: true }));
+      }
+      const ip = req.socket.remoteAddress || "unknown";
+      if (loginRateLimited(ip)) {
+        res.writeHead(429, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ error: { message: "too many login attempts, try again shortly", type: "rate_limit_error" } }));
+      }
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      const bodyText = Buffer.concat(chunks).toString("utf8");
+      let body;
+      try {
+        body = JSON.parse(bodyText);
+      } catch {
+        body = null;
+      }
+      const expected = uiPasswordValue(cfg);
+      if (!expected) {
+        // Fail closed: password configured but env value empty at request time.
+        res.writeHead(401, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ ok: false }));
+      }
+      const given = body && typeof body.password === "string" ? body.password : "";
+      if (!safeEqual(hashSecret(given), hashSecret(expected))) {
+        recordLoginAttempt(ip);
+        res.writeHead(401, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ ok: false }));
+      }
+      const token = crypto.randomBytes(24).toString("base64url");
+      uiSessions.add(token);
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "set-cookie": `${UI_SESSION_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Strict`,
+      });
+      return res.end(JSON.stringify({ ok: true, uiAuthed: true }));
+    }
+
+    if (req.method === "POST" && url === "/api/auth/logout") {
+      const m = /(?:^|;\s*)lmr_ui=([^;\s]+)/.exec(req.headers.cookie || "");
+      if (m) uiSessions.delete(m[1]);
+      res.writeHead(200, {
+        "content-type": "application/json",
+        "set-cookie": `${UI_SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0`,
+      });
+      return res.end(JSON.stringify({ ok: true }));
+    }
+
+    // ---- issued-keys management (master-key gated by requireAuth) ----------
+
+    if (req.method === "GET" && url === "/api/keys") {
+      // Never expose hashes or raw values, only the listing metadata.
+      const { keys } = loadIssuedKeys();
+      const list = keys.map((k) => ({ id: k.id, name: k.name, createdAt: k.createdAt, revoked: !!k.revoked }));
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ keys: list }));
+    }
+
+    if (req.method === "POST" && url === "/api/keys") {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      const bodyText = Buffer.concat(chunks).toString("utf8");
+      let body;
+      try {
+        body = JSON.parse(bodyText);
+      } catch {
+        body = null;
+      }
+      const name = body && typeof body.name === "string" ? body.name.trim() : "";
+      if (!name || name.length > ISSUED_KEYS_MAX_NAME) {
+        res.writeHead(400, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ error: { message: `name must be a non-empty string of at most ${ISSUED_KEYS_MAX_NAME} chars`, type: "invalid_request_error" } }));
+      }
+      try {
+        const key = await issueKey(name);
+        res.writeHead(200, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ key }));
+      } catch (e) {
+        console.error(`[${new Date().toISOString()}] issueKey failed: ${e.message}`);
+        return writeError(res, newError(500, JSON.stringify({ error: { message: "failed to persist keys", type: "router_error" } })));
+      }
+    }
+
+    if (req.method === "DELETE" && url === "/api/keys") {
+      const id = new URL(req.url, "http://localhost").searchParams.get("id") || "";
+      try {
+        const ok = await revokeKey(id);
+        if (!ok) {
+          res.writeHead(404, { "content-type": "application/json" });
+          return res.end(JSON.stringify({ error: { message: `key '${id}' not found`, type: "not_found" } }));
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ ok: true }));
+      } catch (e) {
+        console.error(`[${new Date().toISOString()}] revokeKey failed: ${e.message}`);
+        return writeError(res, newError(500, JSON.stringify({ error: { message: "failed to persist keys", type: "router_error" } })));
+      }
     }
 
     res.writeHead(404, { "content-type": "application/json" });
