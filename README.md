@@ -167,8 +167,8 @@ curl http://127.0.0.1:8787/v1/chat/completions \
 
 ## Config
 
-Top-level keys: `port`, `prefix`, `masterKeyEnv`, `backends`, `models`,
-`presets`, optional top-level `params`, `backoff`.
+Top-level keys: `port`, `prefix`, `masterKeyEnv`, `uiPasswordEnv`, `backends`,
+`models`, `presets`, optional top-level `params`, `backoff`.
 
 ```jsonc
 {
@@ -247,12 +247,34 @@ three-layer shape at load, byte-identically for identical effective configs.
 | GET | `/api/history?limit=N` | request history (default 100, clamp 1..500) |
 | GET | `/api/history/detail?t=<timestamp>` or `?call=<callId>` | deep-dive detail for one history entry (payload, attempts, response summary) |
 | GET | `/api/config` | normalized config (env NAMES only, never key values) |
+| GET | `/api/auth/status` | dashboard auth state (`passwordSet`, `uiAuthed`); never echoes the password |
+| POST | `/api/auth/login` | `{password}` -> sets the UI session cookie; 401 wrong password, 429 throttled (5 attempts / 10s per IP) |
+| POST | `/api/auth/logout` | clears the UI session cookie |
+| GET | `/api/keys` | issued chat-only keys (`id`, `name`, `createdAt`, `revoked`; never hashes or raw values); master key required |
+| POST | `/api/keys` | `{name}` -> issues a chat-only key, raw value returned once; master key required |
+| DELETE | `/api/keys?id=<id>` | revokes an issued key; master key required |
 | POST | `/admin/reset-health` | reset all cooling states |
 | POST | `/admin/backend` | `{id, action: "cool"\|"uncool", forMs?}` manual cool/uncool |
 | GET | `/` | web UI |
 
 History lives in an in-memory ring buffer (500 entries) and appends to
 `router-history.jsonl` (override with `ROUTER_HISTORY`).
+
+## Security
+
+- **Dashboard password** — set `uiPasswordEnv` in `config.json` to the name of
+  an env var (`.env`: `LMR_UI_PASSWORD`) to require a login for the web UI.
+  When the env var is unset the UI stays open. Login is throttled (5 attempts
+  per 10s per client IP) and the session cookie is `HttpOnly`/`SameSite=Strict`.
+- **Master key** — `masterKeyEnv` names the env var holding the chat/admin
+  master key (`LITELLM_API_KEY` locally, the value dsh and OpenCode already
+  send). It gates `POST /v1/chat/completions`, `/admin/*`, and `/api/keys`;
+  set-but-empty fails closed.
+- **Issued keys are chat-only** — keys created via `POST /api/keys` unlock chat
+  completions but never `/admin/*` (admin stays master-key-only). Only SHA-256
+  hashes are stored, in `api-keys.json` (gitignored).
+- **Read-only endpoints stay open** — `/health`, `/v1/models`, `/api/stats`,
+  `/api/history`, `/api/config`, `/api/auth/*`, and `/` never require a key.
 
 ### Call IDs
 

@@ -7,3 +7,5 @@ node_modules/
 *.png
 config.json.pre-*
 router-history.jsonl
+api-keys.json
+*.json.tmp

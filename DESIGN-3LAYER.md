@@ -124,7 +124,8 @@ Design decisions worth stating plainly:
 {
   "port": 8787,
   "prefix": "/v1",
-  "masterKeyEnv": null,
+  "masterKeyEnv": null,               // OPTIONAL: env var NAME holding the chat/admin master key
+  "uiPasswordEnv": null,              // OPTIONAL: env var NAME holding the dashboard password (LMR_UI_PASSWORD)
   "params": {                         // OPTIONAL global defaults, lowest layer
     "temperature": 0.7
   },
@@ -226,6 +227,11 @@ Design decisions worth stating plainly:
   UI is field-level: preset.meta wins over model.meta, which wins over
   defaults.
 - Top-level `params`: optional object, lowest-priority defaults.
+- Top-level `masterKeyEnv` / `uiPasswordEnv`: OPTIONAL env var NAMES (values
+  live in `.env`, never in config). `masterKeyEnv` gates `POST
+  /v1/chat/completions` + `/admin/*` + `/api/keys` (Bearer); `uiPasswordEnv`
+  gates the dashboard login (section 5). Unset keeps the open posture;
+  set-but-empty fails closed at request time.
 - If a model id is also a preset id: the PRESET wins at request time, a config
   warning fires once at load, and `/v1/models` lists the id once.
 
@@ -472,6 +478,21 @@ Request-time 404 messages (type `model_not_found`, same shape as today):
   when present, backoff. Never key values.
 - `/health`, `/api/stats`, `/api/history` (entries gain `routedModel`),
   `/v1/chat/completions`, `/admin/*`: unchanged shapes apart from `routedModel`.
+- `GET /api/auth/status`, `POST /api/auth/login`, `POST /api/auth/logout`:
+  dashboard password gate, NEVER gated by `requireAuth` (they ARE the login).
+  `/api/auth/status` -> `{passwordSet, uiAuthed}`; login compares
+  `hashSecret(password)` against `hashSecret(process.env[uiPasswordEnv])` with a
+  constant-time compare, throttled per client IP (5 attempts / 10s window, then
+  429); the session is an in-memory token set behind an HttpOnly SameSite=Strict
+  `lmr_ui` cookie; logout removes it. `uiPasswordEnv` unset -> `passwordSet:false`,
+  UI stays open.
+- `GET /api/keys`, `POST /api/keys`, `DELETE /api/keys?id=<id>`: issued
+  chat-only keys, added to `requireAuth`'s gated set (master-key-only; chat is
+  the only issued-key path). Store `api-keys.json` (gitignored;
+  `LMR_KEYS_FILE` overrides the path) as
+  `{ keys: [{id, name, hash, createdAt, revoked}] }` with SHA-256 hashes only;
+  the raw value (base64url, `sk-lmr-` prefix) is returned once at issue. `GET`
+  never returns hashes or raw values.
 
 ---
 
@@ -552,6 +573,7 @@ and /v1/models output is unchanged):
   "port": 8787,
   "prefix": "/v1",
   "masterKeyEnv": null,
+  "uiPasswordEnv": null,
   "backends": [
     { "id": "go-primary", "baseURL": "https://opencode.ai/zen/go/v1",
       "apiKeyEnv": "OPENCODE_GO_KEY" },
@@ -627,7 +649,7 @@ Notes:
   over [go-primary, go-alt, commandcode] with direct as ordered fallback.
 - No `params` keys anywhere in the migrated config (today's config has none;
   forwarding behavior is bit-identical apart from the internal rewrite).
-- port, prefix, masterKeyEnv, backoff: verbatim.
+- port, prefix, masterKeyEnv, uiPasswordEnv, backoff: verbatim.
 - Keep a `config.json.pre-3layer` backup next to the file before overwriting.
 
 ---
