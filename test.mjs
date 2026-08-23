@@ -1971,6 +1971,100 @@ async function main() {
     }
   }
 
+  // zAuth) inbound Bearer auth via top-level masterKeyEnv: gated endpoints
+  //  (/v1/chat/completions, /admin/*) require the env-referenced token, the
+  //  scheme matches case-insensitively, read-only endpoints stay open, an
+  //  empty expected value fails closed, and unset/empty masterKeyEnv keeps
+  //  the exact open posture as before.
+  {
+    const chatBody = { model: "pauth", messages: [] };
+    // Fresh mock + router child per case: each child owns its own health
+    // registry, so nothing leaks between the auth states below.
+    const bringUp = async (masterKeyEnv, envLines) => {
+      const srv = mockBackend("auth", {});
+      const port = await listen(srv.srv);
+      const cfg = {
+        port: 0, prefix: "/v1", masterKeyEnv,
+        backends: [{ id: "auth", baseURL: `http://${HOST}:${port}`, apiKeyEnv: "KEY_AUTH" }],
+        models: { "mauth": { providers: [{ backend: "auth", upstream: "u" }], affinityPool: 1 } },
+        presets: { "pauth": { strategy: "affinity", models: ["mauth"] } },
+        backoff: BO,
+      };
+      return { ...(await startRouterCfg(cfg, envLines)), srv };
+    };
+    const closeUp = async ({ child, srv, dir }) => {
+      child.kill();
+      srv.srv.close();
+      await rm(dir, { recursive: true, force: true });
+    };
+
+    // Set master key with a real env value.
+    let h = await bringUp("LMR_MASTER", "KEY_AUTH=k\nLMR_MASTER=master-secret-123\n");
+    try {
+      let rr = await api(h.base, "/v1/chat/completions", { body: chatBody, headers: { authorization: "Bearer master-secret-123" } });
+      let bb = await rr.json();
+      assert(rr.status === 200 && /^mock:auth/.test(bb.choices[0].message.content), "zA1) correct bearer token -> 200 (status=" + rr.status + ")");
+
+      const hitsBefore = h.srv.hits.length;
+      rr = await api(h.base, "/v1/chat/completions", { body: chatBody }); // api default: Bearer local-master (wrong)
+      assert(rr.status === 401 && h.srv.hits.length === hitsBefore, "zA2) wrong bearer token -> 401, backend never hit (status=" + rr.status + ")");
+
+      rr = await fetch(h.base + "/v1/chat/completions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(chatBody) });
+      assert(rr.status === 401, "zA3) no Authorization header -> 401 (status=" + rr.status + ")");
+
+      rr = await api(h.base, "/v1/chat/completions", { body: chatBody, headers: { authorization: "bearer master-secret-123" } });
+      assert(rr.status === 200, "zA4) case-insensitive 'bearer' scheme -> 200 (status=" + rr.status + ")");
+
+      // Read-only endpoints stay open even without a valid token.
+      const openChecks = [
+        ["/health", 200], ["/v1/models", 200], ["/api/stats", 200],
+        ["/api/history", 200], ["/api/config", 200],
+      ];
+      for (const [path, want] of openChecks) {
+        const rrr = await api(h.base, path, { method: "GET" });
+        assert(rrr.status === want, "zA5) read-only " + path + " open without valid token (status=" + rrr.status + ")");
+      }
+      const rrDetail = await api(h.base, "/api/history/detail", { method: "GET" });
+      assert(rrDetail.status !== 401, "zA6) /api/history/detail open (not 401, status=" + rrDetail.status + ")");
+
+      rr = await api(h.base, "/admin/reset-health", { method: "POST", headers: { authorization: "Bearer master-secret-123" } });
+      assert(rr.status === 200, "zA7) /admin/reset-health with token -> 200 (status=" + rr.status + ")");
+      rr = await api(h.base, "/admin/reset-health", { method: "POST" });
+      assert(rr.status === 401, "zA8) /admin/reset-health without token -> 401 (status=" + rr.status + ")");
+
+      rr = await api(h.base, "/admin/backend", { method: "POST", body: { id: "auth", action: "cool" }, headers: { authorization: "Bearer master-secret-123" } });
+      assert(rr.status === 200, "zA9) /admin/backend with token -> 200 (status=" + rr.status + ")");
+      rr = await api(h.base, "/admin/backend", { method: "POST", body: { id: "auth", action: "cool" } });
+      assert(rr.status === 401, "zA10) /admin/backend without token -> 401 (status=" + rr.status + ")");
+    } finally {
+      await closeUp(h);
+    }
+
+    // Fail closed: masterKeyEnv names an env var with no value anywhere.
+    h = await bringUp("LMR_UNSET", "KEY_AUTH=k\n");
+    try {
+      let rr = await api(h.base, "/v1/chat/completions", { body: chatBody, headers: { authorization: "Bearer whatever" } });
+      assert(rr.status === 401, "zB1) masterKeyEnv set but env value empty -> chat 401 even with a token (fail closed, status=" + rr.status + ")");
+      rr = await api(h.base, "/admin/reset-health", { method: "POST" });
+      assert(rr.status === 401, "zB2) fail-closed 401 on /admin/reset-health (status=" + rr.status + ")");
+      rr = await api(h.base, "/health", { method: "GET" });
+      assert(rr.status === 200, "zB3) /health still open under fail-closed config (status=" + rr.status + ")");
+    } finally {
+      await closeUp(h);
+    }
+
+    // Unset / empty masterKeyEnv keeps the open posture (no auth anywhere).
+    for (const [envVal, tag] of [[null, "zC1"], ["", "zC2"]]) {
+      h = await bringUp(envVal, "KEY_AUTH=k\n");
+      try {
+        const rr = await fetch(h.base + "/v1/chat/completions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(chatBody) });
+        assert(rr.status === 200, tag + ") masterKeyEnv=" + JSON.stringify(envVal) + " -> /v1/chat/completions open without token (status=" + rr.status + ")");
+      } finally {
+        await closeUp(h);
+      }
+    }
+  }
+
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
 }

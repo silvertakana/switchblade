@@ -1648,6 +1648,44 @@ function writeError(res, e) {
   res.end(buf);
 }
 
+// ---- inbound bearer auth ---------------------------------------------------
+
+// Constant-time string compare over a fixed-length digest so that
+// crypto.timingSafeEqual's equal-length buffers requirement holds without
+// revealing the raw secret length to a wire-side observer.
+function safeEqual(a, b) {
+  const ha = crypto.createHash("sha256").update(String(a)).digest();
+  const hb = crypto.createHash("sha256").update(String(b)).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+
+// Inbound gate for `/v1/chat/completions` and `/admin/*`. `masterKeyEnv` names
+// an env var whose value the client must echo as `Authorization: Bearer <v>`
+// (scheme matched case-insensitively). `masterKeyEnv` is read from the LIVE
+// cfg object at request time, exactly like cfg.backoff / cfg.prefix, so a
+// config hot-reload toggles the gate without a restart. Unset masterKeyEnv
+// keeps today's open posture for every endpoint. A set name whose env value is
+// empty at request time FAILS CLOSED: the gated endpoints reject every request
+// rather than silently treating a missing expected key as "no auth". Read-only
+// endpoints (health, models, stats, history, config, UI) never pass through
+// here, so they stay open.
+function requireAuth(cfg, req) {
+  const name = cfg.masterKeyEnv;
+  if (!name) return null;
+  const url = req.url.split("?")[0];
+  const p = (cfg.prefix || "/v1").replace(/\/$/, "");
+  if (url !== p + "/chat/completions" && !url.startsWith("/admin")) return null;
+  const expected = process.env[name];
+  const unauthorized = newError(401, JSON.stringify({ error: { message: "authentication required", type: "authentication_error" } }));
+  if (!expected) {
+    console.error(`[${new Date().toISOString()}] masterKeyEnv '${name}' set but process.env['${name}'] is empty; rejecting request (fail closed)`);
+    return unauthorized;
+  }
+  const m = /^Bearer\s+(.+)$/i.exec(req.headers["authorization"] || "");
+  if (!m || !safeEqual(m[1].trim(), expected)) return unauthorized;
+  return null;
+}
+
 // ---- server ---------------------------------------------------------------
 
 let cfg = null;
@@ -1662,6 +1700,11 @@ async function loadConfig() {
   // Reconcile: keep health registry keyed by backend id on reload.
   const prevIds = new Set(cfg ? cfg.backends.map((b) => b.id) : []);
   cfg = parsed;
+  if (cfg.masterKeyEnv && !process.env[cfg.masterKeyEnv]) {
+    console.error(
+      `[${new Date().toISOString()}] config warning: masterKeyEnv '${cfg.masterKeyEnv}' set but process.env['${cfg.masterKeyEnv}'] is empty; auth-gated endpoints will reject all requests (fail closed)`
+    );
+  }
   ensureBackends(cfg);
   return cfg;
 }
@@ -1671,6 +1714,9 @@ function server() {
     const url = req.url.split("?")[0];
     const prefix = cfg.prefix || "/v1";
     const p = prefix.replace(/\/$/, "");
+
+    const authErr = requireAuth(cfg, req);
+    if (authErr) return writeError(res, authErr);
 
     if (req.method === "GET" && url === "/health") {
       const now = Date.now();
