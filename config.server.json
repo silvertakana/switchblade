@@ -3,6 +3,7 @@
   "prefix": "/v1",
   "host": "0.0.0.0",
   "masterKeyEnv": "LITELLM_API_KEY",
+  "uiPasswordEnv": "LMR_UI_PASSWORD",
   "backends": [
     { "id": "go-primary", "baseURL": "https://opencode.ai/zen/go/v1",
       "apiKeyEnv": "OPENCODE_GO_KEY", "idleTimeoutMs": 120000 },
