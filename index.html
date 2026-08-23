@@ -532,6 +532,9 @@
               <option value="docs">Documentation</option>
             </select>
           </label>
+          <label title="Optional; only needed if the router requires authentication">API key
+            <input type="password" id="pgKey" placeholder="(none)" autocomplete="off" spellcheck="false" style="width:160px">
+          </label>
           <button class="linkbtn" id="pgAdvancedToggle" data-icon="sliders">Advanced</button>
         </div>
         <div class="collapsed" id="pgAdvanced">
@@ -758,6 +761,14 @@ function fmtCountdown(until) {
 function chatUrl() {
   const p = (state.cfg && state.cfg.prefix) || "/v1";
   return p.replace(/\/$/, "") + "/chat/completions";
+}
+
+// Optional auth key for the playground. Only attached to chat requests, never
+// to admin calls or anything else; kept in the browser's localStorage only.
+function pgAuthHeader() {
+  const key = $("pgKey").value.trim();
+  if (!key) return null;
+  return { "authorization": "Bearer " + key };
 }
 
 // Some upstreams (Poolside Laguna family via CommandCode) do not understand
@@ -1515,6 +1526,7 @@ function savePlaygroundState() {
       stream: $("pgStream").checked,
       showReasoning: $("pgShowReasoning").checked,
       session: $("pgSession").value,
+      key: $("pgKey").value,
       system: $("pgSystem").value,
       temp: $("pgTemp").value,
       maxTokens: $("pgMaxTokens").value,
@@ -1578,6 +1590,7 @@ function loadPlaygroundState() {
     if (saved.stream != null) $("pgStream").checked = !!saved.stream;
     if (saved.showReasoning != null) $("pgShowReasoning").checked = !!saved.showReasoning;
     if (saved.session != null) $("pgSession").value = saved.session;
+    if (saved.key != null) $("pgKey").value = saved.key;
     if (saved.system != null) $("pgSystem").value = saved.system;
     if (saved.temp != null && saved.temp !== "") $("pgTemp").value = saved.temp;
     if (saved.maxTokens != null && saved.maxTokens !== "") $("pgMaxTokens").value = saved.maxTokens;
@@ -1786,6 +1799,8 @@ async function pgSend() {
 
   const headers = { "content-type": "application/json" };
   if (session) headers["x-session-affinity"] = session;
+  const auth = pgAuthHeader();
+  if (auth) Object.assign(headers, auth);
 
   const started = Date.now();
   pg.lastStart = started;
@@ -1808,7 +1823,11 @@ async function pgSend() {
 
     if (!resp.ok) {
       const errText = await resp.text();
-      pg.msgs[idx].content = "HTTP " + resp.status + "\n" + errText.slice(0, 2000);
+      if (resp.status === 401 && !auth) {
+        pg.msgs[idx].content = "Authentication required. Paste the router API key in the 'API key' field above (it is kept only in this browser) and send again.";
+      } else {
+        pg.msgs[idx].content = "HTTP " + resp.status + "\n" + errText.slice(0, 2000);
+      }
       pg.lastRaw = "HTTP " + resp.status + "\n" + errText;
       $("pgRaw").textContent = pg.lastRaw;
       pg.lastLatencyMs = Date.now() - started;
@@ -1950,7 +1969,7 @@ $("pgAdvancedToggle").addEventListener("click", () => {
 $("pgShowReasoning").addEventListener("change", () => { renderThread(); scheduleSave(); });
 
 // Persist playground settings whenever any control changes (debounced).
-["pgModel", "pgStream", "pgShowReasoning", "pgSession", "pgSystem", "pgTemp", "pgMaxTokens", "pgReasoning", "pgTopP", "pgFreqPenalty", "pgPresencePenalty"].forEach((id) => {
+["pgModel", "pgStream", "pgShowReasoning", "pgSession", "pgKey", "pgSystem", "pgTemp", "pgMaxTokens", "pgReasoning", "pgTopP", "pgFreqPenalty", "pgPresencePenalty"].forEach((id) => {
   const el = $(id);
   if (!el) return;
   el.addEventListener(el.type === "checkbox" ? "change" : "input", scheduleSave);
@@ -2024,6 +2043,8 @@ $("pgCompareRun").addEventListener("click", async () => {
     }
     const headers = { "content-type": "application/json" };
     if (session) headers["x-session-affinity"] = session;
+    const auth = pgAuthHeader();
+    if (auth) Object.assign(headers, auth);
     const t0 = Date.now();
     try {
       const resp = await fetch(chatUrl(), { method: "POST", headers, body: JSON.stringify(body) });

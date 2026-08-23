@@ -2122,6 +2122,56 @@ async function main() {
     }
   }
 
+  // zU) web UI playground carries the API-key input: when masterKeyEnv is set,
+  //  the served dashboard must still load (200) and include the key field so
+  //  users can chat against an authenticated router from the browser.
+  {
+    const dir = await mkdtemp(join(tmpdir(), "lmr-test-"));
+    const cfgPath = join(dir, "config.json");
+    const envPath = join(dir, ".env");
+    const cfgU = {
+      port: 0, prefix: "/v1", masterKeyEnv: "LMR_UI_KEY",
+      backends: [{ id: "u", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_U" }],
+      models: { "mu": { providers: [{ backend: "u", upstream: "u" }], affinityPool: 1 } },
+      presets: { "pu": { strategy: "affinity", models: ["mu"] } },
+      backoff: BO,
+    };
+    await writeFile(cfgPath, JSON.stringify(cfgU, null, 2));
+    await writeFile(envPath, "KEY_U=k\nLMR_UI_KEY=dummy-ui-key\n");
+    const child = spawn(process.execPath, ["server.mjs"], {
+      cwd: join(import.meta.dirname),
+      env: { ...process.env, ROUTER_CONFIG: cfgPath, ROUTER_ENV: envPath },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let port = null;
+    const bannerRe = /listening on http:\/\/([^:]+):(\d+)/g;
+    let exited = false;
+    const grab = (d) => {
+      for (const m of d.toString().matchAll(bannerRe)) {
+        if (m[1] === "127.0.0.1") port = parseInt(m[2], 10);
+      }
+    };
+    child.on("exit", () => { exited = true; });
+    child.stderr.on("data", grab);
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("ui child did not start")), 8000);
+      const check = () => { if (port) { clearTimeout(timer); resolve(); } };
+      child.on("exit", (code) => { clearTimeout(timer); reject(new Error("ui child exited early, code=" + code)); });
+      child.stderr.on("data", check);
+      check();
+    });
+    try {
+      const rr = await api("http://127.0.0.1:" + port, "/", { method: "GET" });
+      const html = await rr.text();
+      assert(rr.status === 200 && html.includes('id="pgKey"'), "zU1) dashboard loads with playground API key field under auth (status=" + rr.status + ")");
+      assert(html.includes("API key"), "zU2) dashboard key field has a visible label (status=" + rr.status + ")");
+      assert(!exited, "zU3) ui child stays up after serving dashboard");
+    } finally {
+      child.kill();
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
 }
