@@ -1875,9 +1875,11 @@ async function main() {
   // Always listen on localhost (existing consumers: OpenCode, dsh, local UI).
   // When cfg.host is set (e.g. a Tailscale IP to expose the router on the
   // tailnet), listen on that address too. Two server instances share the same
-  // request handler.
+  // request handler. A wildcard host (0.0.0.0 / ::) already covers loopback, so
+  // bind ONLY the wildcard: binding both on one port is EADDRINUSE on Linux.
   const hosts = new Set(["127.0.0.1"]);
   if (cfg.host) hosts.add(String(cfg.host));
+  if (cfg.host === "0.0.0.0" || cfg.host === "::") hosts.delete("127.0.0.1");
   for (const bindHost of hosts) {
     const srv = server();
     srv.listen(cfg.port, bindHost, () => {

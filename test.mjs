@@ -2065,6 +2065,63 @@ async function main() {
     }
   }
 
+  // zW) wildcard host: a config with host "0.0.0.0" must bind ONLY the
+  //  wildcard socket (no loopback double-bind) - the exact startup regression
+  //  that crashed Linux containers with EADDRINUSE. Expect one and only one
+  //  listening banner (the wildcard, via port 0), the child stays up, and
+  //  /health is reachable through loopback.
+  {
+    const dir = await mkdtemp(join(tmpdir(), "lmr-test-"));
+    const cfgPath = join(dir, "config.json");
+    const envPath = join(dir, ".env");
+    const cfgW = {
+      port: 0, prefix: "/v1", host: "0.0.0.0", masterKeyEnv: null,
+      backends: [{ id: "w", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_W" }],
+      models: { "mw": { providers: [{ backend: "w", upstream: "u" }], affinityPool: 1 } },
+      presets: { "pw": { strategy: "affinity", models: ["mw"] } },
+      backoff: BO,
+    };
+    await writeFile(cfgPath, JSON.stringify(cfgW, null, 2));
+    await writeFile(envPath, "KEY_W=k\n");
+    const child = spawn(process.execPath, ["server.mjs"], {
+      cwd: join(import.meta.dirname),
+      env: { ...process.env, ROUTER_CONFIG: cfgPath, ROUTER_ENV: envPath },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const banners = [];
+    let exited = false;
+    const onData = (d) => {
+      for (const m of d.toString().matchAll(/listening on http:\/\/([^:]+):(\d+)/g)) {
+        banners.push({ host: m[1], port: parseInt(m[2], 10) });
+      }
+    };
+    child.on("exit", () => { exited = true; });
+    child.stderr.on("data", onData);
+    let port = null;
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("wildcard child did not start")), 8000);
+      const check = () => {
+        const w = banners.find((b) => b.host === "0.0.0.0");
+        if (w) { port = w.port; clearTimeout(timer); resolve(); }
+      };
+      child.on("exit", (code) => { clearTimeout(timer); reject(new Error("wildcard child exited early, code=" + code)); });
+      child.stderr.on("data", check);
+      check();
+    });
+    // Grace window: the buggy double-bind emits a second banner immediately.
+    await new Promise((r) => setTimeout(r, 250));
+    try {
+      assert(!exited, "zW1) host 0.0.0.0 child stays up (no EADDRINUSE crash)");
+      assert(banners.length === 1, "zW2) host 0.0.0.0 binds exactly one socket, got " + banners.length + " (" + JSON.stringify(banners) + ")");
+      assert(banners[0].host === "0.0.0.0", "zW3) the single bind is the wildcard (got " + JSON.stringify(banners[0]) + ")");
+      const h = await api("http://127.0.0.1:" + port, "/health", { method: "GET" });
+      assert(h.status === 200, "zW4) /health reachable on the wildcard bind via loopback (status=" + h.status + ")");
+    } finally {
+      child.kill();
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
 }
