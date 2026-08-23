@@ -46,3 +46,10 @@ jobs:
             exit 1
           fi
           echo ".env.example placeholders are clean."
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build container image
+        run: docker build -t switchblade:ci .
