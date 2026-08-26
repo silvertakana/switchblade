@@ -235,6 +235,28 @@ Design decisions worth stating plainly:
 - If a model id is also a preset id: the PRESET wins at request time, a config
   warning fires once at load, and `/v1/models` lists the id once.
 
+### Optional diagnostics blocks (missCapture, alerts)
+
+Two OPTIONAL top-level blocks gate persistent cache-miss payload capture and
+ntfy push alerts. Both are absent-by-default (disabled): when the block is
+missing, the router's behavior is byte-identical to before.
+
+- `missCapture` (object): `enabled` (bool, required to turn on), `maxMissPct`
+  (default 50: only requests whose cache-hit percentage is BELOW this are
+  captured), `minMissTokens` (default 1000: minimum estimated cache-miss prompt
+  tokens before capture), `file` (default `router-misses.jsonl`, resolved next
+  to the config), `maxFileBytes` (default 25000000; when the file exceeds this
+  it rotates to `<file>.old`). Captured rows are a bounded copy of the outgoing
+  payload (see `boundedPayload`), never API keys. Used to make a bad-miss night
+  recoverable (low cache-hit percentage = an EARLY cache break).
+- `alerts.ntfy` (object): `baseUrl` (default `https://ntfy.sh`), `topic`
+  (required), `minMissPct` (default 50) / `minMissTokens` (default 20000) for
+  the `cache_miss` alert threshold, `cooldownMs` (default 600000, per-kind), and
+  optional `events` map to disable specific kinds (`{"cache_miss": false}`).
+  Kinds: `cache_miss`, `weekly_limit`, `all_cooling`, `request_exhausted`,
+  `relay_cut`. Alerts are fire-and-forget (never block the request path), never
+  carry secrets, and are throttled by the per-kind cooldown.
+
 ---
 
 ## 3. Routing semantics (two-level)
@@ -936,5 +958,176 @@ clustered overnight rather than scattered; these were the router's own
 wall-clock cuts, distinct from genuine upstream `terminated` drops. Tests z23
 (slow-alive stream completes past a tiny timeoutMs) and z24 (stalled stream cut
 by idle watchdog) pin the new behavior.
+
+---
+
+## 14. Analytics dashboard and cost engine (pricing)
+
+STATUS: FINAL (append-only addendum; sections 0-13 are unchanged). Reviewed
+against server.mjs and the test suite @ 245 asserts. Pins the top-level
+`pricing` key, the extended `models[].meta.pricing` shape, the per-request cost
+engine, the new history-entry fields, and the `GET /api/dashboard` contract.
+
+### 14.1 Top-level `pricing` (peak windows + off-peak multiplier)
+
+OPTIONAL top-level key. Absent = standard peak-only billing with the default
+windows. Billing mirrors DeepSeek's published price shape: models declare
+USD-per-1M rates under `meta.pricing` and OPT IN to off-peak discounting; this
+key controls the discount factor and the peak windows.
+
+```jsonc
+"pricing": {
+  "offPeakMultiplier": 0.5,
+  "peakWindows": [
+    { "days": "1-5", "start": "01:00", "end": "04:00" },
+    { "days": "1-5", "start": "06:00", "end": "10:00" }
+  ]
+}
+```
+
+- `offPeakMultiplier` (default 0.5, DeepSeek's half price): the factor applied
+  to peak rates during off-peak time. Missing -> 0.5; a non-positive value is a
+  config bug and also falls back to 0.5.
+- `peakWindows`: weekday UTC hour ranges. `days` is a `Date.getUTCDay()` span
+  ("1-5" = Monday through Friday, UTC); `start`/`end` are UTC "HH:MM", start
+  inclusive, end exclusive. A malformed window entry is skipped, so a bad
+  window never shifts billing.
+- Off-peak = outside ALL peak windows. Weekends (UTC Sat/Sun) have no windows
+  at all, so the whole weekend is off-peak. An empty `peakWindows: []` makes
+  every hour off-peak.
+- Window evaluation is UTC, from the request's own timestamp (`entry.t`); there
+  is no local-time or per-backend timezone handling.
+- The discount applies ONLY to models that opt in
+  (`meta.pricing.offPeak === true`, section 14.2). Every other model bills at
+  its declared rates around the clock, peak and off-peak time alike.
+
+### 14.2 Extended `models[].meta.pricing`
+
+```jsonc
+"meta": {
+  "pricing": {
+    "inputPerM": 0.18,           // REQUIRED: USD per 1M prompt tokens, peak rate
+    "cacheHitInputPerM": 0.025,  // OPTIONAL: USD per 1M cached prompt tokens; falls back to inputPerM
+    "outputPerM": 0.87,          // REQUIRED: USD per 1M completion tokens
+    "offPeak": true              // OPTIONAL: opt the model into off-peak discounting
+  }
+}
+```
+
+- `inputPerM` and `outputPerM` are REQUIRED and must be finite numbers. If
+  either is missing or non-finite, the model has no pricing at all and every
+  cost field stays null (the UI renders "n/a" / "pricing not configured").
+- `cacheHitInputPerM` is OPTIONAL. When absent the engine falls back to
+  `inputPerM`: cache hits then bill at the full input rate and `cacheSavings`
+  is 0. DeepSeek-family models normally declare it.
+- `offPeak` is OPTIONAL boolean. `true` opts the model into the off-peak
+  multiplier; the deepseek models ship `offPeak: true` on their peak pricing
+  cards. Absent or `false` = flat rates at all hours.
+- Cost resolution: `computeCost` reads `cfg.models[entry.model].meta.pricing`,
+  where `entry.model` is the REQUESTED id (a preset id when a preset was
+  addressed). A requested id with no configured model entry (e.g. an alias
+  preset id that is not also a model id) has no pricing, so its cost fields
+  stay null even when the serving model declares pricing.
+
+### 14.3 Per-request cost engine
+
+`computeCost(entry, cfg)` runs at every history-entry finalization site (live
+and seeded rows alike). All figures are USD, rounded to 10 decimal places.
+
+Formula (effective rates; `mult` = offPeakMultiplier when the request ran
+off-peak AND the model opted in, else 1):
+
+```
+cost = missTokens * (inputPerM * mult) / 1e6
+     + hitTokens  * (cacheHitInputPerM * mult) / 1e6
+     + completionTokens * (outputPerM * mult) / 1e6
+```
+
+- `hitTokens` = `promptCacheHitTokens`, clamped to `promptTokens` (cache hits
+  can never exceed the prompt).
+- `missTokens` = `promptCacheMissTokens` when reported; when the upstream only
+  reports hits it is derived as `max(0, promptTokens - hitTokens)`.
+- `cacheSavings` = `hitTokens * (inputPerM - cacheHitInputPerM) / 1e6`,
+  measured at PEAK rates so it does not depend on when the request ran; it is
+  the saving the cache-hit rate buys vs paying the full input price for those
+  tokens.
+- `offPeakSavings` = `offPeak ? cost * (1 / mult - 1) : 0`, the portion of cost
+  the off-peak discount removed.
+- Return shape for a priced model: `{ cost, cacheSavings, offPeakSavings,
+  offPeak }` with every number >= 0; `null` when the model has no pricing.
+
+### 14.4 New history-entry fields
+
+`/api/history` entries and `router-history.jsonl` rows gain:
+
+| field | type | meaning |
+|---|---|---|
+| `promptCacheHitTokens` | number | raw prompt tokens served from cache (0 = upstream did not report a split) |
+| `promptCacheMissTokens` | number | raw miss tokens; derived from `prompt - hit` when the upstream only reports hits |
+| `errorKind` | string \| null | classified upstream failure kind: `weekly` / `rate` / `auth` / `server` / `client`; null = no upstream failure |
+| `cost` | number \| null | request cost in USD; null = the model has no `meta.pricing` |
+| `cacheSavings` | number \| null | USD saved by cache hits vs full-price miss (peak rates) |
+| `offPeakSavings` | number \| null | USD saved by the off-peak discount (0 when it did not apply) |
+| `offPeak` | boolean \| null | whether off-peak pricing applied to this request |
+
+### 14.5 `GET /api/dashboard` contract
+
+Read-only (stays open, like `/api/stats` and `/api/history`). Returns one JSON
+object:
+
+```
+{ since, uptimeMs, kpis, byBackend, byModel, hourly, daily, cooling, pricing }
+```
+
+- `since` / `uptimeMs`: process start of aggregate tracking and the current
+  uptime.
+- `kpis`: `{requests, ok, errors, errorRate, promptTokens, completionTokens,
+  cacheHitTokens, cacheMissTokens, cacheHitRate, cost, cacheSavings,
+  offPeakSavings, offPeakRequests, offPeakShare, cooledBackends,
+  activeModelCount}`.
+- `byBackend`: one entry per CONFIGURED backend, in config order: `{id,
+  requests, ok, errors, errorRate, latencyAvgMs, latencyMaxMs, promptTokens,
+  completionTokens, cost, cacheHits, cacheKnown, cacheHitRate, state, fails,
+  lastErrorKind, manual}`. `state` is `"cooling"` or `"healthy"`, derived at
+  read time from the health registry; `manual` is true when the active cool is
+  a manual one.
+- `byModel`: one entry per model id with observed traffic (insertion order):
+  `{id, label, requests, ok, errors, errorRate, latencyAvgMs, latencyMaxMs,
+  promptTokens, completionTokens, cost, cacheHitRate}`; `label` from
+  `meta.label`, else null.
+- `hourly`: EXACTLY 24 slots, oldest first, ending at the current hour; each
+  `{t, requests, ok, errors, promptTokens, completionTokens, cacheHitTokens,
+  cacheMissTokens, cost, latencyAvgMs, latencyMaxMs}` where `t` = hour-start
+  epoch ms. Empty slots materialize as zeroed rows.
+- `daily`: EXACTLY 30 slots, oldest first, ending today; each `{t, requests,
+  errors, cost, tokens, cacheHitRate}` where `t` = UTC-midnight epoch ms.
+- `cooling`: the cooling-event observation ring, newest at head, capped at the
+  last 500 transitions: `{t, backend, action, kind, manual}`. Actions: `cool`
+  (transition INTO cooling from a classified failure; never for client-kind
+  errors, never for a re-cool of an already-active cooling; manual cools do not
+  emit ring events, they surface via `byBackend.manual`), `expire` (lazy expiry
+  observed at request time, once per expiry), `success` (a success cleared the
+  cooling), `uncool` (admin uncool), `reset` (reset-health). `kind` is the
+  classified failure kind or `manual` that produced the transition.
+- `pricing`: `{offPeakMultiplier, peakWindows, modelsWithOffPeak}`: the
+  resolved pricing configuration (section 14.1) plus the model ids whose
+  `meta.pricing.offPeak === true`.
+
+Null semantics (the contract's "no data" signal, never a fake zero):
+
+- `cost` / `cacheSavings` / `offPeakSavings` are null until real priced traffic
+  exists (and stay null when nothing is priced); zeros are REAL values once
+  pricing applies.
+- `errorRate` / `cacheHitRate` / `offPeakShare` / `latencyAvgMs` are null when
+  their denominator is empty (no requests, no cache split known); 0 is a real
+  rate.
+- Per-entry `cost` of null means "no pricing configured for this model",
+  distinct from a priced request that cost 0.
+
+Seeding: at startup the aggregate store is seeded from the tail of
+`router-history.jsonl` (at most the last 20 MB; a partial first line and
+malformed lines are dropped; legacy rows count as requests with zero tokens),
+so the dashboard charts survive restarts. Live entries feed the same
+accumulators at every history-finalization site.
 
 ---

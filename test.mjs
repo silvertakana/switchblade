@@ -3,13 +3,13 @@
 
 import http from "node:http";
 import { once } from "node:events";
-import { writeFile, mkdtemp, rm } from "node:fs/promises";
+import { writeFile, mkdtemp, rm, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 // Unit-level imports: server.mjs only starts the server when run as a script,
 // so importing it here gives direct access to strategy selection for tests.
-import { candidates, normalizeConfig, buildPayload } from "./server.mjs";
+import { candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost } from "./server.mjs";
 
 const HOST = "127.0.0.1";
 let passed = 0;
@@ -1309,10 +1309,379 @@ async function main() {
         (!byBackend["z16u"] || byBackend["z16u"].cacheHits === 0),
         "z16) cache tri-state: usage hit=true, miss=false, no-signal=null; stats count only true (h=" + (h && h.cacheHit) + ", m=" + (m && m.cacheHit) + ", u=" + (u && u.cacheHit) + ")"
       );
+      // The raw cache token split is now retained on the history entry instead
+      // of being discarded after cacheHitPct: hits/miss as reported, errorKind
+      // null on success, and cost null because these models have no pricing.
+      assert(
+        h && h.promptCacheHitTokens === 40 && h.promptCacheMissTokens === 60 && h.errorKind === null && h.cost === null,
+        "z16b) cost fields: raw cache split retained (hit=" + (h && h.promptCacheHitTokens) + ", miss=" + (h && h.promptCacheMissTokens) + "), errorKind null, cost null without pricing"
+      );
+      // No cache signal at all -> hit 0, miss derived from prompt (full prompt
+      // billed as miss: conservative when the upstream reports no split).
+      assert(
+        u && u.promptCacheHitTokens === 0 && u.promptCacheMissTokens === 100,
+        "z16c) no cache signal -> hit 0, miss derived = prompt (hit=" + (u && u.promptCacheHitTokens) + ", miss=" + (u && u.promptCacheMissTokens) + ")"
+      );
     } finally {
       childZ16.kill();
       hitSrv.close(); missSrv.close(); unkSrv.close();
       await rm(dirZ16, { recursive: true, force: true });
+    }
+  }
+
+  // z31) unit-level: computeCost - pricing resolution, peak-window boundaries,
+  //      the off-peak multiplier, and cache-split math with exact numbers. The
+  //      default peak windows are DeepSeek's Mon-Fri 01:00-04:00 + 06:00-10:00
+  //      UTC; 2026-01-05 is a Monday and 2026-01-10 is a Saturday.
+  {
+    const tMonOff1 = Date.UTC(2026, 0, 5, 0, 59, 59);  // Mon 00:59:59 UTC (before window 1)
+    const tMonPeak1 = Date.UTC(2026, 0, 5, 1, 0, 0);   // Mon 01:00:00 UTC (window 1 start, inclusive)
+    const tMonPeak2 = Date.UTC(2026, 0, 5, 3, 59, 59); // Mon 03:59:59 UTC (inside window 1)
+    const tMonOff2 = Date.UTC(2026, 0, 5, 4, 0, 0);    // Mon 04:00:00 UTC (window 1 end, exclusive)
+    const tMonOff3 = Date.UTC(2026, 0, 5, 10, 0, 0);   // Mon 10:00:00 UTC (window 2 end, exclusive)
+    const tSat = Date.UTC(2026, 0, 10, 2, 0, 0);       // Sat 02:00 UTC (no windows on weekends)
+    const opCfg = { models: { m: { meta: { pricing: { inputPerM: 1, outputPerM: 1, offPeak: true } } } } };
+    const flag = (t, cfg) => computeCost({ t, model: "m", promptTokens: 0, completionTokens: 0 }, cfg).offPeak;
+    assert(flag(tMonOff1, opCfg) === true, "z31a) Mon 00:59:59 UTC -> offPeak true");
+    assert(flag(tMonPeak1, opCfg) === false, "z31b) Mon 01:00:00 UTC -> offPeak false (window start inclusive)");
+    assert(flag(tMonPeak2, opCfg) === false, "z31c) Mon 03:59:59 UTC -> offPeak false (inside window 1)");
+    assert(flag(tMonOff2, opCfg) === true, "z31d) Mon 04:00:00 UTC -> offPeak true (window end exclusive)");
+    assert(flag(tMonOff3, opCfg) === true, "z31e) Mon 10:00:00 UTC -> offPeak true (window 2 end exclusive)");
+    assert(flag(tSat, opCfg) === true, "z31f) Sat 02:00 UTC -> offPeak true (weekends have no windows)");
+    const customCfg = {
+      models: { m: { meta: { pricing: { inputPerM: 1, outputPerM: 1, offPeak: true } } } },
+      pricing: { peakWindows: [{ days: "6-6", start: "00:00", end: "23:59" }] },
+    };
+    assert(flag(tSat, customCfg) === false, "z31g) custom peakWindows override: Sat 02:00 UTC -> peak when Saturday is a window");
+    const none = computeCost({ t: tMonPeak1, model: "m", promptTokens: 10 }, { models: { m: { meta: {} } } });
+    assert(none === null, "z31h) computeCost -> null when the model has no meta.pricing");
+    const unknown = computeCost({ t: tMonPeak1, model: "m", promptTokens: 10 }, { models: {} });
+    assert(unknown === null, "z31i) computeCost -> null when the model id is unknown");
+    // Multiplier: offPeak 0.5 halves the bill for an opted-in model; a model
+    // without offPeak:true pays peak rates off-peak with the flag false.
+    const peakCfg = { models: { m: { meta: { pricing: { inputPerM: 1, outputPerM: 2, offPeak: true } } } } };
+    const rPeak = computeCost({ t: tMonPeak1, model: "m", promptTokens: 1000, completionTokens: 100 }, peakCfg);
+    const rOff = computeCost({ t: tMonOff1, model: "m", promptTokens: 1000, completionTokens: 100 }, peakCfg);
+    assert(
+      rPeak && rOff && rPeak.cost === 0.0012 && rOff.cost === 0.0006 && rOff.cost === rPeak.cost / 2 && rOff.offPeak === true,
+      "z31j) off-peak multiplier 0.5 halves cost for an offPeak:true model (peak=" + (rPeak && rPeak.cost) + ", off=" + (rOff && rOff.cost) + ")"
+    );
+    const noOptCfg = { models: { m: { meta: { pricing: { inputPerM: 1, outputPerM: 2 } } } } };
+    const rNoOptPeak = computeCost({ t: tMonPeak1, model: "m", promptTokens: 1000, completionTokens: 100 }, noOptCfg);
+    const rNoOptOff = computeCost({ t: tMonOff1, model: "m", promptTokens: 1000, completionTokens: 100 }, noOptCfg);
+    assert(
+      rNoOptPeak && rNoOptOff && rNoOptOff.cost === rNoOptPeak.cost && rNoOptOff.cost === 0.0012 && rNoOptOff.offPeak === false,
+      "z31k) model without offPeak:true pays peak rates off-peak, flag false (cost=" + (rNoOptOff && rNoOptOff.cost) + ", offPeak=" + (rNoOptOff && rNoOptOff.offPeak) + ")"
+    );
+    // Cache split: hits billed at cacheHitInputPerM, misses at inputPerM.
+    const splitCfg = { models: { m: { meta: { pricing: { inputPerM: 2.8, cacheHitInputPerM: 0.7, outputPerM: 0.87 } } } } };
+    const rSplit = computeCost({ t: tMonPeak1, model: "m", promptTokens: 1000, promptCacheHitTokens: 400, promptCacheMissTokens: 600, completionTokens: 100 }, splitCfg);
+    assert(
+      rSplit && rSplit.cost === 0.002047 && rSplit.cacheSavings === 0.00084 && rSplit.offPeakSavings === 0 && rSplit.offPeak === false,
+      "z31l) cache split billed at both rates; savings exact at peak rates (cost=" + (rSplit && rSplit.cost) + ", savings=" + (rSplit && rSplit.cacheSavings) + ")"
+    );
+    const noHitRateCfg = { models: { m: { meta: { pricing: { inputPerM: 2.8, outputPerM: 0.87 } } } } };
+    const rNoRate = computeCost({ t: tMonPeak1, model: "m", promptTokens: 1000, promptCacheHitTokens: 400, promptCacheMissTokens: 600, completionTokens: 100 }, noHitRateCfg);
+    assert(
+      rNoRate && rNoRate.cacheSavings === 0 && rNoRate.cost === 0.002887,
+      "z31m) missing cacheHitInputPerM falls back to inputPerM (savings 0) (cost=" + (rNoRate && rNoRate.cost) + ")"
+    );
+    const rDerive = computeCost({ t: tMonPeak1, model: "m", promptTokens: 100, promptCacheHitTokens: 40, completionTokens: 0 }, splitCfg);
+    assert(rDerive && rDerive.cost === 0.000196, "z31n) missing miss tokens derive from prompt - hit (cost=" + (rDerive && rDerive.cost) + ")");
+    const rClamp = computeCost({ t: tMonPeak1, model: "m", promptTokens: 1000, promptCacheHitTokens: 1500, promptCacheMissTokens: 0, completionTokens: 0 }, { models: { m: { meta: { pricing: { inputPerM: 1, cacheHitInputPerM: 0.5, outputPerM: 1 } } } } });
+    assert(rClamp && rClamp.cost === 0.0005, "z31o) hit tokens clamped to prompt (cost=" + (rClamp && rClamp.cost) + ")");
+    const rExact = computeCost({ t: tMonPeak1, model: "m", promptTokens: 1234, promptCacheHitTokens: 1234, promptCacheMissTokens: 0, completionTokens: 0 }, { models: { m: { meta: { pricing: { inputPerM: 1, cacheHitInputPerM: 0.0028, outputPerM: 1 } } } } });
+    assert(
+      rExact && rExact.cost === 0.0000034552 && rExact.cacheSavings === 0.0012305448,
+      "z31p) exact numbers: 1234 hit tokens * 0.0028 / 1e6 (cost=" + (rExact && rExact.cost) + ", savings=" + (rExact && rExact.cacheSavings) + ")"
+    );
+    // cacheSavings uses peak rates even when off-peak pricing applied.
+    const offSplitCfg = { models: { m: { meta: { pricing: { inputPerM: 2.8, cacheHitInputPerM: 0.7, outputPerM: 0.87, offPeak: true } } } } };
+    const rOffSplit = computeCost({ t: tMonOff1, model: "m", promptTokens: 1000, promptCacheHitTokens: 400, promptCacheMissTokens: 600, completionTokens: 100 }, offSplitCfg);
+    assert(
+      rOffSplit && rOffSplit.cacheSavings === 0.00084 && rOffSplit.cost === 0.0010235 && rOffSplit.offPeakSavings === 0.0010235,
+      "z31q) cacheSavings stays at peak rates off-peak; offPeakSavings = cost at mult 0.5 (cost=" + (rOffSplit && rOffSplit.cost) + ", savings=" + (rOffSplit && rOffSplit.cacheSavings) + ", offSav=" + (rOffSplit && rOffSplit.offPeakSavings) + ")"
+    );
+    const badMultCfg = { models: { m: { meta: { pricing: { inputPerM: 1, outputPerM: 2, offPeak: true } } } }, pricing: { offPeakMultiplier: 0 } };
+    const rBadMult = computeCost({ t: tMonOff1, model: "m", promptTokens: 1000, completionTokens: 100 }, badMultCfg);
+    assert(rBadMult && rBadMult.cost === 0.0006, "z31r) 0 offPeakMultiplier falls back to 0.5 (cost=" + (rBadMult && rBadMult.cost) + ")");
+  }
+
+  // z32) integration: cost + cache-split fields land on the history entry with
+  //      EXACT numbers through a real request flow. peakWindows: [] pins every
+  //      hour off-peak so the result is deterministic no matter when the test
+  //      runs (the model opts in with offPeak:true -> multiplier 0.5 applies).
+  {
+    const srv32 = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        id: "z32", object: "chat.completion",
+        choices: [{ message: { role: "assistant", content: "ok" } }],
+        usage: { prompt_tokens: 1000, completion_tokens: 50, prompt_cache_hit_tokens: 400, prompt_cache_miss_tokens: 600 },
+      }));
+    });
+    const port32 = await listen(srv32);
+    const cfgZ32 = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "z32", baseURL: `http://${HOST}:${port32}`, apiKeyEnv: "KEY_Z32" }],
+      models: {
+        "mc": { providers: [{ backend: "z32", upstream: "u32" }], meta: { pricing: { inputPerM: 0.28, cacheHitInputPerM: 0.07, outputPerM: 0.87, offPeak: true } } },
+      },
+      pricing: { peakWindows: [] },
+      backoff: BO,
+    };
+    const { child: childZ32, base: baseZ32, dir: dirZ32 } = await startRouterCfg(cfgZ32, "KEY_Z32=test-key-z32\n");
+    try {
+      const rr = await api(baseZ32, "/v1/chat/completions", { body: { model: "mc", messages: [] } });
+      assert(rr.status === 200, "z32a) request through a priced model succeeds (status=" + rr.status + ")");
+      const hist = await (await api(baseZ32, "/api/history?limit=5", { method: "GET" })).json();
+      const e = (hist.entries || []).find((x) => x.model === "mc");
+      assert(
+        e && e.promptCacheHitTokens === 400 && e.promptCacheMissTokens === 600 && e.errorKind === null &&
+        e.cost === 0.00011975 && e.cacheSavings === 0.000084 && e.offPeakSavings === 0.00011975 && e.offPeak === true,
+        "z32b) history entry cost fields: hit 400 / miss 600, cost 0.00011975 (off-peak half of 0.0002395), savings 0.000084, errorKind null, offPeak true (got " + JSON.stringify(e && { pcht: e.promptCacheHitTokens, pcmt: e.promptCacheMissTokens, cost: e.cost, cs: e.cacheSavings, ops: e.offPeakSavings, offPeak: e.offPeak, ek: e.errorKind }) + ")"
+      );
+      // The appended JSONL row must carry the same fields (survives the append path).
+      const jsonl = await readFile(join(dirZ32, "router-history.jsonl"), "utf8");
+      const rows = jsonl.trim().split("\n").map((l) => JSON.parse(l));
+      const last = rows[rows.length - 1];
+      assert(
+        last && last.model === "mc" && last.promptCacheHitTokens === 400 && last.promptCacheMissTokens === 600 &&
+        last.cost === 0.00011975 && typeof last.offPeak === "boolean" && last.errorKind === null,
+        "z32c) router-history.jsonl row carries the new cost fields (cost=" + (last && last.cost) + ")"
+      );
+    } finally {
+      childZ32.kill();
+      srv32.close();
+      await rm(dirZ32, { recursive: true, force: true });
+    }
+  }
+
+  // z33) integration: an upstream 429 (rate-limit class) survives to the
+  //      history entry as errorKind "rate" with a 0-token cost of 0 (not null).
+  {
+    const srv33 = http.createServer(async (req, res) => {
+      for await (const c of req) { /* drain */ }
+      res.writeHead(429, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "rate limited" } }));
+    });
+    const port33 = await listen(srv33);
+    const cfgZ33 = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "z33", baseURL: `http://${HOST}:${port33}`, apiKeyEnv: "KEY_Z33" }],
+      models: { "mf": { providers: [{ backend: "z33", upstream: "u33" }], meta: { pricing: { inputPerM: 1, outputPerM: 1 } } } },
+      backoff: BO,
+    };
+    const { child: childZ33, base: baseZ33, dir: dirZ33 } = await startRouterCfg(cfgZ33, "KEY_Z33=test-key-z33\n");
+    try {
+      await api(baseZ33, "/v1/chat/completions", { body: { model: "mf", messages: [] } });
+      const hist = await (await api(baseZ33, "/api/history?limit=5", { method: "GET" })).json();
+      const e = (hist.entries || []).find((x) => x.model === "mf");
+      assert(
+        e && e.status === 503 && e.errorKind === "rate" && e.promptCacheHitTokens === 0 && e.promptCacheMissTokens === 0 &&
+        e.cost === 0 && e.cacheSavings === 0 && e.offPeakSavings === 0,
+        "z33) 429 exhausted -> errorKind rate, 0-token cost 0 not null (status=" + (e && e.status) + ", kind=" + (e && e.errorKind) + ", cost=" + (e && e.cost) + ")"
+      );
+    } finally {
+      childZ33.kill();
+      srv33.close();
+      await rm(dirZ33, { recursive: true, force: true });
+    }
+  }
+
+  // z27) unit-level: cacheHitPctOf - the per-call cache-hit percentage. Low % =
+  //      early cache break (0% = miss from the very start), 95% = break near
+  //      the end. Non-finite / zero-total signals yield null.
+  {
+    const pct = (h, m, c, p) => cacheHitPctOf(h, m, c, p);
+    assert(pct(100, 900, NaN, 1000) === 10, "z27a) cacheHitPctOf(100,900) == 10");
+    assert(pct(0, 100, NaN, 100) === 0, "z27b) cacheHitPctOf(0,100) == 0");
+    assert(pct(40, 60, NaN, 100) === 40, "z27c) cacheHitPctOf(40,60) == 40");
+    assert(pct(1000, 0, NaN, 1000) === 100, "z27d) cacheHitPctOf(1000,0) == 100");
+    assert(pct(NaN, NaN, NaN, 1000) === null, "z27e) cacheHitPctOf(no signal) == null");
+    assert(pct(0, 0, NaN, 1000) === null, "z27f) cacheHitPctOf(0,0) == null (nothing measured)");
+    assert(pct(NaN, NaN, 500, 1000) === 50, "z27g) cacheHitPctOf(cached 500/1000) == 50 (cached-only fallback)");
+    assert(pct(100, NaN, NaN, 1000) === 10, "z27h) cacheHitPctOf(hit 100/1000 prompt) == 10 (hit-only fallback)");
+    assert(pct(1, 2, NaN, 3) === 33.3, "z27i) cacheHitPctOf rounding: (1,2) == 33.3");
+  }
+
+  // z28) unit-level: buildAlert / resetAlertCooldowns - config-gated, cooldown-
+  //      throttled ntfy alert construction. Never sends; pure shape checks.
+  {
+    resetAlertCooldowns(); // order independence: clear the shared cooldown map
+    assert(buildAlert({}, "cache_miss", {}) === null, "z28a) no alerts.ntfy block -> null");
+    const cfgn = { alerts: { ntfy: { baseUrl: "http://x", topic: "t" } } };
+    const missFields = { backend: "b1", cacheHitPct: 10, missTokens: 100, promptTokens: 1000, model: "m", session: "s" };
+    const a1 = buildAlert(cfgn, "cache_miss", missFields);
+    assert(
+      a1 && a1.url === "http://x/t" && a1.body.topic === "t" &&
+      typeof a1.body.message === "string" && a1.body.message.includes("Cache break") &&
+      a1.body.message.includes("b1") && Array.isArray(a1.body.tags) && a1.body.tags.length === 1 &&
+      typeof a1.body.priority === "number",
+      "z28b) enabled block -> {url, body{topic,title,message,tags,priority}}"
+    );
+    const cfge = { alerts: { ntfy: { baseUrl: "http://x", topic: "t", events: { cache_miss: false } } } };
+    assert(buildAlert(cfge, "cache_miss", {}) === null, "z28c) kind disabled via events -> null");
+    assert(buildAlert(cfgn, "nope", {}) === null, "z28d) unknown kind -> null");
+    resetAlertCooldowns(); // drop the cooldown a1 set so the pair below starts clean
+    const a4 = buildAlert(cfgn, "cache_miss", missFields);
+    const a5 = buildAlert(cfgn, "cache_miss", missFields);
+    assert(a4 !== null && a5 === null, "z28e) cooldown: same kind twice -> second is null");
+    const a6 = buildAlert(cfgn, "weekly_limit", { backend: "b1", days: 7 });
+    assert(a6 !== null, "z28f) different kind still fires during cooldown");
+    resetAlertCooldowns();
+    const a7 = buildAlert(cfgn, "cache_miss", missFields);
+    assert(a7 !== null, "z28g) resetAlertCooldowns clears -> same kind fires again");
+    resetAlertCooldowns();
+  }
+
+  // z29) integration: a big cache MISS persists a bounded payload row AND fires
+  //      an ntfy alert; a full cache HIT does neither. Exercises Part 1 (pct
+  //      on /api/history) + Part 2 (persistent capture) + Part 3 (ntfy) end to
+  //      end through a real server child against mock backends and a mock ntfy
+  //      receiver.
+  {
+    const received = []; // POST bodies recorded by the mock ntfy receiver
+    const ntfySrv = http.createServer((req, res) => {
+      const chunks = [];
+      req.on("data", (c) => chunks.push(c));
+      req.on("end", () => {
+        const b = Buffer.concat(chunks).toString("utf8");
+        try { received.push(JSON.parse(b)); } catch { received.push({ raw: b }); }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      });
+    });
+    const ntfyPort = await listen(ntfySrv);
+    const mk = (id, usage) => {
+      const srv = http.createServer(async (req, res) => {
+        const chunks = [];
+        for await (const c of req) chunks.push(c);
+        const body = Buffer.concat(chunks).toString("utf8");
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          id, object: "chat.completion",
+          choices: [{ message: { role: "assistant", content: "ok" } }],
+          usage,
+        }));
+      });
+      return srv;
+    };
+    const missSrv = mk("z29m", { prompt_tokens: 1000, completion_tokens: 5, prompt_cache_hit_tokens: 100, prompt_cache_miss_tokens: 900 });
+    const hitSrv = mk("z29h", { prompt_tokens: 1000, completion_tokens: 5, prompt_cache_hit_tokens: 1000, prompt_cache_miss_tokens: 0 });
+    const ports29 = await Promise.all([listen(missSrv), listen(hitSrv)]);
+    const cfgZ29 = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "z29m", baseURL: `http://${HOST}:${ports29[0]}`, apiKeyEnv: "KEY_Z29M" },
+        { id: "z29h", baseURL: `http://${HOST}:${ports29[1]}`, apiKeyEnv: "KEY_Z29H" },
+      ],
+      models: {
+        "m29a": { providers: [{ backend: "z29m", upstream: "u29" }], affinityPool: 1 },
+        "m29b": { providers: [{ backend: "z29h", upstream: "u29" }], affinityPool: 1 },
+      },
+      presets: {
+        "p29a": { strategy: "affinity", models: ["m29a"] },
+        "p29b": { strategy: "affinity", models: ["m29b"] },
+      },
+      backoff: BO,
+      alerts: { ntfy: { baseUrl: `http://${HOST}:${ntfyPort}`, topic: "t29", minMissPct: 50, minMissTokens: 0, cooldownMs: 600000 } },
+      missCapture: { enabled: true, maxMissPct: 50, minMissTokens: 0, file: "misses.jsonl" },
+    };
+    const { child: childZ29, base: baseZ29, dir: dirZ29 } = await startRouterCfg(cfgZ29, "KEY_Z29M=k\nKEY_Z29H=k\n");
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const waitFor = async (fn, timeoutMs) => {
+      const start = Date.now();
+      while (Date.now() - start < timeoutMs) {
+        if (await fn()) return true;
+        await sleep(25);
+      }
+      return false;
+    };
+    try {
+      // p29a: 10% cache hit -> a real miss. Tri-state stays true (hit > 0); the
+      // percentage is what the new feature reports.
+      const ra = await api(baseZ29, "/v1/chat/completions", { body: { model: "p29a", messages: [{ role: "user", content: "z29 miss probe" }] } });
+      assert(ra.status === 200, "z29a) p29a request succeeds (status=" + ra.status + ")");
+      let hist = await (await api(baseZ29, "/api/history?limit=10", { method: "GET" })).json();
+      let ea = hist.entries.find((e) => e.model === "p29a");
+      assert(
+        ea && ea.cacheHit === true && ea.cacheHitPct === 10,
+        "z29b) p29a history: cacheHit=true, cacheHitPct=10 (hit=" + (ea && ea.cacheHit) + ", pct=" + (ea && ea.cacheHitPct) + ")"
+      );
+      const alerted = await waitFor(() => received.length >= 1, 2000);
+      assert(
+        alerted && received[0] && received[0].topic === "t29" && typeof received[0].message === "string" && received[0].message.includes("10%"),
+        "z29c) cache_miss ntfy alert fired with 10% (received=" + received.length + ")"
+      );
+      let missesFile = join(dirZ29, "misses.jsonl");
+      const missWritten = await waitFor(async () => {
+        try { return (await readFile(missesFile, "utf8")).split("\n").filter(Boolean).length === 1; } catch { return false; }
+      }, 2000);
+      let rows = missWritten ? (await readFile(missesFile, "utf8")).split("\n").filter(Boolean) : [];
+      let row0 = rows.length ? JSON.parse(rows[0]) : null;
+      assert(
+        missWritten && row0 && row0.cacheHitPct === 10 && row0.cacheMissTokens === 900 &&
+        Array.isArray(row0.payload && row0.payload.messages) && row0.payload.messages.some((m) => m.content === "z29 miss probe"),
+        "z29d) misses.jsonl has exactly 1 row with cacheHitPct=10, cacheMissTokens=900, and the sent message (rows=" + rows.length + ")"
+      );
+      // p29b: 100% cache hit -> no capture, no alert.
+      const rb = await api(baseZ29, "/v1/chat/completions", { body: { model: "p29b", messages: [{ role: "user", content: "z29 hit probe" }] } });
+      assert(rb.status === 200, "z29e) p29b request succeeds (status=" + rb.status + ")");
+      hist = await (await api(baseZ29, "/api/history?limit=10", { method: "GET" })).json();
+      const eb = hist.entries.find((e) => e.model === "p29b");
+      assert(eb && eb.cacheHitPct === 100, "z29f) p29b history: cacheHitPct=100 (pct=" + (eb && eb.cacheHitPct) + ")");
+      await sleep(100); // allow any (wrong) fire-and-forget to land
+      let rowsAfter = [];
+      try { rowsAfter = (await readFile(missesFile, "utf8")).split("\n").filter(Boolean); } catch { /* file may be absent -> 0 rows */ }
+      assert(
+        rowsAfter.length === 1 && received.length === 1,
+        "z29g) 100% hit: misses.jsonl still 1 row and ntfy count still 1 (rows=" + rowsAfter.length + ", ntfy=" + received.length + ")"
+      );
+    } finally {
+      childZ29.kill();
+      missSrv.close(); hitSrv.close(); ntfySrv.close();
+      await rm(dirZ29, { recursive: true, force: true });
+    }
+  }
+
+  // z30) regression: a STREAMING upstream that reports ONLY cached_tokens
+  //      (prompt_tokens_details, OpenAI style) must yield the cached/prompt
+  //      percentage, not 100% - the collector folds cached into promptCacheHit
+  //      while the miss field stays unset, and the ratio must treat that as
+  //      "no miss signal" rather than "zero misses".
+  {
+    const srv = http.createServer((req, res) => {
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+      res.write("data: " + JSON.stringify({ id: "m", choices: [{ delta: { content: "ok" } }] }) + "\n\n");
+      res.write("data: " + JSON.stringify({ id: "m", choices: [{ delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 1000, completion_tokens: 5, prompt_tokens_details: { cached_tokens: 500 } } }) + "\n\n");
+      res.write("data: [DONE]\n\n");
+      res.end();
+    });
+    const port30 = await listen(srv);
+    const cfgZ30 = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "z30", baseURL: `http://${HOST}:${port30}`, apiKeyEnv: "KEY_Z30" }],
+      models: { "m30": { providers: [{ backend: "z30", upstream: "u30" }], affinityPool: 1 } },
+      presets: { "p30": { strategy: "affinity", models: ["m30"] } },
+      backoff: BO,
+    };
+    const { child: childZ30, base: baseZ30, dir: dirZ30 } = await startRouterCfg(cfgZ30, "KEY_Z30=k\n");
+    try {
+      const rr = await api(baseZ30, "/v1/chat/completions", { body: { model: "p30", messages: [], stream: true } });
+      await rr.text();
+      const hist = await (await api(baseZ30, "/api/history?limit=5", { method: "GET" })).json();
+      const e = hist.entries.find((x) => x.model === "p30");
+      assert(
+        e && e.cacheHitPct === 50 && e.cacheHit === true,
+        "z30) cached-only streaming usage: pct=cached/prompt=50, cacheHit=true (pct=" + (e && e.cacheHitPct) + ", hit=" + (e && e.cacheHit) + ")"
+      );
+    } finally {
+      childZ30.kill();
+      srv.close();
+      await rm(dirZ30, { recursive: true, force: true });
     }
   }
 
@@ -2409,6 +2778,270 @@ async function main() {
     } finally {
       await closeUp(h);
       await rm(kd.dir, { recursive: true, force: true });
+    }
+  }
+
+  // zM) analytics dashboard: aggregate store, cooling ring, JSONL seeding,
+  //      pricing echo, health join. GET /api/dashboard returns the exact
+  //      contract shape; field names are load-bearing for the UI.
+  {
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    // zM1) seed continuity: a temp router-history.jsonl (new-style rows with
+    //      cost in the current hour + a day 3 days ago, plus one legacy row)
+    //      rolls into kpis/hourly/daily/byModel/byBackend before any traffic.
+    {
+      const seedDir = await mkdtemp(join(tmpdir(), "lmr-dash-seed-"));
+      const histPath = join(seedDir, "router-history.jsonl");
+      const now = Date.now();
+      const curHour = Math.floor(now / 3600000) * 3600000;
+      const curDay = Math.floor(now / 86400000) * 86400000;
+      const day3 = curDay - 3 * 86400000;
+      const rows = [
+        JSON.stringify({ t: curHour + 1000, callId: "s1", model: "sd1", backend: "b1", stream: false, status: 200, latencyMs: 120, promptTokens: 1000, completionTokens: 50, cacheHit: true, promptCacheHitTokens: 400, promptCacheMissTokens: 600, cost: 0.00011975, cacheSavings: 0.000084, offPeakSavings: 0.00011975, offPeak: true }),
+        JSON.stringify({ t: curHour + 2000, callId: "s2", model: "sd1", backend: "b1", stream: false, status: 200, latencyMs: 200, promptTokens: 200, completionTokens: 10, cacheHit: false, promptCacheHitTokens: 0, promptCacheMissTokens: 200, cost: 0.00002, cacheSavings: 0, offPeakSavings: 0.00002, offPeak: true }),
+        JSON.stringify({ t: day3 + 12 * 3600000, callId: "s3", model: "sd2", backend: "b2", stream: false, status: 503, latencyMs: 50, promptTokens: 0, completionTokens: 0, cost: 0, errorKind: "rate" }),
+        JSON.stringify({ t: day3 + 13 * 3600000, callId: "s4", model: "sd2", backend: "b2", stream: false, status: 200, latencyMs: 90, promptTokens: 500, completionTokens: 25, cacheHit: true, promptCacheHitTokens: 500, promptCacheMissTokens: 0, cost: 0.000005, cacheSavings: 0.0001, offPeakSavings: 0.000005 }),
+        JSON.stringify({ t: curHour + 3000, model: "sd1", backend: "b1", stream: false, status: 200, latencyMs: 60, session: "legacy" }), // legacy shape: no tokens/cost/cache fields
+      ];
+      await writeFile(histPath, rows.join("\n") + "\n");
+      const cfgSeed = {
+        port: 0, prefix: "/v1", masterKeyEnv: null,
+        backends: [
+          { id: "b1", baseURL: "http://127.0.0.1:9", apiKeyEnv: "KEY_B1" },
+          { id: "b2", baseURL: "http://127.0.0.1:9", apiKeyEnv: "KEY_B2" },
+        ],
+        models: {
+          "sd1": { providers: [{ backend: "b1", upstream: "u1" }], meta: { label: "Seeded Model One" } },
+          "sd2": { providers: [{ backend: "b2", upstream: "u2" }], meta: { label: "Seeded Model Two" } },
+        },
+        backoff: BO,
+      };
+      const { child: childM1, base: baseM1, dir: dirM1 } = await startRouterCfg(cfgSeed, "KEY_B1=k\nKEY_B2=k\n", { ROUTER_HISTORY: histPath });
+      try {
+        const d = await (await api(baseM1, "/api/dashboard", { method: "GET" })).json();
+        assert(d.kpis.requests === 5 && d.kpis.ok === 4 && d.kpis.errors === 1, "zM1a) seed: kpis.requests counts all 5 rows incl. legacy, ok/errors split (got " + d.kpis.requests + "/" + d.kpis.ok + "/" + d.kpis.errors + ")");
+        assert(d.kpis.activeModelCount === 2 && d.kpis.promptTokens === 1700 && d.kpis.completionTokens === 85, "zM1b) seed: activeModelCount + token sums (got models " + d.kpis.activeModelCount + ")");
+        assert(Math.abs(d.kpis.cost - 0.00014475) < 1e-12 && Math.abs(d.kpis.cacheHitRate - 900 / 1700) < 1e-9, "zM1c) seed: kpis.cost sums priced rows, cacheHitRate 900/1700 (got " + d.kpis.cost + ", " + d.kpis.cacheHitRate + ")");
+        const hb = d.hourly.find((x) => x.t === curHour);
+        assert(hb && hb.requests === 3 && hb.promptTokens === 1200 && hb.completionTokens === 60 && hb.cacheHitTokens === 400 && hb.cacheMissTokens === 800, "zM1d) seed: current-hour bucket holds the 3 rows of this hour (req " + (hb && hb.requests) + ")");
+        assert(hb && Math.abs(hb.cost - 0.00013975) < 1e-12 && hb.latencyAvgMs > 0 && hb.latencyMaxMs === 200, "zM1e) seed: hour bucket cost = priced sum, latencies aggregated (cost " + (hb && hb.cost) + ")");
+        assert(d.hourly.length === 24 && d.hourly[0].t === curHour - 23 * 3600000, "zM1f) seed: hourly is exactly 24 slots oldest first (got " + d.hourly.length + ")");
+        const db3 = d.daily.find((x) => x.t === day3);
+        assert(db3 && db3.requests === 2 && db3.tokens === 525 && db3.errors === 1 && Math.abs(db3.cost - 0.000005) < 1e-12, "zM1g) seed: daily includes the 3-days-ago slot with seeded totals (req " + (db3 && db3.requests) + ")");
+        assert(d.daily.length === 30 && d.daily[29].t === curDay, "zM1h) seed: daily is exactly 30 slots ending today (got " + d.daily.length + ")");
+        const m1 = d.byModel.find((x) => x.id === "sd1");
+        const m2 = d.byModel.find((x) => x.id === "sd2");
+        assert(m1 && m1.label === "Seeded Model One" && m1.requests === 3 && m1.promptTokens === 1200 && m1.ok === 3 && m1.errorRate === 0, "zM1i) seed: byModel label from meta, legacy row counted (got " + JSON.stringify(m1 && { l: m1.label, r: m1.requests }) + ")");
+        assert(m2 && m2.label === "Seeded Model Two" && m2.requests === 2 && m2.errors === 1 && m2.cost === 0.000005, "zM1j) seed: byModel error/ok split (got " + JSON.stringify(m2 && { r: m2.requests, e: m2.errors }) + ")");
+        assert(d.byBackend.length === 2 && d.byBackend.every((x) => x.state === "healthy" && x.requests > 0), "zM1k) seed: byBackend joins health for both known backends (got " + d.byBackend.length + " rows)");
+      } finally {
+        childM1.kill();
+        await rm(dirM1, { recursive: true, force: true });
+        await rm(seedDir, { recursive: true, force: true });
+      }
+    }
+
+    // zM2) live aggregation: a priced request (cache split, off-peak) flows
+    //      into kpis, byModel/byBackend rows, the current-hour bucket and the
+    //      current-day bucket with EXACT cost numbers. Pristine dashboard
+    //      shape: nulls where no data, zeros elsewhere.
+    {
+      const srvM2 = http.createServer(async (req, res) => {
+        for await (const c of req) { /* drain */ }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          id: "zM2", object: "chat.completion",
+          choices: [{ message: { role: "assistant", content: "ok" } }],
+          usage: { prompt_tokens: 1000, completion_tokens: 50, prompt_cache_hit_tokens: 400, prompt_cache_miss_tokens: 600 },
+        }));
+      });
+      const portM2 = await listen(srvM2);
+      const cfgM2 = {
+        port: 0, prefix: "/v1", masterKeyEnv: null,
+        backends: [{ id: "zb", baseURL: `http://${HOST}:${portM2}`, apiKeyEnv: "KEY_ZB" }],
+        models: {
+          "mc": { providers: [{ backend: "zb", upstream: "u" }], meta: { label: "Cost Model", pricing: { inputPerM: 0.28, cacheHitInputPerM: 0.07, outputPerM: 0.87, offPeak: true } } },
+        },
+        pricing: { peakWindows: [] },
+        backoff: BO,
+      };
+      const { child: childM2, base: baseM2, dir: dirM2 } = await startRouterCfg(cfgM2, "KEY_ZB=k\n");
+      try {
+        const d0 = await (await api(baseM2, "/api/dashboard", { method: "GET" })).json();
+        assert(d0.kpis.requests === 0 && d0.kpis.errorRate === null && d0.kpis.cacheHitRate === null && d0.kpis.cost === null && d0.kpis.offPeakShare === null, "zM2a) pristine dashboard: requests 0, rates/cost null (got req " + d0.kpis.requests + ", er " + d0.kpis.errorRate + ")");
+        assert(d0.byBackend.length === 1 && d0.byBackend[0].id === "zb" && d0.byBackend[0].requests === 0 && d0.byBackend[0].cost === null && d0.byBackend[0].state === "healthy", "zM2b) byBackend joins health: single zeroed row for the known backend (got " + d0.byBackend.length + ")");
+        assert(d0.byModel.length === 0 && d0.hourly.length === 24 && d0.daily.length === 30 && d0.cooling.length === 0, "zM2c) windows materialized, cooling ring empty (hourly " + d0.hourly.length + "/daily " + d0.daily.length + ")");
+        const rrM2 = await api(baseM2, "/v1/chat/completions", { body: { model: "mc", messages: [] } });
+        assert(rrM2.status === 200, "zM2d) priced request succeeds (status=" + rrM2.status + ")");
+        const d = await (await api(baseM2, "/api/dashboard", { method: "GET" })).json();
+        assert(d.kpis.requests === 1 && d.kpis.ok === 1 && d.kpis.errors === 0 && d.kpis.errorRate === 0, "zM2e) kpis: 1 ok request, errorRate 0 (got " + JSON.stringify([d.kpis.requests, d.kpis.ok, d.kpis.errors, d.kpis.errorRate]) + ")");
+        assert(d.kpis.promptTokens === 1000 && d.kpis.completionTokens === 50 && d.kpis.cacheHitTokens === 400 && d.kpis.cacheMissTokens === 600 && d.kpis.cacheHitRate === 0.4, "zM2f) kpis tokens + cacheHitRate 400/1000 (got rate " + d.kpis.cacheHitRate + ")");
+        assert(d.kpis.cost === 0.00011975 && d.kpis.cacheSavings === 0.000084 && d.kpis.offPeakSavings === 0.00011975 && d.kpis.offPeakRequests === 1 && d.kpis.offPeakShare === 1 && d.kpis.cooledBackends === 0, "zM2g) kpis cost fields exact (got cost " + d.kpis.cost + ")");
+        const bm = d.byModel.find((x) => x.id === "mc");
+        assert(bm && bm.label === "Cost Model" && bm.requests === 1 && bm.ok === 1 && bm.promptTokens === 1000 && bm.completionTokens === 50 && bm.cost === 0.00011975 && bm.cacheHitRate === 0.4, "zM2h) byModel row: label from meta + exact tokens/cost (got " + JSON.stringify(bm && { r: bm.requests, c: bm.cost }) + ")");
+        const bb = d.byBackend.find((x) => x.id === "zb");
+        assert(bb && bb.requests === 1 && bb.ok === 1 && bb.errors === 0 && bb.errorRate === 0 && bb.cost === 0.00011975 && bb.cacheHits === 1 && bb.cacheKnown === 1 && bb.cacheHitRate === 0.4 && bb.state === "healthy" && bb.lastErrorKind === null && bb.latencyAvgMs > 0 && bb.latencyMaxMs >= bb.latencyAvgMs, "zM2i) byBackend row: traffic merged onto the health join (got " + JSON.stringify(bb && { r: bb.requests, c: bb.cost, s: bb.state }) + ")");
+        const histM2 = await (await api(baseM2, "/api/history?limit=5", { method: "GET" })).json();
+        const eM2 = (histM2.entries || []).find((x) => x.model === "mc");
+        const slotM2 = Math.floor((eM2 ? eM2.t : Date.now()) / 3600000) * 3600000;
+        const hbM2 = d.hourly.find((x) => x.t === slotM2);
+        assert(hbM2 && hbM2.requests === 1 && hbM2.cost === 0.00011975 && hbM2.promptTokens === 1000 && hbM2.latencyAvgMs > 0 && hbM2.latencyMaxMs >= hbM2.latencyAvgMs, "zM2j) current-hour bucket holds the live request (slot " + slotM2 + ", req " + (hbM2 && hbM2.requests) + ")");
+        const daySlotM2 = Math.floor((eM2 ? eM2.t : Date.now()) / 86400000) * 86400000;
+        const dbM2 = d.daily.find((x) => x.t === daySlotM2);
+        assert(dbM2 && dbM2.requests === 1 && dbM2.tokens === 1050 && dbM2.cost === 0.00011975 && dbM2.cacheHitRate === 0.4 && dbM2.errors === 0, "zM2k) current-day bucket holds the live request (tokens " + (dbM2 && dbM2.tokens) + ")");
+      } finally {
+        childM2.kill();
+        srvM2.close();
+        await rm(dirM2, { recursive: true, force: true });
+      }
+    }
+
+    // zM3) error counting + cache denominators: a 429-exhausted flow bumps
+    //      kpis.errors/errorRate; a signal request sets cacheHitRate 0.4 and a
+    //      signal-less request (no usage at all) must NOT corrupt it.
+    {
+      let callsM3 = 0;
+      const srvM3 = http.createServer(async (req, res) => {
+        for await (const c of req) { /* drain */ }
+        callsM3++;
+        if (callsM3 === 1) {
+          res.writeHead(429, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: { message: "rate limited" } }));
+          return;
+        }
+        if (callsM3 === 2) {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ id: "zM3", choices: [{ message: { role: "assistant", content: "hit" } }], usage: { prompt_tokens: 1000, completion_tokens: 50, prompt_cache_hit_tokens: 400, prompt_cache_miss_tokens: 600 } }));
+          return;
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ id: "zM3b", choices: [{ message: { role: "assistant", content: "nosig" } }] })); // no usage -> no cache signal
+      });
+      const portM3 = await listen(srvM3);
+      const cfgM3 = {
+        port: 0, prefix: "/v1", masterKeyEnv: null,
+        backends: [{ id: "zb", baseURL: `http://${HOST}:${portM3}`, apiKeyEnv: "KEY_ZB" }],
+        models: { "mf": { providers: [{ backend: "zb", upstream: "u" }] } },
+        backoff: BO,
+      };
+      const { child: childM3, base: baseM3, dir: dirM3 } = await startRouterCfg(cfgM3, "KEY_ZB=k\n");
+      try {
+        await api(baseM3, "/v1/chat/completions", { body: { model: "mf", messages: [] } }); // 503 exhausted
+        await api(baseM3, "/v1/chat/completions", { body: { model: "mf", messages: [] } }); // 200 with cache split
+        await api(baseM3, "/v1/chat/completions", { body: { model: "mf", messages: [] } }); // 200 without any usage
+        const d = await (await api(baseM3, "/api/dashboard", { method: "GET" })).json();
+        assert(d.kpis.requests === 3 && d.kpis.ok === 2 && d.kpis.errors === 1 && d.kpis.errorRate === 1 / 3, "zM3a) error counting: 503 exhaust bumps errors, errorRate 1/3 (got " + JSON.stringify([d.kpis.requests, d.kpis.ok, d.kpis.errors, d.kpis.errorRate]) + ")");
+        assert(d.kpis.cacheHitRate === 0.4 && d.kpis.cacheHitTokens === 400 && d.kpis.cacheMissTokens === 600, "zM3b) cache denominator: signal request sets 0.4, no-signal request leaves it untouched (got rate " + d.kpis.cacheHitRate + ", hit " + d.kpis.cacheHitTokens + ")");
+        assert(d.kpis.cost === null && d.kpis.cacheSavings === null && d.kpis.offPeakSavings === null, "zM3c) unpriced traffic keeps cost null (got " + d.kpis.cost + ")");
+        const bb = d.byBackend.find((x) => x.id === "zb");
+        assert(bb && bb.requests === 3 && bb.ok === 2 && bb.errors === 1 && bb.errorRate === 1 / 3 && bb.cacheHits === 1 && bb.cacheKnown === 1, "zM3d) byBackend mirrors the error/cache split (got " + JSON.stringify(bb && { r: bb.requests, e: bb.errors }) + ")");
+      } finally {
+        childM3.kill();
+        srvM3.close();
+        await rm(dirM3, { recursive: true, force: true });
+      }
+    }
+
+    // zM4) cooling ring: 429 rate-limit cools -> ring {action cool, kind rate};
+    //      after the short backoff elapses the next request observes the lazy
+    //      expiry (expire event) and re-cools; admin uncool records the uncool
+    //      event newest-first. Events keep {t, backend, action, kind, manual}.
+    {
+      const srvM4 = http.createServer(async (req, res) => {
+        for await (const c of req) { /* drain */ }
+        res.writeHead(429, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "rate limited" } }));
+      });
+      const portM4 = await listen(srvM4);
+      const cfgM4 = {
+        port: 0, prefix: "/v1", masterKeyEnv: null,
+        backends: [{ id: "zb", baseURL: `http://${HOST}:${portM4}`, apiKeyEnv: "KEY_ZB" }],
+        models: { "mf": { providers: [{ backend: "zb", upstream: "u" }] } },
+        // rateBaseMs/rateMaxMs are the keys backoffFor actually reads (the
+        // suite-wide BO's rateLimit* names are silently ignored - a pre-existing
+        // mismatch) so the cool here really is short and the lazy expiry is
+        // observable within the test.
+        backoff: { rateBaseMs: 50, rateMaxMs: 200, serverBaseMs: 50, serverMaxMs: 200, authBaseMs: 50, authMaxMs: 200, weeklyDefaultMs: 1000 },
+      };
+      const { child: childM4, base: baseM4, dir: dirM4 } = await startRouterCfg(cfgM4, "KEY_ZB=k\n");
+      try {
+        await api(baseM4, "/v1/chat/completions", { body: { model: "mf", messages: [] } }); // 503 exhausted -> cool
+        await sleep(300); // outlast the 50ms rate backoff so the next request sees it expired
+        await api(baseM4, "/v1/chat/completions", { body: { model: "mf", messages: [] } }); // expired -> expire -> retried -> re-cooled -> 503
+        const d = await (await api(baseM4, "/api/dashboard", { method: "GET" })).json();
+        const evts = d.cooling;
+        assert(evts.length === 3, "zM4a) cooling ring: cool + expire + recool recorded (got " + evts.length + ")");
+        assert(evts[0] && evts[0].action === "cool" && evts[0].kind === "rate" && evts[0].backend === "zb" && evts[0].manual === false && typeof evts[0].t === "number", "zM4b) newest first: the re-cool heads the ring (got " + JSON.stringify(evts[0]) + ")");
+        assert(evts[1] && evts[1].action === "expire" && evts[1].backend === "zb" && evts[1].kind === "rate" && evts[1].manual === false, "zM4c) lazy expiry lands between the cools (got " + JSON.stringify(evts[1]) + ")");
+        assert(evts[2] && evts[2].action === "cool" && evts[2].kind === "rate", "zM4d) the first cool trails (got " + JSON.stringify(evts[2]) + ")");
+        const ru = await api(baseM4, "/admin/backend", { method: "POST", body: { id: "zb", action: "uncool" } });
+        assert(ru.status === 200, "zM4e) admin uncool ok (status=" + ru.status + ")");
+        const d2 = await (await api(baseM4, "/api/dashboard", { method: "GET" })).json();
+        const ev2 = d2.cooling;
+        assert(ev2[0] && ev2[0].action === "uncool" && ev2[0].backend === "zb" && ev2[0].kind === "rate" && ev2[0].manual === false, "zM4f) uncool event newest-first with kind from the original failure (got " + JSON.stringify(ev2[0]) + ")");
+        assert(ev2.length === evts.length + 1 && ev2.slice(1).every((x, i) => x.action === evts[i].action && x.backend === evts[i].backend && x.kind === evts[i].kind), "zM4g) ring order preserved, exactly one new event (got " + ev2.length + ")");
+      } finally {
+        childM4.kill();
+        srvM4.close();
+        await rm(dirM4, { recursive: true, force: true });
+      }
+    }
+
+    // zM5) pricing echo: offPeakMultiplier + peakWindows mirrored from the
+    //      config, modelsWithOffPeak = ids whose meta.pricing.offPeak is true.
+    {
+      const cfgM5 = {
+        port: 0, prefix: "/v1", masterKeyEnv: null,
+        backends: [{ id: "pb", baseURL: "http://127.0.0.1:9", apiKeyEnv: "KEY_PB" }],
+        models: {
+          "pm1": { providers: [{ backend: "pb", upstream: "u1" }], meta: { pricing: { inputPerM: 1, outputPerM: 1, offPeak: true } } },
+          "pm2": { providers: [{ backend: "pb", upstream: "u2" }], meta: { pricing: { inputPerM: 1, outputPerM: 1 } } },
+          "pm3": { providers: [{ backend: "pb", upstream: "u3" }] },
+        },
+        pricing: { offPeakMultiplier: 0.35, peakWindows: [{ days: "1-5", start: "02:00", end: "05:00" }] },
+        backoff: BO,
+      };
+      const { child: childM5, base: baseM5, dir: dirM5 } = await startRouterCfg(cfgM5, "KEY_PB=k\n");
+      try {
+        const d = await (await api(baseM5, "/api/dashboard", { method: "GET" })).json();
+        assert(d.pricing.offPeakMultiplier === 0.35, "zM5a) pricing.offPeakMultiplier echoes config (got " + d.pricing.offPeakMultiplier + ")");
+        assert(Array.isArray(d.pricing.peakWindows) && d.pricing.peakWindows.length === 1 && d.pricing.peakWindows[0].start === "02:00" && d.pricing.peakWindows[0].end === "05:00", "zM5b) pricing.peakWindows echoes config (got " + JSON.stringify(d.pricing.peakWindows) + ")");
+        assert(Array.isArray(d.pricing.modelsWithOffPeak) && d.pricing.modelsWithOffPeak.length === 1 && d.pricing.modelsWithOffPeak[0] === "pm1", "zM5c) modelsWithOffPeak = ids with meta.pricing.offPeak true (got " + JSON.stringify(d.pricing.modelsWithOffPeak) + ")");
+      } finally {
+        childM5.kill();
+        await rm(dirM5, { recursive: true, force: true });
+      }
+    }
+
+    // zM6) byBackend health join: a long-cooling backend (429, 60s backoff)
+    //      renders state cooling / fails 1 / lastErrorKind rate, and
+    //      kpis.cooledBackends counts it.
+    {
+      const srvM6 = http.createServer(async (req, res) => {
+        for await (const c of req) { /* drain */ }
+        res.writeHead(429, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "rate limited" } }));
+      });
+      const portM6 = await listen(srvM6);
+      const cfgM6 = {
+        port: 0, prefix: "/v1", masterKeyEnv: null,
+        backends: [{ id: "zb", baseURL: `http://${HOST}:${portM6}`, apiKeyEnv: "KEY_ZB" }],
+        models: { "mf": { providers: [{ backend: "zb", upstream: "u" }] } },
+        backoff: { rateBaseMs: 60000, rateMaxMs: 120000, serverBaseMs: 50, serverMaxMs: 200, authBaseMs: 50, authMaxMs: 200, weeklyDefaultMs: 1000 },
+      };
+      const { child: childM6, base: baseM6, dir: dirM6 } = await startRouterCfg(cfgM6, "KEY_ZB=k\n");
+      try {
+        await api(baseM6, "/v1/chat/completions", { body: { model: "mf", messages: [] } }); // 503 -> cools for 60s
+        const d = await (await api(baseM6, "/api/dashboard", { method: "GET" })).json();
+        const row = d.byBackend.find((x) => x.id === "zb");
+        assert(row && row.state === "cooling" && row.fails === 1 && row.lastErrorKind === "rate" && row.manual === false && row.requests === 1 && row.errors === 1 && row.errorRate === 1, "zM6a) byBackend joins health: 429-cooled backend renders cooling (got " + JSON.stringify(row && { s: row.state, f: row.fails, lk: row.lastErrorKind }) + ")");
+        assert(d.kpis.cooledBackends === 1, "zM6b) kpis.cooledBackends counts the cooling backend (got " + d.kpis.cooledBackends + ")");
+      } finally {
+        childM6.kill();
+        srvM6.close();
+        await rm(dirM6, { recursive: true, force: true });
+      }
     }
   }
 

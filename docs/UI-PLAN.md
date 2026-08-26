@@ -228,3 +228,69 @@ Gaps to close per this plan:
 3. Should backend state flips surface as toasts ("go-primary cooled: weekly limit")? (Recommend a subtle log line in the history table rather than toasts; toasts are noise.)
 4. Should the UI offer a "force direct" quick-switch in Playground (a button that sends with model flash-direct)? (Recommend no — the model selector already covers it.)
 5. Confirm the Playground is the right home for session-affinity demoing, vs a dedicated "Routing" tab. (Recommend keeping it in Playground.)
+
+---
+
+## 8. Analytics dashboard (shipped)
+
+The Dashboard tab was rebuilt around the analytics view fed by the new
+`GET /api/dashboard` endpoint: live KPIs, hand-rolled SVG charts, savings
+badges, a cooling timeline, and a filtered request history with a cost column.
+Zero external assets; every chart is drawn in the single `index.html` file.
+
+### 8.1 Sections built
+
+- **KPI strip**: requests, total tokens (in / out), spend, cache hit rate,
+  error rate, cooled backends, off-peak share, uptime. Spend / cache / rate
+  cells render "n/a" while their data is null; zeros are real once data exists.
+- **Donuts**: request share by backend, by model, and the cache hit / miss
+  token split, plus a cache trend line.
+- **Spend chart** with a 24h / 7d range toggle: per-hour (hourly) or per-day
+  (daily) cost bars with peak-window band shading drawn from the dashboard
+  payload's `pricing.peakWindows`, so off-peak hours read at a glance.
+- **Tokens chart**: stacked bars (miss / hit / output tokens) over the same
+  24h / 7d range.
+- **Latency chart** (avg / max lines) and **error chart**.
+- **Savings badges**: cache savings (hit tokens at the full input price vs the
+  cache-hit rate, measured at peak rates) and off-peak savings (what the
+  off-peak discount removed), plus the off-peak request share.
+- **Cooling timeline**: the cooling-event ring (cool / uncool / expire /
+  success / reset) with a colored dot per action and relative timestamps.
+- **Backend cards**: healthy / cooling with countdowns and Cool / Uncool, now
+  driven by the dashboard payload's `byBackend` state list.
+- **Request history**: client-side filters (model / backend / errors-only) and
+  a Cost column whose tooltip carries cache savings / off-peak savings;
+  unpriced models render "no pricing configured".
+
+### 8.2 Data sources
+
+- `GET /api/dashboard` (3 s poll): one aggregate payload with `kpis`,
+  `byBackend`, `byModel`, `hourly` (exactly 24 hour-start slots), `daily`
+  (exactly 30 UTC-midnight slots), `cooling` (ring) and `pricing` (resolved
+  windows + `modelsWithOffPeak`). Seeded at startup from the
+  `router-history.jsonl` tail (last 20 MB) so charts survive restarts. The
+  client validates the payload shape (`kpis` present, `hourly` an array) and
+  falls back to chart-empty states instead of a broken page.
+- `GET /api/history?limit=500` (5 s poll): the per-request rows for the
+  filtered history table; rows now also carry `promptCacheHitTokens`,
+  `promptCacheMissTokens`, `errorKind`, `cost`, `cacheSavings`,
+  `offPeakSavings`, `offPeak`.
+
+### 8.3 Polling cadence
+
+- Dashboard payload: every 3 s (`setInterval(pollDashboard, 3000)`); history:
+  every 5 s (`setInterval(pollHistory, 5000)`, limit 500). Both are gated by
+  the Auto-refresh checkbox and both start only once the auth gate clears (the
+  login overlay); the uptime KPI ticks locally between polls.
+- Section redraws stay change-detected: an unchanged poll result never rebuilds
+  identical DOM (existing principle 2, "Change detection everywhere"), so the
+  charts do not flicker on the 3 s cadence.
+
+### 8.4 Pricing notes (config side)
+
+- Cost is null until a model declares `meta.pricing` (the UI renders "n/a" /
+  "pricing not configured"); zeros become real once pricing applies.
+- The off-peak discount applies only to models with
+  `meta.pricing.offPeak === true`, outside all weekday peak windows (UTC);
+  weekends are entirely off-peak. The multiplier and windows come from the
+  top-level `pricing` key. Contract: DESIGN-3LAYER.md section 14.

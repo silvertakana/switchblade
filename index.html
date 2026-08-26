@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
 <title>Switchblade</title>
 <style>
   :root {
@@ -258,6 +259,7 @@
   /* ---- request history: cache miss row tint ---- */
   .status-miss { color: var(--faint); }
   .status-hit { color: var(--green); font-weight: 600; }
+  .status-warn { color: var(--amber); }
 
   /* ---- request history: call id cell + copy button ---- */
   .call-cell { white-space: nowrap; }
@@ -378,6 +380,99 @@
   @keyframes shimmer { 0% { background-position: -200% 0; } 100% { background-position: 200% 0; } }
   .skeleton { background: linear-gradient(90deg, var(--panel) 25%, var(--panel-2) 50%, var(--panel) 75%); background-size: 200% 100%; animation: shimmer 1.4s linear infinite; border-radius: var(--radius); height: 14px; margin: 6px 0; }
 
+  /* ---- analytics dashboard ---- */
+  .dash-grid { display: flex; flex-direction: column; gap: 16px; }
+  .kpi-strip { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 10px; }
+  .kpi { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: clamp(10px, 1.2vw, 14px) clamp(12px, 1.6vw, 14px); min-width: 0; }
+  .kpi .k { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.7px; display: flex; align-items: center; gap: 5px; }
+  .kpi .k svg { width: 12px; height: 12px; flex-shrink: 0; }
+  .kpi .v { font-size: clamp(20px, 0.8vw + 17px, 24px); font-weight: 600; font-family: var(--mono); font-variant-numeric: tabular-nums; margin-top: 4px; line-height: 1.15; }
+  .kpi .v.na { color: var(--muted); font-weight: 400; font-size: 16px; }
+  .kpi .s { font-size: 10px; color: var(--faint); margin-top: 3px; letter-spacing: 0.2px; }
+  .peak-badge { display: inline-flex; align-items: center; gap: 8px; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 9px 14px; font-size: 12px; color: var(--muted); }
+  .peak-badge .pill { font-weight: 700; letter-spacing: 0.5px; padding: 2px 10px; border-radius: 11px; text-transform: uppercase; font-size: 11px; }
+  .peak-badge .pill.peak { background: rgba(251,191,36,.14); color: var(--amber); }
+  .peak-badge .pill.offpeak { background: rgba(74,222,128,.14); color: var(--green); }
+  .peak-badge .pill.na { background: rgba(154,154,154,.15); color: var(--muted); }
+  .peak-badge .why { color: var(--faint); }
+  .peak-badge .why b { color: var(--text); font-family: var(--mono); font-weight: 500; }
+  .chart-grid { display: grid; gap: 14px; }
+  .chart-grid.row-a { grid-template-columns: repeat(3, 1fr); }
+  .chart-grid.row-b { grid-template-columns: 1.7fr 1fr; }
+  .chart-grid.row-c { grid-template-columns: 1.1fr 1fr; }
+  .chart-card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px; min-width: 0; }
+  .chart-card h3 { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.9px; margin-bottom: 10px; font-weight: 600; display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+  .chart-card h3 .togglers { display: inline-flex; gap: 4px; }
+  .chart-card h3 .togglers button { padding: 2px 9px; font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px; border-radius: 6px; }
+  .chart-card h3 .togglers button.on { background: var(--text); color: #0a0a0a; border-color: var(--text); font-weight: 700; }
+  .chart-card .help { cursor: help; border-bottom: 1px dotted var(--faint); }
+  .chart-head-row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+  .chart-body { position: relative; }
+  .chart-body svg { width: 100%; height: auto; display: block; }
+  .chart-empty { color: var(--muted); font-size: 12px; padding: 26px 8px; text-align: center; border: 1px dashed var(--border); border-radius: var(--radius); }
+  .chart-empty .sub { color: var(--faint); font-size: 11px; margin-top: 3px; }
+  .donut-wrap { display: flex; gap: 14px; align-items: center; }
+  .donut-svg { flex-shrink: 0; width: 130px; max-width: 100%; }
+  .donut-legend { display: flex; flex-direction: column; gap: 5px; min-width: 0; flex: 1; font-size: 12px; }
+  .donut-legend .li { display: flex; align-items: center; gap: 7px; }
+  .donut-legend .sw { width: 9px; height: 9px; border-radius: 2px; flex-shrink: 0; }
+  .donut-legend .ln { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .donut-legend .lv { margin-left: auto; font-family: var(--mono); color: var(--text); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .donut-legend .lv .pct { color: var(--faint); margin-left: 6px; }
+  .donut-legend .lv .pct { color: var(--faint); margin-left: 5px; }
+  .spark { margin-top: 12px; border-top: 1px solid var(--border); padding-top: 10px; }
+  .spark .spark-head { font-size: 10px; color: var(--faint); text-transform: uppercase; letter-spacing: 0.7px; margin-bottom: 6px; }
+  .savings-row { display: flex; gap: 10px; flex-wrap: wrap; }
+  .savings-badge { display: flex; align-items: center; gap: 8px; background: var(--panel-2); border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 12px; font-size: 11px; color: var(--muted); }
+  .savings-badge .amt { font-family: var(--mono); font-size: 15px; font-weight: 600; color: var(--green); }
+  .savings-badge .amt.na { color: var(--faint); font-weight: 400; font-size: 13px; }
+  .savings-badge .desc { max-width: 190px; color: var(--faint); }
+  .savings-badge .desc b { color: var(--muted); }
+  .cool-list { display: flex; flex-direction: column; gap: 3px; max-height: 250px; overflow-y: auto; padding-right: 4px; }
+  .cool-row { display: flex; align-items: center; gap: 9px; font-size: 12px; padding: 5px 8px; border-radius: 6px; }
+  .cool-row:hover { background: var(--panel-2); }
+  .cool-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+  .cool-dot.cool { background: var(--amber); }
+  .cool-dot.uncool { background: var(--green); }
+  .cool-dot.expire { background: var(--muted); }
+  .cool-dot.success { background: var(--green); }
+  .cool-dot.reset { background: #60a5fa; }
+  .cool-what { font-weight: 600; text-transform: uppercase; font-size: 10px; letter-spacing: 0.4px; min-width: 44px; }
+  .cool-what.cool { color: var(--amber); }
+  .cool-what.uncool, .cool-what.success { color: var(--green); }
+  .cool-what.expire { color: var(--muted); }
+  .cool-what.reset { color: #60a5fa; }
+  .cool-backend { font-family: var(--mono); color: var(--text); }
+  .cool-kind { color: var(--faint); font-size: 10px; font-family: var(--mono); }
+  .cool-manual { color: var(--amber); font-size: 10px; font-family: var(--mono); }
+  .cool-time { margin-left: auto; color: var(--faint); font-size: 10px; font-family: var(--mono); white-space: nowrap; }
+  .tooltip-row { font-size: 11px; color: var(--faint); }
+  .tooltip-row b { color: var(--text); font-family: var(--mono); font-weight: 500; }
+
+  /* ---- responsive safety: wide content scrolls inside its card, columns never crush ---- */
+  #view-history table { min-width: 900px; }
+  #view-dashboard table { min-width: 560px; }
+  .donut-legend .li { min-width: 0; }
+  .peak-badge { flex-wrap: wrap; }
+  .savings-badge { min-width: 0; }
+
+  /* ---- history filters ---- */
+  .filter-bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
+  .filter-bar input[type="text"] { min-width: 130px; }
+  .filter-bar select { padding: 6px 8px; }
+  .filter-bar label.check { white-space: nowrap; }
+  .cost-na { color: var(--faint); }
+
+  @media (max-width: 1000px) {
+    .kpi-strip { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .savings-row { flex-direction: column; }
+    /* tablets (641-1000px): chart grids collapse to 2 columns; the third
+       row-a card (cache split + sparkline) spans the full row */
+    .chart-grid.row-a { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .chart-grid.row-b, .chart-grid.row-c { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .chart-grid.row-a .chart-card:nth-child(3) { grid-column: 1 / -1; }
+  }
+
   /* ---- scrollbars ---- */
   ::-webkit-scrollbar { width: 10px; height: 10px; }
   ::-webkit-scrollbar-track { background: var(--bg); }
@@ -415,17 +510,11 @@
     .tab { flex: 1; padding: 12px 8px; font-size: 14px; text-align: center; }
 
     /* touch targets */
-    button, select, input[type="text"], input[type="number"], textarea { min-height: 40px; font-size: 14px; }
+    button:not(.call-copy), select, input[type="text"], input[type="number"], textarea { min-height: 40px; font-size: 14px; }
     label.check { min-height: 40px; }
 
-    /* stacked history table: each row becomes a card of label:value pairs */
-    #historyBody tr { display: block; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 12px; margin-bottom: 8px; }
-    #historyBody td { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; padding: 3px 0; border: none; font-size: 13px; }
-    #historyBody td::before { content: attr(data-label); color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600; flex-shrink: 0; }
-    #historyBody td.mono::before { font-family: inherit; }
-    #historyBody td:first-child { padding-top: 0; }
-    #historyBody td:last-child { padding-bottom: 0; }
-    #historyBody .skeleton { height: 40px; }
+    /* history table keeps its columns on phones and scrolls horizontally
+       inside the card (min-width rules above) */
 
     /* presets/models tables keep horizontal scroll but tighten */
     table { font-size: 12px; }
@@ -460,6 +549,38 @@
     .compare-config { flex-direction: column; align-items: flex-start; }
     .debug-grid { grid-template-columns: 1fr; }
     .bar-pct { font-size: 10px; }
+
+    /* charts stack to one column on phones */
+    .chart-grid.row-a, .chart-grid.row-b, .chart-grid.row-c { grid-template-columns: 1fr; }
+    .chart-grid.row-a .chart-card:nth-child(3) { grid-column: auto; }
+
+    /* donut cards: legend drops below the donut on narrow screens */
+    .donut-wrap { flex-direction: column; align-items: stretch; }
+    .donut-svg { align-self: center; }
+
+    /* history filters: text inputs go full width, the cache select and
+       errors-only checkbox align on their own line */
+    .filter-bar { align-items: stretch; }
+    .filter-bar input[type="text"] { flex: 1 1 100%; min-width: 0; }
+
+    /* cooling events + banners wrap instead of overflowing */
+    .cool-row { flex-wrap: wrap; row-gap: 2px; }
+    .banner { flex-wrap: wrap; }
+    .peak-badge { width: 100%; }
+
+    /* touch: reachable controls */
+    .detail-head .close-x { width: 40px; height: 40px; }
+    .linkbtn { min-height: 40px; }
+    .chart-card h3 .togglers button { padding: 6px 12px; }
+    #detailPanel .detail-head { padding: 12px 14px; }
+  }
+  @media (max-width: 480px) {
+    .kpi-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  }
+  /* coarse pointers (touch screens): hit targets stay >= ~40px tall everywhere */
+  @media (pointer: coarse) {
+    button:not(.call-copy), select, input[type="text"], input[type="number"], textarea, label.check, summary, .linkbtn { min-height: 40px; }
+    .tab { min-height: 44px; }
   }
   @media (max-width: 380px) {
     .chat-actions-right { grid-template-columns: 1fr; }
@@ -497,14 +618,90 @@
 
 <main>
   <div id="view-dashboard" class="view active" role="tabpanel" aria-labelledby="tab-dashboard">
+    <div class="dash-grid">
     <section>
-      <h2 data-icon="server">Backends</h2>
-      <div id="backends" class="cards"><div class="skeleton" style="grid-column:1/-1"></div></div>
+      <h2 data-icon="activity">Overview</h2>
+      <div class="peak-badge" id="peakBadge" title="Pricing is per model: deepseek models opt into off-peak (half price outside weekday peak windows, UTC).">
+        <span class="pill na">loading</span><span class="why">Fetching pricing...</span>
+      </div>
+      <div id="kpiStrip" class="kpi-strip"><div class="skeleton" style="grid-column:1/-1"></div></div>
     </section>
 
     <section>
-      <h2 data-icon="activity">Traffic stats</h2>
-      <div id="stats"><div class="skeleton"></div><div class="skeleton"></div></div>
+      <h2 data-icon="pie">Traffic &amp; cache</h2>
+      <div class="chart-grid row-a">
+        <div class="chart-card">
+          <h3>By provider</h3>
+          <div class="chart-body" id="donutBackend"><div class="skeleton"></div></div>
+        </div>
+        <div class="chart-card">
+          <h3>By model</h3>
+          <div class="chart-body" id="donutModel"><div class="skeleton"></div></div>
+        </div>
+        <div class="chart-card">
+          <h3>Cache split</h3>
+          <div class="chart-body" id="donutCache"><div class="skeleton"></div></div>
+          <div class="spark" id="cacheTrendWrap" style="display:none">
+            <div class="spark-head">Cache hit rate by day</div>
+            <div class="chart-body" id="cacheTrend"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2 data-icon="dollar">Spend</h2>
+      <div class="chart-grid row-b">
+        <div class="chart-card">
+          <h3>Spend <span class="togglers" id="spendRangeToggle"><button data-range="24h" class="on">24h</button><button data-range="7d">7d</button></span></h3>
+          <div class="chart-body" id="spendChart"><div class="skeleton"></div></div>
+          <div class="tooltip-row" style="margin-top:8px">Shaded bands = <b>peak windows</b> (UTC weekday windows, shown in local time). Peaks are standard price.</div>
+        </div>
+        <div class="chart-card">
+          <h3>Savings</h3>
+          <div class="savings-row">
+            <div class="savings-badge" title="What cache hits saved vs paying the full input price for cached tokens. Peak rates.">
+              <span class="amt" id="cacheSavingsAmt">-</span>
+              <span class="desc">cache savings<br><b>saved vs full-price cached input</b></span>
+            </div>
+            <div class="savings-badge" title="What the off-peak discount removed vs the peak price. Only models opted into off-peak pricing.">
+              <span class="amt" id="offPeakSavingsAmt">-</span>
+              <span class="desc">off-peak savings<br><b>discount applied off-peak</b></span>
+            </div>
+            <div class="savings-badge" title="Requests sent while off-peak pricing applied (share of all requests).">
+              <span class="amt" id="offPeakShareAmt">-</span>
+              <span class="desc">off-peak share<br><b>requests at discounted rate</b></span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2 data-icon="box">Operations</h2>
+      <div class="chart-grid row-c">
+        <div class="chart-card">
+          <h3>Tokens per hour <span class="togglers" id="tokensRangeToggle"><button data-range="24h" class="on">24h</button><button data-range="7d">7d</button></span></h3>
+          <div class="chart-body" id="tokensChart"><div class="skeleton"></div></div>
+        </div>
+        <div class="chart-card">
+          <h3>Latency &amp; errors</h3>
+          <div class="chart-body" id="latencyChart"><div class="skeleton"></div></div>
+        </div>
+        <div class="chart-card">
+          <h3>Error rate per hour</h3>
+          <div class="chart-body" id="errorChart"><div class="skeleton"></div></div>
+        </div>
+        <div class="chart-card">
+          <h3>Cooling events</h3>
+          <div id="coolingList" class="cool-list"><div class="skeleton"></div></div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2 data-icon="server">Backends</h2>
+      <div id="backends" class="cards"><div class="skeleton" style="grid-column:1/-1"></div></div>
     </section>
 
     <section>
@@ -531,18 +728,31 @@
       <summary>Config viewer</summary>
       <pre id="configView">Loading...</pre>
     </details>
+    </div>
   </div>
 
   <div id="view-history" class="view" role="tabpanel" aria-labelledby="tab-history">
     <section>
       <h2 data-icon="clock">Request history</h2>
       <div id="historyCacheSummary" class="stat-overview" style="margin-bottom:10px;display:none"></div>
+      <div class="filter-bar" id="historyFilters">
+        <input type="text" id="hfModel" placeholder="Filter model..." spellcheck="false" autocomplete="off">
+        <input type="text" id="hfBackend" placeholder="Filter backend..." spellcheck="false" autocomplete="off">
+        <select id="hfCache" aria-label="Cache state filter">
+          <option value="">Cache: all</option>
+          <option value="hit">hit</option>
+          <option value="miss">miss</option>
+          <option value="unknown">unknown</option>
+        </select>
+        <label class="check" title="Only rows with a failure (status >= 400 or an upstream error kind)"><input type="checkbox" id="hfErrors"> errors only</label>
+        <span id="historyFilterCount" class="cost-na"></span>
+      </div>
       <div style="overflow-x:auto">
         <table>
           <thead>
-            <tr><th scope="col">Call</th><th scope="col">Time</th><th scope="col">Model</th><th scope="col">Backend</th><th scope="col">Stream</th><th scope="col">Status</th><th scope="col">Latency (ms)</th><th scope="col">TTFT (ms)</th><th scope="col">Tokens</th><th scope="col">Cache</th><th scope="col">Session</th></tr>
+            <tr><th scope="col">Call</th><th scope="col">Time</th><th scope="col">Model</th><th scope="col">Backend</th><th scope="col">Stream</th><th scope="col">Status</th><th scope="col">Latency (ms)</th><th scope="col">TTFT (ms)</th><th scope="col">Tokens</th><th scope="col">Cache</th><th scope="col">Cost</th><th scope="col">Session</th></tr>
           </thead>
-          <tbody id="historyBody"><tr><td colspan="11"><div class="skeleton"></div></td></tr></tbody>
+          <tbody id="historyBody"><tr><td colspan="12"><div class="skeleton"></div></td></tr></tbody>
         </table>
       </div>
     </section>
@@ -732,6 +942,10 @@ const state = {
   stats: null,
   history: null,
   cfg: null,
+  dash: null,          // /api/dashboard payload (analytics dashboard)
+  dashOk: false,       // a dashboard payload has loaded at least once
+  histOk: false,       // a history payload has loaded at least once
+  dashFetchedAt: 0,    // wall clock of the last successful dashboard fetch (live uptime)
   unreachable: false,
   passwordSet: false,
   uiAuthed: false,
@@ -961,20 +1175,20 @@ function sectionChanged(name, data) {
 function render() {
   renderHeader();
   renderAlerts();
-  renderBackends();
-  renderStats();
+  renderAnalytics();
   renderHistory();
 }
 
 function renderHeader() {
-  const health = state.health;
+  const port = state.cfg && state.cfg.port != null ? state.cfg.port : (state.health && state.health.port != null ? state.health.port : null);
+  const cooling = !!(state.dash && Array.isArray(state.dash.byBackend) && state.dash.byBackend.some((b) => b.state === "cooling"));
   // Stable snapshot for change detection. Clock-driven values (uptimeMs) change
   // every poll, so they must NOT gate header updates; uptime is updated live
   // below and by the 1s ticker instead.
   const stable = {
-    port: health && health.port != null ? health.port : null,
+    port: port,
     unreachable: !!state.unreachable,
-    cooling: !!(health && Array.isArray(health.backends) && health.backends.some((b) => b.state === "cooling")),
+    cooling: cooling,
   };
   if (sectionChanged("header", stable)) {
     $("port").textContent = stable.port != null ? stable.port : "-";
@@ -993,14 +1207,14 @@ function renderHeader() {
     }
   }
   // Uptime is a live clock — always update the text, never gate it.
-  const u = state.stats && state.stats.uptimeMs;
+  const u = state.dash && state.dash.uptimeMs;
   if (u != null) $("uptime").textContent = fmtUptime(u);
 }
 
 // Prominent alert when every backend is cooling and the router cannot serve.
 function renderAlerts() {
   const host = $("allDown");
-  const bs = state.health && Array.isArray(state.health.backends) ? state.health.backends : null;
+  const bs = state.dash && Array.isArray(state.dash.byBackend) ? state.dash.byBackend : null;
   const allCooling = !!bs && bs.length > 0 && bs.every((b) => b.state === "cooling");
   if (!allCooling || state.unreachable) {
     host.style.display = "none";
@@ -1011,7 +1225,7 @@ function renderAlerts() {
   host.innerHTML =
     ICONS.warn +
     '<span>All backends are cooling - the router cannot serve requests. ' +
-    (bs[0].lastError && bs[0].lastError.kind === "weekly"
+    (bs.some((b) => b.lastErrorKind === "weekly")
       ? "All GO accounts hit their weekly usage limits."
       : "Check each backend below for the reason.") +
     "</span>" +
@@ -1060,45 +1274,36 @@ function decorate() {
 
 function renderBackends() {
   const host = $("backends");
-  const data = state.health && state.health.backends ? state.health.backends : null;
+  const data = state.dash && Array.isArray(state.dash.byBackend) ? state.dash.byBackend : null;
   if (!data) {
     if (state.unreachable) return;
     host.innerHTML = '<p class="empty">No backends.</p>';
     return;
   }
-  // Include the traffic snapshot in change detection so the card's live metrics
-  // (avg latency / success rate) refresh as requests flow, not only on health changes.
-  const statsSb = (state.stats && state.stats.byBackend) || {};
-  if (!sectionChanged("backends", { backends: data, stats: statsSb })) return;
+  if (!sectionChanged("backends", { backends: data, cooling: state.dash.cooling })) return;
   host.innerHTML = data.map((b, idx) => {
-    const sb = statsSb[b.id];
-    const avgLat = sb && sb.requests ? Math.round(sb.latencySumMs / sb.requests) : null;
-    const okRate = sb && sb.requests ? Math.round(((sb.ok || 0) / sb.requests) * 100) : null;
     const cooling = b.state === "cooling";
-    const err = b.lastError;
-    const kind = err && err.kind ? err.kind : null;
-    const weekly = kind === "weekly";
-    // The /health "manual" flag is authoritative: cooling AND the cool is a
-    // user decision (lastError.kind === "manual"). Sticky manual cools report
-    // nextAvailableAtMs = MAX_SAFE_INTEGER, which must never become a countdown.
     const manual = cooling && !!b.manual;
-    const auth = kind === "auth";
+    const okRate = b.requests ? Math.round(((b.ok || 0) / b.requests) * 100) : null;
+    const cacheTxt = b.cacheHitRate != null ? fmtPct(b.cacheHitRate) : (b.cacheHits && b.cacheKnown ? b.cacheHits + " hits" : "n/a");
+    const kind = b.lastErrorKind;
     const kindLabel = kind === "weekly" ? "weekly limit" : kind === "rate" ? "rate limit" : kind === "auth" ? "auth" : kind === "server" ? "server error" : kind === "manual" ? "manual" : kind === "client" ? "client error" : null;
-    const errShort = err ? formatErrShort(err) : "";
-    const errFull = err ? JSON.stringify(err, null, 2) : "";
     const stagger = Math.min(idx * 50, 350);
     return (
       '<div class="card" style="animation-delay:' + stagger + 'ms">' +
       "<h3>" + esc(b.id) + ' <span class="badge ' + (cooling ? (manual ? "manual-badge" : "cooling") : "healthy") + '">' + (cooling ? (manual ? ICONS.snowflake : ICONS.warn) : ICONS.ok) + (cooling ? (manual ? "Manual" : "cooling") : "healthy") + "</span></h3>" +
-      '<div class="row"><span>Next available</span><b>' + (cooling ? (manual ? '<span class="kind manual">until uncooled</span>' : '<span class="countdown" data-next="' + (b.nextAvailableAtMs || 0) + '">' + fmtCountdown(b.nextAvailableAtMs || 0) + "</span>") : "now") + "</b></div>" +
-      '<div class="row"><span>Fails</span><b>' + (b.fails || 0) + "</b></div>" +
-      '<div class="row"><span>Avg latency</span><b>' + (avgLat != null ? avgLat + " ms" : "-") + "</b></div>" +
+      '<div class="row"><span>Requests</span><b>' + (b.requests || 0) + "</b></div>" +
       '<div class="row"><span>Success rate</span><b>' + (okRate != null ? okRate + "%" : "-") + "</b></div>" +
+      '<div class="row"><span>Error rate</span><b>' + (b.errorRate != null ? fmtPct(b.errorRate) : "-") + "</b></div>" +
+      '<div class="row"><span>Avg latency</span><b>' + (b.latencyAvgMs != null ? Math.round(b.latencyAvgMs) + " ms" : "-") + "</b></div>" +
+      '<div class="row"><span>Tokens</span><b>' + fmtCompact((b.promptTokens || 0) + (b.completionTokens || 0)) + " (" + fmtCompact(b.promptTokens || 0) + " in / " + fmtCompact(b.completionTokens || 0) + " out)</b></div>" +
+      '<div class="row"><span>Cost</span><b>' + (b.cost != null ? fmtMoney(b.cost) : "n/a") + "</b></div>" +
+      '<div class="row"><span>Cache hit</span><b>' + cacheTxt + "</b></div>" +
+      '<div class="row"><span>Fails</span><b>' + (b.fails || 0) + "</b></div>" +
       (kind ? '<div class="row"><span>Reason</span><b><span class="kind ' + esc(kind) + '">' + esc(kindLabel) + "</span></b></div>" : "") +
-      (err ? '<div class="errbox"><span class="errline" data-short="' + esc(errShort) + '" data-full="' + esc(errFull) + '" title="Click to expand / collapse">' + esc(errShort) + "</span></div>" : "") +
-      (weekly ? '<div class="note">Cooled due to weekly usage limit - retries when the limit resets.</div>' : "") +
+      (kind === "weekly" ? '<div class="note">Cooled due to weekly usage limit - retries when the limit resets.</div>' : "") +
       (manual ? '<div class="note">Manually cooled from the UI. Uncool to restore.</div>' : "") +
-      (auth ? '<div class="note err">Auth failure - check the API key in .env for this backend.</div>' : "") +
+      (kind === "auth" ? '<div class="note err">Auth failure - check the API key in .env for this backend.</div>' : "") +
       '<div class="card-actions">' +
       '<button class="danger" data-cool="' + esc(b.id) + '">' + ICONS.snowflake + "Cool</button>" +
       '<button data-uncool="' + esc(b.id) + '">' + ICONS.sun + "Uncool</button>" +
@@ -1107,91 +1312,286 @@ function renderBackends() {
   }).join("");
 }
 
-// Per-backend latency samples from the request history, used to compute
-// P50/P95/P99 client-side (the server only tracks sums/max).
-function statsPerfKey() {
-  const entries = (state.history && state.history.entries) || [];
-  const out = {};
-  for (const e of entries) {
-    if (e.latencyMs == null) continue;
-    (out[e.backend] = out[e.backend] || []).push(e.latencyMs);
-  }
-  return out;
+// ---- analytics dashboard rendering ------------------------------------------
+// Master render for everything under the Dashboard tab except the backend
+// cards (renderBackends above) and the static config tables. Reads state.dash
+// (the /api/dashboard contract). Every section gates on sectionChanged so the
+// 3s poll does not rebuild identical DOM.
+
+// Shared 24h/7d range for the spend + tokens charts.
+let dashRange = "24h";
+function setDashRange(r) {
+  dashRange = r;
+  document.querySelectorAll("#spendRangeToggle button, #tokensRangeToggle button").forEach((b) => {
+    b.classList.toggle("on", b.dataset.range === r);
+  });
+  renderMoney();
+  renderTokens();
 }
 
-function renderStats() {
-  const host = $("stats");
-  if (!state.stats) return;
-  // FIX (popping): exclude clock-driven fields from change detection so this
-  // section does not re-render (and replay its entrance animation) every poll.
-  // uptimeMs changes every second; the uptime text is kept live by the 1s ticker.
-  // The history-derived percentile samples must gate the redraw too, or the
-  // P50/P95/P99 figures would go stale.
-  const stableStats = Object.assign({}, state.stats);
-  delete stableStats.uptimeMs;
-  stableStats.perf = statsPerfKey();
-  if (!sectionChanged("stats", stableStats)) return;
-  const s = state.stats;
-  const names = Object.keys(s.byBackend || {});
-  const total = s.total || 0;
-  const perf = stableStats.perf;
-  let cacheTotal = 0;
-  let errorsTotal = 0;
-  let latencyTotal = 0;
-  for (const n of names) {
-    cacheTotal += s.byBackend[n].cacheHits || 0;
-    errorsTotal += s.byBackend[n].errors || 0;
-    latencyTotal += s.byBackend[n].latencySumMs || 0;
-  }
-  const successRate = total ? Math.round(((total - errorsTotal) / total) * 100) : 0;
-  const avgLat = total ? Math.round(latencyTotal / total) : 0;
-  let overview = '<div class="stat-overview">' +
-    "<span>Total requests <b>" + total + "</b></span>" +
-    '<span>Uptime <b data-stats-uptime>' + fmtUptime(s.uptimeMs) + "</b></span>" +
-    "<span>Since <b>" + fmtTime(s.since) + "</b></span>" +
-    "<span>Success <b>" + successRate + "%</b></span>" +
-    "<span>Avg latency <b>" + avgLat + "ms</b></span>" +
-    "<span>Cache <b>" + (cacheTotal > 0 ? cacheTotal + " hits" : "n/a") + "</b></span></div>";
-  if (names.length === 0) {
-    host.innerHTML = overview + '<p class="empty">No backend traffic recorded yet.</p>';
+function renderAnalytics() {
+  renderPeakBadge();
+  renderKpis();
+  renderDonutProvider();
+  renderDonutModel();
+  renderDonutCache();
+  renderMoney();
+  renderTokens();
+  renderLatency();
+  renderErrors();
+  renderCooling();
+  renderBackends();
+}
+
+// "PEAK / OFF-PEAK now" badge from pricing.peakWindows (request time in UTC is
+// peak when it falls in a weekday window). Explains "half price now".
+function renderPeakBadge() {
+  const host = $("peakBadge");
+  const pricing = state.dash && state.dash.pricing;
+  if (!pricing || !pricing.peakWindows || !pricing.peakWindows.length) {
+    if (!sectionChanged("peakBadge", { has: false })) return;
+    host.innerHTML = '<span class="pill na">n/a</span><span class="why">Peak pricing not configured.</span>';
     return;
   }
-  const goRequests = (s.byBackend["go-primary"]?.requests || 0) + (s.byBackend["go-alt"]?.requests || 0);
-  const directRequests = s.byBackend["direct"]?.requests || 0;
-  const directOnly = total > 0 && goRequests === 0 && directRequests > 0;
-  host.innerHTML = overview + names.map((n) => {
-    const b = s.byBackend[n];
-    const avg = b.requests ? Math.round(b.latencySumMs / b.requests) : 0;
-    const ttft = b.requests ? Math.round((b.ttftSumMs || 0) / b.requests) : 0;
-    // Cache is reported as a hit COUNT, not a rate: cacheHits only counts TRUE
-    // outcomes and misses/unknowns are not tracked per-backend, so a percentage
-    // would be misleading (would implicitly treat every request as known).
-    const hits = b.cacheHits || 0;
-    const hitText = hits > 0 ? hits + " hits" : "n/a";
-    const errRate = b.requests ? Math.round(((b.errors || 0) / b.requests) * 100) : 0;
-    const lats = perf[n] || [];
-    const p50 = percentile(lats, 50);
-    const p95 = percentile(lats, 95);
-    const p99 = percentile(lats, 99);
-    const share = total ? ((b.requests / total) * 100).toFixed(1) : "0.0";
+  const now = Date.now();
+  const peak = inPeakWindow(now, pricing);
+  const mult = pricing.offPeakMultiplier != null ? pricing.offPeakMultiplier : 0.5;
+  const opt = (pricing.modelsWithOffPeak || []).length;
+  const snap = { peak, mult, opt };
+  if (!sectionChanged("peakBadge", snap)) return;
+  const why = peak
+    ? "Standard pricing now. Off-peak (half price for " + opt + " off-peak model(s)) resumes when the window ends."
+    : (mult < 1
+        ? "Off-peak: " + Math.round((1 - mult) * 100) + "% off (" + mult + "x multiplier) for " + opt + " off-peak model(s)."
+        : "Off-peak now - no discount multiplier configured.");
+  host.innerHTML = '<span class="pill ' + (peak ? "peak" : "offpeak") + '">' + (peak ? "Peak now" : "Off-peak now") + "</span><span class=\"why\">" + esc(why) + "</span>";
+}
+
+function kpiCell(label, value, sub, icon, cls) {
+  return '<div class="kpi"><span class="k">' + (ICONS[icon] || "") + esc(label) + '</span><div class="v' + (cls ? " " + cls : "") + '">' + value + "</div>" + (sub ? '<div class="s">' + sub + "</div>" : "") + "</div>";
+}
+
+function renderKpis() {
+  const host = $("kpiStrip");
+  const k = state.dash && state.dash.kpis;
+  if (!state.dash) {
+    if (state.unreachable) return;
+    host.innerHTML = '<div class="skeleton" style="grid-column:1/-1"></div>';
+    return;
+  }
+  if (!(k.requests > 0)) {
+    host.innerHTML = '<p class="empty" style="grid-column:1/-1">No traffic recorded in this window.</p>';
+    return;
+  }
+  const snap = { k, since: state.dash.since };
+  if (!sectionChanged("kpis", snap)) return;
+  const totalTokens = (k.promptTokens || 0) + (k.completionTokens || 0);
+  // After a router restart the dashboard endpoint may briefly 404; keep the
+  // last good snapshot visible and mark the data as stale.
+  const staleNote = state.dashOk ? "" : '<div class="empty" style="grid-column:1/-1;padding:0;font-size:11px;color:var(--amber)">Showing last snapshot \u00b7 reconnecting to /api/dashboard...</div>';
+  host.innerHTML =
+    kpiCell("Requests", fmtCompact(k.requests), fmtTime(state.dash.since) + " since", "activity") +
+    kpiCell("Total tokens", fmtCompact(totalTokens), fmtCompact(k.promptTokens || 0) + " in / " + fmtCompact(k.completionTokens || 0) + " out", "hash") +
+    kpiCell("Spend", fmtMoney(k.cost), k.cost == null ? "pricing not configured" : "incl. off-peak discounts", "dollar", k.cost == null ? "na" : "") +
+    kpiCell("Cache hit rate", fmtPct(k.cacheHitRate), fmtCompact(k.cacheHitTokens != null ? k.cacheHitTokens : 0) + " hit / " + fmtCompact(k.cacheMissTokens != null ? k.cacheMissTokens : 0) + " miss tokens", "database", k.cacheHitRate == null ? "na" : "") +
+    kpiCell("Error rate", fmtPct(k.errorRate), k.errors + " failed of " + k.requests, "warn", k.errorRate == null ? "na" : "") +
+    kpiCell("Cooled", String(k.cooledBackends != null ? k.cooledBackends : 0), "backends cooling", "snowflake") +
+    kpiCell("Off-peak share", fmtPct(k.offPeakShare), fmtCompact(k.offPeakRequests || 0) + " requests off-peak", "sun", k.offPeakShare == null ? "na" : "") +
+    kpiCell("Uptime", fmtUptime(state.dash.uptimeMs), "", "clock") +
+    staleNote;
+}
+
+function renderDonutProvider() {
+  const host = $("donutBackend");
+  const bs = state.dash && Array.isArray(state.dash.byBackend) ? state.dash.byBackend : [];
+  if (!state.dash) { host.innerHTML = '<div class="skeleton"></div>'; return; }
+  const segs = bs.map((b, i) => ({ label: b.id, value: b.requests || 0, color: segmentColor(i), title: b.requests + " requests", fmtValue: fmtCompact })).filter((s) => s.value > 0);
+  const total = segs.reduce((s, x) => s + x.value, 0);
+  renderDonut(host, segs, { emptyText: "No backend traffic recorded in this window.", centerTop: fmtCompact(total), centerSub: "requests" });
+}
+
+function renderDonutModel() {
+  const host = $("donutModel");
+  const ms = state.dash && Array.isArray(state.dash.byModel) ? state.dash.byModel : [];
+  if (!state.dash) { host.innerHTML = '<div class="skeleton"></div>'; return; }
+  const segs = ms.map((m, i) => ({ label: m.label || m.id, value: m.requests || 0, color: segmentColor(i), title: (m.label && m.label !== m.id ? m.id + " / " : "") + m.requests + " requests", fmtValue: fmtCompact })).filter((s) => s.value > 0);
+  const total = segs.reduce((s, x) => s + x.value, 0);
+  renderDonut(host, segs, { emptyText: "No model traffic recorded in this window.", centerTop: fmtCompact(total), centerSub: "requests" });
+}
+
+// Cache split: hit / miss from kpis token split; unknown = requests with no
+// cache signal (cacheKnown is the number of requests with a known outcome).
+function renderDonutCache() {
+  const host = $("donutCache");
+  const k = state.dash && state.dash.kpis;
+  const bs = state.dash && Array.isArray(state.dash.byBackend) ? state.dash.byBackend : [];
+  if (!state.dash) { host.innerHTML = '<div class="skeleton"></div>'; return; }
+  const known = bs.reduce((s, b) => s + (b.cacheKnown || 0), 0);
+  const requests = bs.reduce((s, b) => s + (b.requests || 0), 0);
+  const unknown = Math.max(0, requests - known);
+  const hitT = k && k.cacheHitTokens != null ? k.cacheHitTokens : 0;
+  const missT = k && k.cacheMissTokens != null ? k.cacheMissTokens : 0;
+  const hasTokens = hitT > 0 || missT > 0;
+  const segs = [];
+  if (hasTokens) {
+    segs.push({ label: "hit", value: hitT, color: "var(--green)", title: "cache hit tokens (billed at the reduced rate)", fmtValue: fmtCompact });
+    segs.push({ label: "miss", value: missT, color: "var(--red)", title: "cache miss tokens (billed at full input rate)", fmtValue: fmtCompact });
+  }
+  if (unknown > 0) segs.push({ label: "unknown", value: unknown, color: "var(--faint)", title: "requests with no cache signal from the upstream", fmtValue: fmtCompact });
+  const total = segs.reduce((s, x) => s + x.value, 0);
+  const centerTop = k && k.cacheHitRate != null ? fmtPct(k.cacheHitRate) : (hasTokens ? fmtPct(hitT / (hitT + missT)) : "-");
+  renderDonut(host, segs, {
+    emptyText: "No cache data in this window.",
+    centerTop: centerTop,
+    centerSub: "hit rate",
+  });
+  // Cache hit rate trend (daily).
+  const trendHost = $("cacheTrend"), wrap = $("cacheTrendWrap");
+  const daily = state.dash && Array.isArray(state.dash.daily) ? state.dash.daily : [];
+  const trendVals = daily.map((d) => d.cacheHitRate);
+  if (trendVals.some((v) => typeof v === "number")) {
+    wrap.style.display = "block";
+    renderLines(trendHost, [{ name: "cache hit rate", color: "var(--green)", values: trendVals }], daily.map((d) => fmtDayLabel(d.t)), {
+      height: 56, padL: 26, xEvery: 5, max: 1, gridFmt: (v) => fmtPct(v), emptyText: "",
+    });
+  } else {
+    wrap.style.display = "none";
+  }
+}
+
+// Row B: spend per hour/daily with peak-window band shading + savings badges.
+function renderMoney() {
+  const host = $("spendChart");
+  const d = state.dash;
+  if (!d) { host.innerHTML = '<div class="skeleton"></div>'; return; }
+  const k = d.kpis || {};
+  const pricing = d.pricing || {};
+  const bayes = {
+    range: dashRange,
+    hourlyCost: (d.hourly || []).map((h) => h.cost),
+    dailyCost: (d.daily || []).map((x) => x.cost),
+  };
+  const snap = { bayes, sav: [k.cacheSavings, k.offPeakSavings, k.offPeakShare, k.offPeakRequests] };
+  if (!sectionChanged("money", snap)) return;
+
+  // Savings badges (always rendered from the same snapshot).
+  const setAmt = (id, v, naText, fmt) => {
+    const el = $(id);
+    if (!el) return;
+    el.textContent = v != null ? (fmt ? fmt(v) : fmtMoney(v)) : naText;
+    el.classList.toggle("na", v == null);
+  };
+  setAmt("cacheSavingsAmt", k.cacheSavings, "n/a");
+  setAmt("offPeakSavingsAmt", k.offPeakSavings, "n/a");
+  setAmt("offPeakShareAmt", k.offPeakShare != null ? k.offPeakShare : null, "n/a", fmtPct);
+
+  if (dashRange === "24h") {
+    const hourly = d.hourly || [];
+    const bars = hourly.map((h) => ({
+      label: fmtSlotLabel(h.t),
+      value: h.cost,
+      band: inPeakWindow(h.t, pricing),
+      tip: fmtSlotLabel(h.t) + (h.cost == null ? ": no priced requests (n/a)" : ": " + fmtMoney(h.cost) + (inPeakWindow(h.t, pricing) ? " [peak]" : " [off-peak]")),
+    }));
+    renderBars(host, bars, {
+      emptyText: "No priced requests in this window.",
+      fmt: fmtMoney, xEvery: 3, height: 160,
+    });
+  } else {
+    const daily = d.daily || [];
+    const bars = daily.map((x) => ({ label: fmtDayLabel(x.t), value: x.cost, tip: fmtDayLabel(x.t) + (x.cost == null ? ": no priced requests (n/a)" : ": " + fmtMoney(x.cost)) }));
+    renderBars(host, bars, {
+      emptyText: "No priced requests in this window.",
+      fmt: fmtMoney, xEvery: 4, height: 160,
+    });
+  }
+}
+
+// Row C: stacked tokens (miss / hit / output) with the shared 24h/7d range.
+function renderTokens() {
+  const host = $("tokensChart");
+  const d = state.dash;
+  if (!d) { host.innerHTML = '<div class="skeleton"></div>'; return; }
+  const hourly = d.hourly || [];
+  const daily = d.daily || [];
+  const snap = { range: dashRange, hourly: hourly, daily: daily };
+  if (!sectionChanged("tokens", snap)) return;
+  if (dashRange === "24h") {
+    const rows = hourly.map((h) => ({
+      label: fmtSlotLabel(h.t),
+      parts: [
+        { name: "cache miss", value: h.cacheMissTokens || 0, color: "var(--red)" },
+        { name: "cache hit", value: h.cacheHitTokens || 0, color: "var(--green)" },
+        { name: "output", value: h.completionTokens || 0, color: "#60a5fa" },
+      ],
+    }));
+    renderStacked(host, rows, {
+      fmt: fmtCompact, xEvery: 3, height: 150,
+      legend: [{ name: "cache miss", color: "var(--red)" }, { name: "cache hit", color: "var(--green)" }, { name: "output", color: "#60a5fa" }],
+    });
+  } else {
+    const rows = daily.map((x) => ({ label: fmtDayLabel(x.t), parts: [{ name: "tokens", value: x.tokens || 0, color: "#60a5fa" }] }));
+    renderStacked(host, rows, { fmt: fmtCompact, xEvery: 4, height: 150, legend: [{ name: "tokens", color: "#60a5fa" }] });
+  }
+}
+
+function renderLatency() {
+  const host = $("latencyChart");
+  const d = state.dash;
+  if (!d) { host.innerHTML = '<div class="skeleton"></div>'; return; }
+  const hourly = d.hourly || [];
+  const snap = hourly.map((h) => [h.latencyAvgMs, h.latencyMaxMs]);
+  if (!sectionChanged("latency", snap)) return;
+  renderLines(host, [
+    { name: "avg", color: "var(--green)", values: hourly.map((h) => h.latencyAvgMs) },
+    { name: "max", color: "var(--red)", dash: "3 2", values: hourly.map((h) => h.latencyMaxMs) },
+  ], hourly.map((h) => fmtSlotLabel(h.t)), {
+    height: 120, xEvery: 3, gridFmt: (v) => Math.round(v) + "ms", emptyText: "No latency data in this window.",
+    legend: true,
+  });
+}
+
+function renderErrors() {
+  const host = $("errorChart");
+  const d = state.dash;
+  if (!d) { host.innerHTML = '<div class="skeleton"></div>'; return; }
+  const hourly = d.hourly || [];
+  const snap = hourly.map((h) => [h.requests, h.errors]);
+  if (!sectionChanged("errors", snap)) return;
+  const vals = hourly.map((h) => (h.requests ? ((h.errors || 0) / h.requests) * 100 : null));
+  renderLines(host, [
+    { name: "error rate", color: "var(--red)", values: vals },
+  ], hourly.map((h) => fmtSlotLabel(h.t)), {
+    height: 120, xEvery: 3, max: 100, gridFmt: (v) => v.toFixed(0) + "%", emptyText: "No requests in this window.",
+  });
+}
+
+// Cooling timeline: compact event list with colored dots per action.
+function renderCooling() {
+  const host = $("coolingList");
+  const d = state.dash;
+  if (!d) { host.innerHTML = '<div class="skeleton"></div>'; return; }
+  const evts = Array.isArray(d.cooling) ? d.cooling : [];
+  if (!sectionChanged("cooling", evts)) return;
+  if (!evts.length) {
+    host.innerHTML = '<p class="empty">No cooling events in this window.</p>';
+    return;
+  }
+  const LABEL = { cool: "cooled", uncool: "uncooled", expire: "expired", success: "recovered", reset: "reset" };
+  host.innerHTML = evts.slice(0, 100).map((e) => {
+    const when = e.t ? fmtRel(e.t) : "";
+    const manual = e.manual ? '<span class="cool-manual">manual</span>' : "";
+    const kind = e.kind && e.kind !== "manual" ? '<span class="cool-kind">' + esc(e.kind) + "</span>" : "";
     return (
-      '<div class="statbar">' +
-      '<div class="top"><span>' + esc(n) + " <b>(" + share + "%)</b></span>" +
-      "<span>req <b>" + b.requests + "</b></span></div>" +
-      '<div class="meta">' +
-      "<span>avg <b>" + avg + "ms</b></span>" +
-      "<span>ttft <b>" + ttft + "ms</b></span>" +
-      "<span>p50 <b>" + (p50 != null ? p50 + "ms" : "-") + "</b></span>" +
-      "<span>p95 <b>" + (p95 != null ? p95 + "ms" : "-") + "</b></span>" +
-      "<span>p99 <b>" + (p99 != null ? p99 + "ms" : "-") + "</b></span>" +
-      "<span>hit <b>" + hitText + "</b></span>" +
-      "<span>err <b>" + (b.errors || 0) + (b.requests ? " (" + errRate + "%)" : "") + "</b></span>" +
-      "</div>" +
-      '<div class="bar"><div style="width:' + share + '%">' + (parseFloat(share) >= 18 ? '<span class="bar-pct">' + share + "%</span>" : "") + "</div></div>" +
+      '<div class="cool-row">' +
+      '<span class="cool-dot ' + esc(e.action) + '"></span>' +
+      '<span class="cool-what ' + esc(e.action) + '">' + esc(LABEL[e.action] || e.action) + "</span>" +
+      '<span class="cool-backend">' + esc(e.backend || "?") + "</span>" +
+      kind + manual +
+      '<span class="cool-time">' + when + "</span>" +
       "</div>"
     );
-  }).join("") +
-  (directOnly ? '<div class="note">All recent traffic is on direct - the GO accounts are idle (weekly limits or cooling).</div>' : "");
+  }).join("");
 }
 
 // Call ID cell: shows the short per-request id with a copy button so any row
@@ -1202,12 +1602,32 @@ function callIdHtml(callId) {
     '<button type="button" class="call-copy" data-call="' + esc(callId) + '" title="Copy call ID">⧉</button></span>';
 }
 
+// History filters (client-side over the limit-500 snapshot).
+const historyFilters = { model: "", backend: "", cache: "", errorsOnly: false };
+
+function historyFiltered() {
+  const entries = (state.history && state.history.entries) || [];
+  const f = historyFilters;
+  const q = (s) => String(s == null ? "" : s).toLowerCase();
+  return entries.filter((e) => {
+    if (f.model && !q(e.model).includes(f.model)) return false;
+    if (f.backend && !q(e.backend).includes(f.backend)) return false;
+    if (f.cache === "hit" && !(e.cacheHit === true)) return false;
+    if (f.cache === "miss" && !(e.cacheHit === false)) return false;
+    if (f.cache === "unknown" && e.cacheHit != null) return false;
+    if (f.errorsOnly && !(e.status >= 400 || (e.errorKind && e.errorKind !== "client"))) return false;
+    return true;
+  });
+}
+
 function renderHistory() {
   const body = $("historyBody");
   const sum = $("historyCacheSummary");
-  const entries = (state.history && state.history.entries) || [];
   if (!state.history) return;
-  if (!sectionChanged("history", entries)) return;
+  const entries = (state.history && state.history.entries) || [];
+  const filtered = historyFiltered();
+  const snap = { entries, filters: historyFilters };
+  if (!sectionChanged("history2", snap)) return;
   // Cache summary over KNOWN entries only (tri-state: null = no signal, skip).
   let hits = 0, misses = 0;
   for (const e of entries) {
@@ -1218,20 +1638,36 @@ function renderHistory() {
   const pct = known > 0 ? Math.round((hits / known) * 100) : 0;
   if (entries.length === 0) {
     sum.style.display = "none";
-    body.innerHTML = '<tr><td colspan="11" class="empty">No requests yet.</td></tr>';
+    body.innerHTML = '<tr><td colspan="12" class="empty">No requests yet.</td></tr>';
+    $("historyFilterCount").textContent = "";
     return;
   }
   sum.style.display = "flex";
+  const pcts = entries.filter((e) => typeof e.cacheHitPct === "number");
+  const avgPct = pcts.length ? Math.round(pcts.reduce((s, e) => s + e.cacheHitPct, 0) / pcts.length * 10) / 10 : null;
   sum.innerHTML =
     "<span>Cache <b>" + (known > 0 ? pct + "% hit" : "n/a") + "</b></span>" +
+    "<span>Avg <b>" + (avgPct != null ? avgPct + "%" : "n/a") + "</b></span>" +
     "<span>Hits <b class='status-ok'>" + hits + "</b></span>" +
     "<span>Misses <b>" + misses + "</b></span>" +
     "<span>Known <b>" + known + "</b></span>";
-  body.innerHTML = entries.slice(0, 100).map((e) =>
+  $("historyFilterCount").textContent = filtered.length === entries.length ? "" : filtered.length + " of " + entries.length + " shown";
+  if (!filtered.length) {
+    body.innerHTML = '<tr><td colspan="12" class="empty">No requests match the current filters.</td></tr>';
+    return;
+  }
+  body.innerHTML = filtered.map((e) => {
+    // Cache cell: prefer the percentage when known, tri-state fallback otherwise.
+    const cacheText = e.cacheHitPct != null ? e.cacheHitPct + "%" : (e.cacheHit == null ? "unknown" : e.cacheHit ? "hit" : "miss");
+    const cacheClass = e.cacheHitPct != null ? (e.cacheHitPct >= 80 ? "status-hit" : e.cacheHitPct > 0 ? "status-warn" : "status-miss") : (e.cacheHit == null ? "" : e.cacheHit ? "status-hit" : "status-miss");
+    const costText = e.cost != null ? fmtMoney(e.cost) : '<span class="cost-na">n/a</span>';
+    // Error cell: prefer the classified errorKind, fall back to the HTTP status.
+    const errText = e.errorKind ? e.errorKind : (e.status >= 400 ? "err" : null);
+    return (
     '<tr class="hist-row" data-t="' + e.t + '" data-call="' + esc(e.callId || "") + '" title="Click for full request detail">' +
     '<td class="mono call-cell" data-label="Call">' + callIdHtml(e.callId || "t" + e.t) + "</td>" +
     '<td class="mono" data-label="Time">' + fmtTime(e.t) + "</td>" +
-    '<td data-label="Model">' + esc(e.model) + "</td>" +
+    '<td data-label="Model">' + esc(e.model) + (errText ? ' <span class="kind ' + esc(errText) + '">' + esc(errText) + "</span>" : "") + "</td>" +
     '<td data-label="Backend">' + esc(e.backend) + "</td>" +
     '<td data-label="Stream">' + (e.stream ? "yes" : "no") + "</td>" +
     '<td class="mono ' + (e.status >= 400 ? "status-err" : "status-ok") + '" data-label="Status">' + e.status + "</td>" +
@@ -1239,10 +1675,12 @@ function renderHistory() {
     '<td class="mono" data-label="TTFT">' + (e.ttftMs != null ? Math.round(e.ttftMs) + "ms" : "-") + "</td>" +
     '<td class="mono" data-label="Tokens">' + (e.promptTokens != null ? e.promptTokens + "/" + (e.completionTokens != null ? e.completionTokens : "?") : "-") +
       (e.reasoningTokens > 0 ? ' <span class="rTok" title="reasoning tokens">🧠' + e.reasoningTokens + "</span>" : "") + "</td>" +
-    '<td class="mono ' + (e.cacheHit == null ? "" : e.cacheHit ? "status-hit" : "status-miss") + '" data-label="Cache">' + (e.cacheHit == null ? "-" : e.cacheHit ? "hit" : "miss") + "</td>" +
+    '<td class="mono ' + cacheClass + '" data-label="Cache">' + cacheText + "</td>" +
+    '<td class="mono" data-label="Cost" title="' + (e.cost != null ? "cache savings " + fmtMoney(e.cacheSavings) + " / off-peak savings " + fmtMoney(e.offPeakSavings) : "no pricing configured for this model") + '">' + costText + "</td>" +
     '<td data-label="Session">' + esc(e.session) + "</td>" +
     "</tr>"
-  ).join("");
+    );
+  }).join("");
 }
 
 function renderPresets() {
@@ -1315,17 +1753,55 @@ function renderModels() {
 
 // ---- data fetching ---------------------------------------------------------
 
+// Single try/catch wrapper: read-only endpoints may 404/503 while the router
+// restarts; the page keeps its last good data and shows a connecting hint.
+async function safeJson(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  return r.json();
+}
+
+// Dashboard poll (3s): drives the KPI strip, charts, and backend cards.
+async function pollDashboard() {
+  let dash = null;
+  try {
+    dash = await safeJson("/api/dashboard");
+    if (!dash || typeof dash !== "object" || !dash.kpis || !Array.isArray(dash.hourly)) throw new Error("bad dashboard payload");
+  } catch {
+    state.dashOk = false;
+    dash = null;
+  }
+  if (dash) {
+    state.dash = dash;
+    state.dashOk = true;
+    state.dashFetchedAt = Date.now();
+  }
+  state.unreachable = !state.dashOk && !state.histOk;
+  renderHeader();
+  renderAlerts();
+  renderAnalytics();
+}
+
+// History poll (5s, limit 500): drives the History tab.
+async function pollHistory() {
+  let hist = null;
+  try {
+    hist = await safeJson("/api/history?limit=500");
+    if (!hist || !Array.isArray(hist.entries)) throw new Error("bad history payload");
+  } catch {
+    state.histOk = false;
+    hist = null;
+  }
+  if (hist) {
+    state.history = hist;
+    state.histOk = true;
+  }
+  state.unreachable = !state.dashOk && !state.histOk;
+  renderHistory();
+}
+
 async function poll() {
-  const results = await Promise.allSettled([
-    fetch("/health").then((r) => r.json()),
-    fetch("/api/stats").then((r) => r.json()),
-    fetch("/api/history?limit=100").then((r) => r.json()),
-  ]);
-  state.health = results[0].status === "fulfilled" ? results[0].value : null;
-  state.stats = results[1].status === "fulfilled" ? results[1].value : null;
-  state.history = results[2].status === "fulfilled" ? results[2].value : null;
-  state.unreachable = !state.health && !state.stats && !state.history;
-  render();
+  await Promise.all([pollDashboard(), pollHistory()]);
 }
 
 let playgroundStateLoaded = false;
@@ -1717,7 +2193,7 @@ function detailMetaRows(d) {
     ["Prompt tokens", fmtNum(resp.promptTokens)],
     ["Completion tokens", fmtNum(resp.completionTokens)],
     ["Reasoning tokens", fmtNum(resp.reasoningTokens)],
-    ["Cache", resp.cacheHit == null ? "-" : (resp.cacheHit ? "hit" : "miss")],
+    ["Cache", resp.cacheHitPct != null ? resp.cacheHitPct + "%" : (resp.cacheHit == null ? "-" : (resp.cacheHit ? "hit" : "miss"))],
     ["Attempts", d.attempts ? d.attempts.length : 0],
   ];
   return rows.map(([k, v]) => '<div class="dm"><span class="k">' + esc(k) + "</span><span class=\"v\">" + v + "</span></div>").join("");
@@ -1835,7 +2311,7 @@ const pg = {
 
 // Per-preset presentation metadata, built from cfg.presets[id].meta on config
 // load (see loadConfig). Fallbacks are applied per lookup in presetMeta().
-const DEFAULT_PRICING = { inputPerM: 0.18, outputPerM: 0.87 };
+const DEFAULT_PRICING = { inputPerM: 0.22, cacheHitInputPerM: 0.0028, outputPerM: 0.66 };
 const DEFAULT_CONTEXT_WINDOW = 128000;
 const PRESET_META = {};
 
@@ -1851,11 +2327,22 @@ function presetMeta(id) {
   };
 }
 
-function calcCost(promptTokens, completionTokens, modelId) {
+function calcCost(promptTokens, completionTokens, modelId, cacheHitPct) {
   const p = Number(promptTokens) || 0;
   const c = Number(completionTokens) || 0;
   const pricing = presetMeta(modelId).pricing;
-  return (p / 1_000_000) * pricing.inputPerM + (c / 1_000_000) * pricing.outputPerM;
+  // When the model's pricing declares a reduced cache-hit input rate AND a
+  // known per-call cache percentage is given, split the prompt cost into its
+  // cache-hit and cache-miss parts. Otherwise fall back to the flat input rate.
+  let inputCost;
+  if (typeof pricing.cacheHitInputPerM === "number" && typeof cacheHitPct === "number" && cacheHitPct >= 0) {
+    const hit = p * (cacheHitPct / 100);
+    const miss = p - hit;
+    inputCost = (miss / 1e6) * pricing.inputPerM + (hit / 1e6) * pricing.cacheHitInputPerM;
+  } else {
+    inputCost = (p / 1e6) * pricing.inputPerM;
+  }
+  return inputCost + (c / 1e6) * pricing.outputPerM;
 }
 
 function fmtCost(cost) {
@@ -1864,6 +2351,257 @@ function fmtCost(cost) {
   if (cost < 1) return "$" + cost.toFixed(3);
   return "$" + cost.toFixed(2);
 }
+
+// ---- analytics: number formatting ------------------------------------------
+
+// Money with sensible precision: 2 decimals for small amounts, compact (k/M)
+// for big ones. null/NaN = "no data or no pricing configured".
+function fmtMoney(v) {
+  if (v == null || Number.isNaN(v)) return "n/a";
+  const a = Math.abs(v);
+  if (a >= 1e6) return "$" + (v / 1e6).toFixed(2).replace(/\.?0+$/, "") + "M";
+  if (a >= 1e4) return "$" + (v / 1e3).toFixed(1).replace(/\.?0+$/, "") + "k";
+  if (a >= 100) return "$" + v.toFixed(0);
+  if (a >= 1) return "$" + v.toFixed(2);
+  if (a >= 0.01) return "$" + v.toFixed(3);
+  return "$" + v.toFixed(4);
+}
+
+// Compact token/request counts: 1.2M, 34k, 512. null -> "n/a".
+function fmtCompact(v) {
+  if (v == null || Number.isNaN(v)) return "n/a";
+  const a = Math.abs(v);
+  if (a >= 1e6) return (v / 1e6).toFixed(a >= 1e7 ? 0 : 1).replace(/\.?0+$/, "") + "M";
+  if (a >= 1e3) return (v / 1e3).toFixed(a >= 1e4 ? 0 : 1).replace(/\.?0+$/, "") + "k";
+  return String(Math.round(v));
+}
+
+// 1-decimal percentage from a 0..1 fraction (the /api/dashboard convention:
+// rates travel as fractions); null -> "n/a" (zeros are real zeros).
+function fmtPct(v) {
+  if (v == null || Number.isNaN(v)) return "n/a";
+  return (Number(v) * 100).toFixed(1) + "%";
+}
+
+// Local-time axis label from an epoch-ms slot start: "14:00" or "8/3".
+function fmtSlotLabel(t, withDay) {
+  const d = new Date(t);
+  const p = (n) => String(n).padStart(2, "0");
+  return (withDay ? d.getMonth() + 1 + "/" + d.getDate() + " " : "") + p(d.getHours()) + ":00";
+}
+function fmtDayLabel(t) {
+  const d = new Date(t);
+  return (d.getMonth() + 1) + "/" + d.getDate();
+}
+
+// Relative time for the cooling timeline ("3m ago").
+function fmtRel(t) {
+  const s = Math.max(1, Math.round((Date.now() - t) / 1000));
+  if (s < 60) return s + "s ago";
+  if (s < 3600) return Math.round(s / 60) + "m ago";
+  if (s < 86400) return Math.round(s / 3600) + "h ago";
+  return Math.round(s / 86400) + "d ago";
+}
+
+// True when epoch ms falls inside a peak window (windows are UTC "HH:MM" on
+// days "1-5" = Mon-Fri; start inclusive, end exclusive). Mirrors the server.
+function inPeakWindow(ts, pricing) {
+  const windows = pricing && Array.isArray(pricing.peakWindows) ? pricing.peakWindows : [];
+  if (!windows.length) return false;
+  const d = new Date(ts);
+  const day = d.getUTCDay();
+  const mins = d.getUTCHours() * 60 + d.getUTCMinutes();
+  for (const w of windows) {
+    if (!w || typeof w.days !== "string" || typeof w.start !== "string" || typeof w.end !== "string") continue;
+    const dash = w.days.indexOf("-");
+    const d0 = Number(dash >= 0 ? w.days.slice(0, dash) : w.days);
+    const d1 = Number(dash >= 0 ? w.days.slice(dash + 1) : w.days);
+    if (!Number.isFinite(d0) || !Number.isFinite(d1) || day < d0 || day > d1) continue;
+    const [hs, ms] = w.start.split(":").map(Number);
+    const [he, me] = w.end.split(":").map(Number);
+    const s = hs * 60 + ms, e = he * 60 + me;
+    if (!Number.isFinite(s) || !Number.isFinite(e)) continue;
+    if (mins >= s && mins < e) return true;
+  }
+  return false;
+}
+
+// ---- analytics: hand-rolled SVG charts --------------------------------------
+
+// Donut chart: segments [{label, value, color}]. Center shows opts.centerTop /
+// opts.centerSub; legend lists each segment with value + share.
+function renderDonut(host, segments, opts) {
+  opts = opts || {};
+  const total = segments.reduce((s, x) => s + (x.value > 0 ? x.value : 0), 0);
+  if (!host || total <= 0) {
+    if (host) host.innerHTML = '<div class="chart-empty">' + (opts.emptyText || "No data in this window.") + "</div>";
+    return;
+  }
+  const SIZE = 130, R = 46, CX = SIZE / 2, CY = SIZE / 2;
+  const C = 2 * Math.PI * R;
+  let svg = '<svg viewBox="0 0 ' + SIZE + " " + SIZE + '" width="130" height="130" role="img" aria-label="donut">';
+  // Track ring
+  svg += '<circle cx="' + CX + '" cy="' + CY + '" r="' + R + '" fill="none" stroke="var(--panel-2)" stroke-width="18"/>';
+  let acc = 0;
+  for (const s of segments) {
+    if (!(s.value > 0)) continue;
+    const frac = s.value / total;
+    const len = Math.max(0.15, frac * C);
+    svg += '<circle cx="' + CX + '" cy="' + CY + '" r="' + R + '" fill="none" stroke="' + s.color + '" stroke-width="18" stroke-dasharray="' + len.toFixed(1) + " " + (C - len).toFixed(1) + '" stroke-dashoffset="' + (-acc).toFixed(1) + '" transform="rotate(-90 ' + CX + " " + CY + ')"><title>' + esc(s.title || s.label + " " + fmtCompact(s.value)) + "</title></circle>";
+    acc += len;
+  }
+  svg += '<text x="' + CX + '" y="' + (CY - 2) + '" text-anchor="middle" fill="var(--text)" font-size="15" font-weight="700" font-family="var(--mono)">' + esc(opts.centerTop != null ? opts.centerTop : fmtCompact(total)) + "</text>";
+  svg += '<text x="' + CX + '" y="' + (CY + 15) + '" text-anchor="middle" fill="var(--faint)" font-size="9" font-family="var(--mono)">' + esc(opts.centerSub || "") + "</text>";
+  svg += "</svg>";
+  const legend = segments.map((s) => {
+    if (!(s.value > 0)) return "";
+    const pct = ((s.value / total) * 100).toFixed(1);
+    return '<div class="li" title="' + esc(s.title || s.label) + '"><span class="sw" style="background:' + s.color + '"></span><span class="ln">' + esc(s.label) + '</span><span class="lv">' + (s.fmtValue ? esc(s.fmtValue(s.value)) : fmtCompact(s.value)) + '<span class="pct">&middot; ' + pct + "%</span></span></div>";
+  }).join("");
+  host.innerHTML = '<div class="donut-wrap"><div class="donut-svg">' + svg + "</div><div class='donut-legend'>" + legend + "</div></div>";
+}
+
+// Simple bar series (also used for the 7d daily spend). bars: [{label, value|null, band, tip}]
+// opts: {color, max, fmt, emptyText, xEvery, height}. value null = "n/a" slot.
+function renderBars(host, bars, opts) {
+  opts = opts || {};
+  const values = bars.map((b) => b.value).filter((v) => typeof v === "number" && !Number.isNaN(v));
+  if (!host || !bars.length) return;
+  if (!values.length) {
+    host.innerHTML = '<div class="chart-empty">' + (opts.emptyText || "No data in this window.") + "</div>";
+    return;
+  }
+  const W = 420, H = opts.height || 150, PL = opts.padL != null ? opts.padL : 34, PR = 6, PT = 10, PB = 18;
+  const max = opts.max != null ? opts.max : Math.max.apply(null, values);
+  const innerW = W - PL - PR, innerH = H - PT - PB;
+  let svg = '<svg viewBox="0 0 ' + W + " " + H + '" role="img">';
+  // gridlines + y labels
+  for (let g = 0; g <= 3; g++) {
+    const y = PT + innerH - (innerH * g) / 3;
+    const v = (max * g) / 3;
+    svg += '<line x1="' + PL + '" y1="' + y + '" x2="' + (W - PR) + '" y2="' + y + '" stroke="var(--border)" stroke-width="1" stroke-dasharray="2 3"/>';
+    svg += '<text x="' + (PL - 5) + '" y="' + (y + 3) + '" text-anchor="end" fill="var(--faint)" font-size="9" font-family="var(--mono)">' + esc(opts.fmt ? opts.fmt(v) : fmtCompact(v)) + "</text>";
+  }
+  const slot = innerW / bars.length;
+  bars.forEach((b, i) => {
+    const x = PL + i * slot;
+    // peak band shading behind the bar (local-time x, UTC window classification)
+    if (b.band) {
+      svg += '<rect x="' + x + '" y="' + PT + '" width="' + slot + '" height="' + innerH + '" fill="var(--amber)" opacity="0.13" rx="2"/>';
+    }
+    if (typeof b.value !== "number" || Number.isNaN(b.value)) {
+      // null slot: hollow marker, tooltip explains "no data"
+      svg += '<rect x="' + (x + slot * 0.3) + '" y="' + (PT + innerH - 4) + '" width="' + (slot * 0.4) + '" height="4" fill="var(--border)" rx="1" opacity="0.7"><title>' + esc(b.tip || "no data") + "</title></rect>";
+      return;
+    }
+    const h = Math.max(2, (b.value / max) * innerH);
+    const bx = x + slot * 0.22, bw = slot * 0.56;
+    svg += '<rect x="' + bx + '" y="' + (PT + innerH - h) + '" width="' + bw + '" height="' + h + '" fill="' + (b.color || opts.color || "var(--green)") + '" rx="2"><title>' + esc(b.tip || b.label + ": " + (opts.fmt ? opts.fmt(b.value) : fmtCompact(b.value))) + "</title></rect>";
+  });
+  // x labels (every few slots)
+  const xEvery = opts.xEvery || Math.max(1, Math.ceil(bars.length / 9));
+  bars.forEach((b, i) => {
+    if (i % xEvery !== 0) return;
+    svg += '<text x="' + (PL + i * slot + slot / 2) + '" y="' + (H - 5) + '" text-anchor="middle" fill="var(--faint)" font-size="8.5" font-family="var(--mono)">' + esc(b.label) + "</text>";
+  });
+  svg += "</svg>";
+  host.innerHTML = svg;
+}
+
+// Line chart: series [{name, color, values, dash}]. xLabels parallel to values
+// (null values = gaps, drawn as breaks). opts: {max, fmt, emptyText, xEvery, height, gridFmt}
+function renderLines(host, series, xLabels, opts) {
+  opts = opts || {};
+  const all = [];
+  for (const s of series) for (const v of s.values) if (typeof v === "number" && !Number.isNaN(v)) all.push(v);
+  if (!host || !xLabels.length || !all.length) {
+    if (host) host.innerHTML = '<div class="chart-empty">' + (opts.emptyText || "No data in this window.") + "</div>";
+    return;
+  }
+  const W = 420, H = opts.height || 140, PL = opts.padL != null ? opts.padL : 34, PR = 6, PT = 10, PB = 18;
+  const max = opts.max != null ? opts.max : Math.max.apply(null, all) * 1.08;
+  const min = opts.min != null ? opts.min : 0;
+  const innerW = W - PL - PR, innerH = H - PT - PB;
+  const X = (i) => PL + (innerW * i) / Math.max(1, xLabels.length - 1);
+  const Y = (v) => PT + innerH - ((v - min) / (max - min || 1)) * innerH;
+  let svg = '<svg viewBox="0 0 ' + W + " " + H + '" role="img">';
+  for (let g = 0; g <= 3; g++) {
+    const y = PT + innerH - (innerH * g) / 3;
+    const v = min + ((max - min) * g) / 3;
+    svg += '<line x1="' + PL + '" y1="' + y + '" x2="' + (W - PR) + '" y2="' + y + '" stroke="var(--border)" stroke-width="1" stroke-dasharray="2 3"/>';
+    svg += '<text x="' + (PL - 5) + '" y="' + (y + 3) + '" text-anchor="end" fill="var(--faint)" font-size="9" font-family="var(--mono)">' + esc(opts.gridFmt ? opts.gridFmt(v) : (opts.fmt ? opts.fmt(v) : fmtCompact(v))) + "</text>";
+  }
+  for (const s of series) {
+    const pts = [];
+    s.values.forEach((v, i) => {
+      if (typeof v === "number" && !Number.isNaN(v)) pts.push([X(i), Y(v)]);
+    });
+    if (pts.length < 2) continue;
+    const d = pts.map((p, i) => (i === 0 ? "M" : "L") + p[0].toFixed(1) + " " + p[1].toFixed(1)).join(" ");
+    svg += '<path d="' + d + '" fill="none" stroke="' + s.color + '" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"' + (s.dash ? ' stroke-dasharray="' + s.dash + '"' : "") + '><title>' + esc(s.name) + "</title></path>";
+    // area under the first series (tokens/spend feel)
+    if (opts.area && s === series[0]) {
+      const areaD = d + " L" + pts[pts.length - 1][0].toFixed(1) + " " + (PT + innerH) + " L" + pts[0][0].toFixed(1) + " " + (PT + innerH) + " Z";
+      svg += '<path d="' + areaD + '" fill="' + s.color + '" opacity="0.10"/>';
+    }
+  }
+  const xEvery = opts.xEvery || Math.max(1, Math.ceil(xLabels.length / 9));
+  xLabels.forEach((l, i) => {
+    if (i % xEvery !== 0) return;
+    svg += '<text x="' + X(i) + '" y="' + (H - 5) + '" text-anchor="middle" fill="var(--faint)" font-size="8.5" font-family="var(--mono)">' + esc(l) + "</text>";
+  });
+  svg += "</svg>";
+  host.innerHTML = svg;
+  // inline legend
+  if (series.length > 1 && opts.legend) {
+    const lg = series.map((s) => '<span style="display:inline-flex;align-items:center;gap:4px;margin-right:10px;color:var(--muted);font-size:11px"><span class="sw" style="background:' + s.color + '"></span>' + esc(s.name) + "</span>").join("");
+    host.innerHTML += '<div style="margin-top:6px">' + lg + "</div>";
+  }
+}
+
+// Stacked bar chart (tokens: miss / hit / output). rows: [{label, parts: [{name, value, color}]}]
+function renderStacked(host, rows, opts) {
+  opts = opts || {};
+  const totals = rows.map((r) => r.parts.reduce((s, p) => s + (p.value > 0 ? p.value : 0), 0));
+  const max = Math.max.apply(null, totals.concat([0]));
+  if (!host || !rows.length || max <= 0) {
+    if (host) host.innerHTML = '<div class="chart-empty">' + (opts.emptyText || "No token traffic in this window.") + "</div>";
+    return;
+  }
+  const W = 420, H = opts.height || 150, PL = 34, PR = 6, PT = 10, PB = 18;
+  const innerW = W - PL - PR, innerH = H - PT - PB;
+  let svg = '<svg viewBox="0 0 ' + W + " " + H + '" role="img">';
+  for (let g = 0; g <= 3; g++) {
+    const y = PT + innerH - (innerH * g) / 3;
+    const v = (max * g) / 3;
+    svg += '<line x1="' + PL + '" y1="' + y + '" x2="' + (W - PR) + '" y2="' + y + '" stroke="var(--border)" stroke-width="1" stroke-dasharray="2 3"/>';
+    svg += '<text x="' + (PL - 5) + '" y="' + (y + 3) + '" text-anchor="end" fill="var(--faint)" font-size="9" font-family="var(--mono)">' + esc(opts.fmt ? opts.fmt(v) : fmtCompact(v)) + "</text>";
+  }
+  const slot = innerW / rows.length;
+  rows.forEach((r, i) => {
+    const x = PL + i * slot;
+    let yBot = PT + innerH;
+    for (const p of r.parts) {
+      if (!(p.value > 0)) continue;
+      const h = (p.value / max) * innerH;
+      if (h < 1) continue;
+      svg += '<rect x="' + (x + 1) + '" y="' + (yBot - h) + '" width="' + (slot - 2) + '" height="' + h + '" fill="' + p.color + '"><title>' + esc(r.label + ": " + p.name + " " + (opts.fmt ? opts.fmt(p.value) : fmtCompact(p.value))) + "</title></rect>";
+      yBot -= h;
+    }
+  });
+  const xEvery = opts.xEvery || Math.max(1, Math.ceil(rows.length / 9));
+  rows.forEach((r, i) => {
+    if (i % xEvery !== 0) return;
+    svg += '<text x="' + (PL + i * slot + slot / 2) + '" y="' + (H - 5) + '" text-anchor="middle" fill="var(--faint)" font-size="8.5" font-family="var(--mono)">' + esc(r.label) + "</text>";
+  });
+  svg += "</svg>";
+  const legend = (opts.legend || []).map((l) => '<span style="display:inline-flex;align-items:center;gap:4px;margin-right:10px;color:var(--muted);font-size:11px"><span class="sw" style="background:' + l.color + '"></span>' + esc(l.name) + "</span>").join("");
+  host.innerHTML = svg + (legend ? '<div style="margin-top:6px">' + legend + "</div>" : "");
+}
+
+// Palette for provider/model donut segments (theme-friendly, distinct hues).
+const CHART_COLORS = ["#4ade80", "#60a5fa", "#c084fc", "#fbbf24", "#f87171", "#34d399", "#f472b6", "#22d3ee", "#fb923c", "#a3e635"];
+function segmentColor(i) { return CHART_COLORS[i % CHART_COLORS.length]; }
 
 // Context window tracker: how much of the preset's window this conversation used.
 function fmtContext(pTok, cTok, modelId) {
@@ -2054,7 +2792,7 @@ function setTokensMetric(pTok, cTok, tps) {
     "</span> tps";
 }
 
-function setCostMetric(pTok, cTok) {
+function setCostMetric(pTok, cTok, cacheHitPct) {
   if (pTok == null) {
     setDebug("dbgCost", "-");
     setDebug("dbgContext", "-");
@@ -2062,7 +2800,7 @@ function setCostMetric(pTok, cTok) {
   }
   // Cost/context derive from the currently selected preset's meta.
   const modelId = $("pgModel").value;
-  setDebug("dbgCost", fmtCost(calcCost(pTok, cTok, modelId)));
+  setDebug("dbgCost", fmtCost(calcCost(pTok, cTok, modelId, cacheHitPct)));
   setDebug("dbgContext", fmtContext(pTok, cTok, modelId));
 }
 
@@ -2103,6 +2841,7 @@ function applyServerDebugMetrics() {
   const pTok = best.promptTokens != null ? best.promptTokens : (pg.lastUsage && pg.lastUsage.prompt_tokens != null ? pg.lastUsage.prompt_tokens : null);
   const cTok = best.completionTokens != null ? best.completionTokens : (pg.lastUsage && pg.lastUsage.completion_tokens != null ? pg.lastUsage.completion_tokens : null);
   const cache = best.cacheHit != null ? best.cacheHit : null;
+  const cachePct = typeof best.cacheHitPct === "number" ? best.cacheHitPct : null;
 
   setLatencyMetric(latencyMs, ttft);
 
@@ -2118,7 +2857,7 @@ function applyServerDebugMetrics() {
   const hitRate = cacheTotal > 0 ? Math.round((pg.cacheHits / cacheTotal) * 100) : 0;
   setDebug("dbgCache", cacheTotal > 0 ? hitRate + "% hit (" + pg.cacheHits + "/" + cacheTotal + ")" : "n/a", cacheTotal > 0 && hitRate > 50 ? "ok" : "");
 
-  setCostMetric(pTok, cTok);
+  setCostMetric(pTok, cTok, cachePct);
 
   // Persist so the cumulative counters survive reloads too.
   savePlaygroundState();
@@ -2599,21 +3338,42 @@ setInterval(() => {
     const until = parseInt(el.dataset.next, 10);
     if (until) el.textContent = fmtCountdown(until);
   });
-  // Live uptime without re-rendering the stats/header sections (keeps the
-  // "popping" fix intact — the sections only redraw on real data changes).
-  const u = state.stats && state.stats.uptimeMs;
+  // Live uptime without re-rendering the dashboard sections (the "popping"
+  // fix stays intact — sections only redraw on real data changes). The header
+  // shows the snapshot's uptime plus the elapsed time since the last fetch.
+  const u = state.dash && state.dash.uptimeMs;
   if (u != null) {
+    const live = u + (state.dashFetchedAt ? Date.now() - state.dashFetchedAt : 0);
     const headerUptime = $("uptime");
-    if (headerUptime) headerUptime.textContent = fmtUptime(u);
-    const statsUptime = document.querySelector("[data-stats-uptime]");
-    if (statsUptime) statsUptime.textContent = fmtUptime(u);
+    if (headerUptime) headerUptime.textContent = fmtUptime(live);
+    // Only refresh the uptime KPI text without forcing a full re-render.
+    const kpiUptimeCell = document.querySelector("#kpiStrip .kpi:last-child .v");
+    if (kpiUptimeCell) kpiUptimeCell.textContent = fmtUptime(live);
   }
 }, 1000);
 
-let pollTimer = null;
+// Range toggles: 24h (hourly) vs 7d (daily) for the spend and tokens charts.
+document.querySelectorAll("#spendRangeToggle button, #tokensRangeToggle button").forEach((btn) => {
+  btn.addEventListener("click", () => setDashRange(btn.dataset.range));
+});
+
+// History filters (client-side over the polled snapshot).
+$("hfModel").addEventListener("input", () => { historyFilters.model = $("hfModel").value.trim().toLowerCase(); renderHistory(); });
+$("hfBackend").addEventListener("input", () => { historyFilters.backend = $("hfBackend").value.trim().toLowerCase(); renderHistory(); });
+$("hfCache").addEventListener("change", () => { historyFilters.cache = $("hfCache").value; renderHistory(); });
+$("hfErrors").addEventListener("change", () => { historyFilters.errorsOnly = $("hfErrors").checked; renderHistory(); });
+
+// Polling cadence (do not hammer): dashboard drives the live cards + charts
+// every 3s; history drives the table every 5s. Both are gated by autoRefresh.
+let dashTimer = null;
+let histTimer = null;
 function syncPollTimer() {
-  clearInterval(pollTimer);
-  if ($("autoRefresh").checked) pollTimer = setInterval(poll, 2000);
+  clearInterval(dashTimer);
+  clearInterval(histTimer);
+  if ($("autoRefresh").checked) {
+    dashTimer = setInterval(pollDashboard, 3000);
+    histTimer = setInterval(pollHistory, 5000);
+  }
 }
 $("autoRefresh").addEventListener("change", () => {
   syncPollTimer();

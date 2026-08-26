@@ -244,6 +244,7 @@ three-layer shape at load, byte-identically for identical effective configs.
 | GET | `/v1/models` | OpenAI-compatible model list (preset ids) |
 | POST | `/v1/chat/completions` | chat completions (stream + non-stream) |
 | GET | `/api/stats` | traffic stats |
+| GET | `/api/dashboard` | analytics aggregates for the Dashboard tab (KPIs, per-backend/per-model, hourly/daily series, cooling timeline, pricing) |
 | GET | `/api/history?limit=N` | request history (default 100, clamp 1..500) |
 | GET | `/api/history/detail?t=<timestamp>` or `?call=<callId>` | deep-dive detail for one history entry (payload, attempts, response summary) |
 | GET | `/api/config` | normalized config (env NAMES only, never key values) |
@@ -316,18 +317,26 @@ click-to-open detail panel per row, config viewer, and a playground that can
 stream a chat, show reasoning, compare models side by side, and export the
 conversation.
 
+Dashboard analytics: the Dashboard tab adds a KPI strip, spend/tokens/latency/
+error charts with peak-window shading, backend/model/cache donuts, savings
+badges for cache and off-peak discounts, a cooling timeline, and a filterable
+request history with a cost column. All of it is fed by `GET /api/dashboard`,
+seeded at startup from the `router-history.jsonl` tail so charts survive
+restarts; the contract is in DESIGN-3LAYER.md section 14.
+
 ## Test
 
 ```bash
 npm test   # node test.mjs
 ```
 
-The suite (100 assertions) spins up mock backends and router instances on temp
+The suite (245 assertions) spins up mock backends and router instances on temp
 configs — no keys, no network. It covers health, streaming, session affinity,
 failover, weighted selection, sticky/timed manual cools, fallback exclusion,
 dialect handling, synthesis from both legacy eras, the layered-params merge
 order, preset-of-presets nesting (expansion, cycle detection, ordering rules),
-per-model retry/backoff, and the request-detail endpoint.
+per-model retry/backoff, the request-detail endpoint, and the analytics
+dashboard (cost engine, /api/dashboard aggregates, cooling timeline).
 
 ## Design docs
 

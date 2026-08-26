@@ -10,6 +10,8 @@
       "apiKeyEnv": "OPENCODE_GO_ALT_KEY", "translateDeveloperRole": true, "idleTimeoutMs": 120000 },
     { "id": "go-alt2", "baseURL": "https://opencode.ai/zen/go/v1",
       "apiKeyEnv": "OPENCODE_GO_ALT2_KEY", "translateDeveloperRole": true, "idleTimeoutMs": 120000 },
+    { "id": "go-alt3", "baseURL": "https://opencode.ai/zen/go/v1",
+      "apiKeyEnv": "OPENCODE_GO_ALT3_KEY", "translateDeveloperRole": true, "idleTimeoutMs": 120000 },
     { "id": "direct", "baseURL": "https://api.deepseek.com/v1",
       "apiKeyEnv": "DEEPSEEK_API_KEY", "translateDeveloperRole": true, "idleTimeoutMs": 120000 },
     { "id": "commandcode", "baseURL": "https://api.commandcode.ai/provider/v1",
@@ -24,15 +26,16 @@
         { "backend": "go-primary", "upstream": "deepseek-v4-flash" },
         { "backend": "go-alt", "upstream": "deepseek-v4-flash" },
         { "backend": "go-alt2", "upstream": "deepseek-v4-flash" },
-        { "backend": "commandcode", "upstream": "deepseek/deepseek-v4-flash" },
-        { "backend": "direct", "upstream": "deepseek-v4-flash" }
+        { "backend": "go-alt3", "upstream": "deepseek-v4-flash" },
+        { "backend": "direct", "upstream": "deepseek-v4-flash" },
+        { "backend": "commandcode", "upstream": "deepseek/deepseek-v4-flash" }
       ],
-      "affinityPool": 3,
+      "affinityPool": 4,
       "params": { "thinking": { "type": "enabled" }, "reasoning_effort": "high" },
       "meta": {
         "label": "DeepSeek V4 Flash",
         "contextWindow": 128000,
-        "pricing": { "inputPerM": 0.18, "outputPerM": 0.87 }
+        "pricing": { "inputPerM": 0.44, "cacheHitInputPerM": 0.014, "outputPerM": 1.32, "offPeak": true }
       }
     },
     "deepseek-v4-flash-direct": {
@@ -43,7 +46,7 @@
       "meta": {
         "label": "DeepSeek V4 Flash",
         "contextWindow": 128000,
-        "pricing": { "inputPerM": 0.18, "outputPerM": 0.87 }
+        "pricing": { "inputPerM": 0.44, "cacheHitInputPerM": 0.014, "outputPerM": 1.32, "offPeak": true }
       }
     },
     "deepseek-v4-flash-commandcode": {
@@ -55,7 +58,7 @@
       "meta": {
         "label": "DeepSeek V4 Flash (CommandCode only)",
         "contextWindow": 128000,
-        "pricing": { "inputPerM": 0.18, "outputPerM": 0.87 }
+        "pricing": { "inputPerM": 0.44, "cacheHitInputPerM": 0.014, "outputPerM": 1.32, "offPeak": true }
       }
     },
     "glm-5.3": {
@@ -64,14 +67,15 @@
         { "backend": "commandcode", "upstream": "zai-org/GLM-5.3" },
         { "backend": "go-primary", "upstream": "glm-5.3" },
         { "backend": "go-alt", "upstream": "glm-5.3" },
-        { "backend": "go-alt2", "upstream": "glm-5.3" }
+        { "backend": "go-alt2", "upstream": "glm-5.3" },
+        { "backend": "go-alt3", "upstream": "glm-5.3" }
       ],
       "affinityPool": 2,
       "params": { "reasoning_effort": "medium" },
       "meta": {
         "label": "GLM 5.3",
         "contextWindow": 1000000,
-        "pricing": { "inputPerM": 1.40, "outputPerM": 4.40 }
+        "pricing": { "inputPerM": 1.40, "cacheHitInputPerM": 0.26, "outputPerM": 4.40 }
       }
     },
     "deepseek-v4-pro": {
@@ -79,14 +83,15 @@
         { "backend": "go-primary", "upstream": "deepseek-v4-pro" },
         { "backend": "go-alt", "upstream": "deepseek-v4-pro" },
         { "backend": "go-alt2", "upstream": "deepseek-v4-pro" },
+        { "backend": "go-alt3", "upstream": "deepseek-v4-pro" },
         { "backend": "commandcode", "upstream": "deepseek/deepseek-v4-pro" },
         { "backend": "direct", "upstream": "deepseek-v4-pro" }
       ],
-      "affinityPool": 3,
+      "affinityPool": 4,
       "meta": {
         "label": "DeepSeek V4 Pro",
         "contextWindow": 1000000,
-        "pricing": { "inputPerM": 0.66, "outputPerM": 1.98 }
+        "pricing": { "inputPerM": 1.32, "cacheHitInputPerM": 0.044, "outputPerM": 3.96, "offPeak": true }
       }
     },
     "mimo-v2.5-pro": {
@@ -94,9 +99,10 @@
         { "backend": "go-primary", "upstream": "mimo-v2.5-pro" },
         { "backend": "go-alt", "upstream": "mimo-v2.5-pro" },
         { "backend": "go-alt2", "upstream": "mimo-v2.5-pro" },
+        { "backend": "go-alt3", "upstream": "mimo-v2.5-pro" },
         { "backend": "commandcode", "upstream": "xiaomi/mimo-v2.5-pro" }
       ],
-      "affinityPool": 3,
+      "affinityPool": 4,
       "meta": {
         "label": "MiMo V2.5 Pro",
         "contextWindow": 1000000,
@@ -120,7 +126,8 @@
         { "backend": "commandcode", "upstream": "stealth/ox-alpha" },
         { "backend": "go-primary", "upstream": "ox-alpha-free" },
         { "backend": "go-alt", "upstream": "ox-alpha-free" },
-        { "backend": "go-alt2", "upstream": "ox-alpha-free" }
+        { "backend": "go-alt2", "upstream": "ox-alpha-free" },
+        { "backend": "go-alt3", "upstream": "ox-alpha-free" }
       ],
       "affinityPool": 2,
       "params": { "reasoning_effort": "high" },
@@ -141,7 +148,7 @@
       "meta": {
         "label": "Qwen 3.7 Flash",
         "contextWindow": 1000000,
-        "pricing": { "inputPerM": 0.00000003, "outputPerM": 0.00000013 }
+        "pricing": { "inputPerM": 0.03, "outputPerM": 0.13 }
       }
     },
     "muse-spark-1.2-contributor": {
@@ -154,7 +161,7 @@
       "meta": {
         "label": "Muse Spark 1.2 Contributor",
         "contextWindow": 1048576,
-        "pricing": { "inputPerM": 0.0000001, "outputPerM": 0.0000002 }
+        "pricing": { "inputPerM": 0.10, "cacheHitInputPerM": 0.002, "outputPerM": 0.20 }
       }
     },
     "qwen3.7-plus": {
@@ -162,6 +169,7 @@
         { "backend": "go-primary", "upstream": "qwen3.7-plus" },
         { "backend": "go-alt", "upstream": "qwen3.7-plus" },
         { "backend": "go-alt2", "upstream": "qwen3.7-plus" },
+        { "backend": "go-alt3", "upstream": "qwen3.7-plus" },
         { "backend": "commandcode", "upstream": "Qwen/Qwen3.7-Plus" }
       ],
       "affinityPool": 2,
@@ -170,7 +178,7 @@
       "meta": {
         "label": "Qwen 3.7 Plus",
         "contextWindow": 1000000,
-        "pricing": { "inputPerM": 0.0000005, "outputPerM": 0.0000015 }
+        "pricing": { "inputPerM": 0.32, "cacheHitInputPerM": 0.032, "outputPerM": 1.28 }
       }
     },
     "qwen3.8-max": {
@@ -178,6 +186,7 @@
         { "backend": "go-primary", "upstream": "qwen3.8-max" },
         { "backend": "go-alt", "upstream": "qwen3.8-max" },
         { "backend": "go-alt2", "upstream": "qwen3.8-max" },
+        { "backend": "go-alt3", "upstream": "qwen3.8-max" },
         { "backend": "commandcode", "upstream": "Qwen/Qwen3.8-Max" }
       ],
       "affinityPool": 2,
@@ -186,7 +195,7 @@
       "meta": {
         "label": "Qwen 3.8 Max",
         "contextWindow": 1000000,
-        "pricing": { "inputPerM": 0.0000005, "outputPerM": 0.0000015 }
+        "pricing": { "inputPerM": 2.00, "outputPerM": 6.00 }
       }
     },
     "deepseek-v4-flash-vision-exp": {
@@ -194,17 +203,25 @@
         { "backend": "go-primary", "upstream": "deepseek-v4-flash-vision-exp" },
         { "backend": "go-alt", "upstream": "deepseek-v4-flash-vision-exp" },
         { "backend": "go-alt2", "upstream": "deepseek-v4-flash-vision-exp" },
+        { "backend": "go-alt3", "upstream": "deepseek-v4-flash-vision-exp" },
         { "backend": "commandcode", "upstream": "deepseek/deepseek-v4-flash-vision-exp" },
         { "backend": "direct", "upstream": "deepseek-v4-flash-vision-exp" }
       ],
-      "affinityPool": 3,
+      "affinityPool": 4,
       "params": { "thinking": { "type": "enabled" }, "reasoning_effort": "high" },
       "meta": {
         "label": "DeepSeek V4 Flash Vision Exp",
         "contextWindow": 1000000,
-        "pricing": { "inputPerM": 0.18, "outputPerM": 0.87 }
+        "pricing": { "inputPerM": 0.44, "cacheHitInputPerM": 0.014, "outputPerM": 1.32, "offPeak": true }
       }
     }
+  },
+  "pricing": {
+    "offPeakMultiplier": 0.5,
+    "peakWindows": [
+      { "days": "1-5", "start": "01:00", "end": "04:00" },
+      { "days": "1-5", "start": "06:00", "end": "10:00" }
+    ]
   },
   "presets": {
     "deepseek-v4-flash": {
@@ -272,5 +289,21 @@
     "authBaseMs": 60000,
     "authMaxMs": 1800000,
     "weeklyDefaultMs": 604800000
+  },
+  "missCapture": {
+    "enabled": true,
+    "maxMissPct": 50,
+    "minMissTokens": 1000,
+    "file": "router-misses.jsonl",
+    "maxFileBytes": 25000000
+  },
+  "alerts": {
+    "ntfy": {
+      "baseUrl": "https://ntfy.sh",
+      "topic": "switchboardrouter_82738362",
+      "minMissPct": 50,
+      "minMissTokens": 20000,
+      "cooldownMs": 600000
+    }
   }
 }

@@ -13,7 +13,7 @@
 // participate in the all-cooling fallback and a success never clears them.
 
 import http from "node:http";
-import { readFileSync, statSync, watch as watchF, appendFileSync } from "node:fs";
+import { readFileSync, statSync, watch as watchF, appendFileSync, renameSync, openSync, readSync, closeSync } from "node:fs";
 import { readFile as readFileP, rename as renameP, writeFile as writeFileP } from "node:fs/promises";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -77,7 +77,14 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function markHealthy(id) {
+function markHealthy(id, origin) {
+  // Observe the transition OUT of cooling for the dashboard cooling timeline
+  // (success / uncool / reset). A backend that was never cooling emits nothing.
+  const prev = health.get(id);
+  if (prev && prev.state === "cooling") {
+    recordCoolingEvent({ backend: id, action: origin || "success", kind: prev.lastError ? prev.lastError.kind : null, manual: !!(prev.lastError && prev.lastError.kind === "manual") });
+    ANALYTICS.expiredNotified.delete(id);
+  }
   health.set(id, { state: "healthy", nextAvailableAt: 0, fails: 0, backoffMs: 0, lastError: null });
 }
 
@@ -159,6 +166,10 @@ function markFailure(cfg, id, status, bodyText) {
     return;
   }
   h.fails = (h.fails || 0) + 1;
+  // Only a transition INTO cooling lands on the dashboard timeline; a re-cool
+  // of an already-active cooling (the all-cooling fallback retrying the
+  // soonest backend) is not a new failure episode.
+  const wasCoolingActive = h.state === "cooling" && h.nextAvailableAt > Date.now();
   let nextMs;
   if (kind === "weekly") {
     // Parse "Resets in N days" if present, else full week.
@@ -166,6 +177,7 @@ function markFailure(cfg, id, status, bodyText) {
     const days = m ? parseInt(m[1], 10) : 7;
     nextMs = cfg.backoff.weeklyDefaultMs || days * 24 * 60 * 60 * 1000;
     h.fails = 100; // effectively pinned until reset
+    fireAlert(cfg, "weekly_limit", { backend: id, days: m ? parseInt(m[1], 10) : null });
   } else {
     h.backoffMs = backoffFor(kind, cfg, h.fails);
     nextMs = h.backoffMs;
@@ -174,6 +186,7 @@ function markFailure(cfg, id, status, bodyText) {
   h.nextAvailableAt = Date.now() + nextMs;
   h.lastError = { status, kind, body: (bodyText || "").slice(0, 300) };
   health.set(id, h);
+  if (!wasCoolingActive) recordCoolingEvent({ backend: id, action: "cool", kind, manual: false });
 }
 
 function markSuccess(id) {
@@ -185,7 +198,39 @@ function markSuccess(id) {
 }
 
 function resetAllHealth() {
-  for (const id of health.keys()) markHealthy(id);
+  for (const id of health.keys()) markHealthy(id, "reset");
+}
+
+// ---- cooling-event ring (dashboard timeline) ---------------------------------
+//
+// Observes health transitions ONLY - cooling semantics are untouched. The
+// dashboard needs to explain WHY a backend was down: failure cool (with the
+// classified kind), lazy expiry at request time, success clearing, admin
+// uncool, and reset-health. Newest first, capped at 500 rows.
+
+const COOLING_EVENTS = []; // newest at head: {t, backend, action, kind, manual}
+const COOLING_EVENT_CAP = 500;
+
+function recordCoolingEvent({ backend, action, kind, manual }) {
+  COOLING_EVENTS.unshift({ t: Date.now(), backend, action, kind: kind || null, manual: !!manual });
+  if (COOLING_EVENTS.length > COOLING_EVENT_CAP) COOLING_EVENTS.length = COOLING_EVENT_CAP;
+}
+
+// Request-time usability check that doubles as the lazy-expiry observer: a
+// cooling backend whose timer elapsed is immediately usable again, and that
+// elapsed moment lands on the cooling timeline once per expiry (later success /
+// uncool / reset events cover the rest of the lifecycle).
+function isUsableCurrently(id, now) {
+  const h = health.get(id);
+  if (!h || h.state !== "cooling") return true;
+  if (h.nextAvailableAt <= now) {
+    if (!ANALYTICS.expiredNotified.has(id)) {
+      ANALYTICS.expiredNotified.add(id);
+      recordCoolingEvent({ backend: id, action: "expire", kind: h.lastError ? h.lastError.kind : null, manual: !!(h.lastError && h.lastError.kind === "manual") });
+    }
+    return true;
+  }
+  return false;
 }
 
 // ---- history + stats ----------------------------------------------------------
@@ -221,6 +266,139 @@ function recordHistory(entry) {
   } catch {
     // Logging must never crash the router.
   }
+}
+
+// ---- bounded cache-miss payload capture (persistent) -------------------------
+//
+// OPTIONAL. Controlled by the top-level `missCapture` config block; when the
+// block is absent or `enabled` is false the whole path is a no-op so existing
+// behavior is untouched. A cache MISS means the upstream had to re-process
+// (and the user got billed for) the full prompt; capturing the exact payload
+// that missed makes a bad night recoverable for forensics. Storage is bounded:
+// `boundedPayload()` clips content/tools, and the file rotates to `<file>.old`
+// once it exceeds `maxFileBytes`.
+const MISS_CAPTURE = {
+  enabled: false,
+  maxMissPct: 50,
+  minMissTokens: 1000,
+  file: "router-misses.jsonl",
+  maxFileBytes: 25000000,
+};
+
+function missCapturePath(cfg) {
+  const name = (cfg.missCapture && cfg.missCapture.file) || MISS_CAPTURE.file;
+  return join(dirname(CONFIG_PATH), name);
+}
+
+// Append one bounded payload row for a low-cache-hit request. Must NEVER crash
+// the router, so the whole body is guarded. The payload never contains keys:
+// key values live only in env / request headers and are never copied.
+function captureMiss(cfg, entry, payload) {
+  const mc = cfg.missCapture;
+  if (!mc || mc.enabled === false) return;
+  const pct = entry.cacheHitPct;
+  if (pct == null || pct >= (mc.maxMissPct ?? MISS_CAPTURE.maxMissPct)) return;
+  let missTokens = Math.max(0, Math.round((entry.promptTokens || 0) * (1 - pct / 100)));
+  if (missTokens < (mc.minMissTokens ?? MISS_CAPTURE.minMissTokens)) return;
+  const file = missCapturePath(cfg);
+  const row = {
+    t: entry.t,
+    callId: entry.callId,
+    backend: entry.backend,
+    model: entry.model,
+    session: entry.session,
+    cacheHitPct: pct,
+    promptTokens: entry.promptTokens,
+    cacheMissTokens: missTokens,
+    payload: boundedPayload(payload),
+  };
+  try {
+    // Rotate before append so the active file never grows unbounded.
+    try {
+      if (statSync(file).size > (mc.maxFileBytes ?? MISS_CAPTURE.maxFileBytes)) {
+        renameSync(file, file + ".old");
+      }
+    } catch {
+      // First write (no file yet) or a transient stat failure is fine.
+    }
+    appendFileSync(file, JSON.stringify(row) + "\n");
+  } catch {
+    // Capture must never crash the router.
+  }
+}
+
+// ---- ntfy push alerts (OPTIONAL) ---------------------------------------------
+//
+// OPTIONAL. Controlled by the top-level `alerts.ntfy` block ({baseUrl, topic,
+// minMissPct, minMissTokens, cooldownMs, events?}). When it is absent, or the
+// kind's event is explicitly disabled (`events[kind] === false`), nothing is
+// sent. Alerts are fire-and-forget: they must never block the hot request path
+// or crash the router if ntfy is unreachable. Cooldown per kind suppresses an
+// alert storm. Messages carry NO secrets (no keys).
+const alertCooldowns = new Map();
+const NTFY_DEFAULT_BASE = "https://ntfy.sh";
+const ALERT_DEFS = {
+  cache_miss: { title: "Cache break on switchblade", tag: "warning", priority: 3 },
+  weekly_limit: { title: "Backend weekly usage limit reached", tag: "rotating_light", priority: 4 },
+  all_cooling: { title: "All backends cooling", tag: "sos", priority: 5 },
+  request_exhausted: { title: "Request failed - every provider down", tag: "exclamation", priority: 4 },
+  relay_cut: { title: "Stream cut mid-relay", tag: "warning", priority: 3 },
+};
+
+function alertMessage(kind, f) {
+  switch (kind) {
+    case "cache_miss":
+      return `Cache break on ${f.backend}: ${f.cacheHitPct}% hit, ~${f.missTokens} miss tokens (prompt ${f.promptTokens}, model ${f.model}, session ${f.session})`;
+    case "weekly_limit":
+      return `${f.backend} hit its weekly usage limit (resets in ${f.days ?? "?"} days); other providers may still serve`;
+    case "all_cooling":
+      return `All backends are cooling (${f.manualCooled} manually cooled); requests fail with 503`;
+    case "request_exhausted":
+      return `Request ${f.callId} (model ${f.model}) failed on every provider: ${f.error || "unknown"}`;
+    case "relay_cut":
+      return `${f.backend} cut mid-relay on ${f.model}: ${f.error}`;
+    default:
+      return null;
+  }
+}
+
+function buildAlert(cfg, kind, fields) {
+  const n = cfg.alerts && cfg.alerts.ntfy;
+  if (!n || !n.topic || !ALERT_DEFS[kind]) return null;
+  const events = n.events || {};
+  if (events[kind] === false) return null;
+  const message = alertMessage(kind, fields);
+  if (!message) return null;
+  const last = alertCooldowns.get(kind) || 0;
+  const cooldownMs = n.cooldownMs ?? 600000;
+  if (Date.now() - last < cooldownMs) return null;
+  alertCooldowns.set(kind, Date.now());
+  return {
+    url: (n.baseUrl || NTFY_DEFAULT_BASE).replace(/\/$/, "") + "/" + n.topic,
+    body: {
+      topic: n.topic,
+      title: ALERT_DEFS[kind].title,
+      message,
+      tags: [ALERT_DEFS[kind].tag],
+      priority: ALERT_DEFS[kind].priority,
+    },
+  };
+}
+
+function fireAlert(cfg, kind, fields) {
+  const a = buildAlert(cfg, kind, fields);
+  if (!a) return;
+  // Fire-and-forget: a slow/unreachable ntfy must not stall or crash the router.
+  fetch(a.url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(a.body),
+    signal: AbortSignal.timeout(5000),
+  }).catch(() => {});
+}
+
+function resetAlertCooldowns() {
+  alertCooldowns.clear();
 }
 
 // ---- request detail store (deep-dive side panel) -----------------------------
@@ -323,6 +501,7 @@ function newHistoryEntry(f) {
     completionTokens: f.completionTokens ?? 0,   // completion usage tokens (0 if upstream did not report)
     reasoningTokens: f.reasoningTokens ?? 0,     // reasoning-only completion tokens (usage.completion_tokens_details.reasoning_tokens; 0 if not reported - "0" and "not reported" are indistinguishable)
     cacheHit: f.cacheHit,                          // tri-state: true (header/usage hit), false (miss reported), null (unknown - no signal)
+    cacheHitPct: f.cacheHitPct ?? null,            // 0..100 share of prompt tokens served from cache (hit/(hit+miss)); low % = early cache break; null = no measurable signal
     genMs: f.genMs ?? 0,                         // generation time: stream duration, or total - ttft for non-stream
     tps: f.tps ?? 0,                             // completion tokens per second (derived)
     session: f.session,
@@ -331,6 +510,13 @@ function newHistoryEntry(f) {
     retries: f.retries ?? 0,                     // number of retry attempts performed on the serving provider (0 = none)
     retryWaitedMs: f.retryWaitedMs ?? 0,         // total ms spent waiting in backoff across retries
     relayError: f.relayError ?? null,            // relay cut mid-body on a 200 row (idle timeout / upstream drop) - null = clean
+    promptCacheHitTokens: f.promptCacheHitTokens ?? 0, // raw prompt tokens served from cache (0 = upstream did not report a split)
+    promptCacheMissTokens: f.promptCacheMissTokens != null ? f.promptCacheMissTokens : Math.max(0, (f.promptTokens ?? 0) - (f.promptCacheHitTokens ?? 0)), // raw miss tokens; derived from prompt - hit when the upstream only reports hits
+    errorKind: f.errorKind ?? null,              // classified upstream failure kind (weekly/rate/auth/server/client); null = no upstream failure
+    cost: f.cost ?? null,                        // request cost in USD (see computeCost); null = model has no meta.pricing
+    cacheSavings: f.cacheSavings ?? null,        // USD saved by cache hits vs full-price miss (peak rates)
+    offPeakSavings: f.offPeakSavings ?? null,    // USD saved by the off-peak discount (0 when it did not apply)
+    offPeak: f.offPeak ?? null,                  // whether off-peak pricing applied to this request
   };
 }
 
@@ -354,7 +540,7 @@ function recordStats(entry) {
   STATS.total++;
   const b = STATS.byBackend[entry.backend] || {
     requests: 0, ok: 0, errors: 0, latencySumMs: 0, latencyMaxMs: 0,
-    promptTokensSum: 0, completionTokensSum: 0, cacheHits: 0, ttftSumMs: 0,
+    promptTokensSum: 0, completionTokensSum: 0, cacheHits: 0, cacheHitPctSum: 0, cachePctKnown: 0, ttftSumMs: 0,
   };
   b.requests++;
   if (entry.status >= 200 && entry.status < 400) b.ok++;
@@ -365,8 +551,313 @@ function recordStats(entry) {
   if (entry.promptTokens) b.promptTokensSum += entry.promptTokens;
   if (entry.completionTokens) b.completionTokensSum += entry.completionTokens;
   if (entry.cacheHit) b.cacheHits++;
+  if (typeof entry.cacheHitPct === "number") { b.cacheHitPctSum = (b.cacheHitPctSum || 0) + entry.cacheHitPct; b.cachePctKnown = (b.cachePctKnown || 0) + 1; }
   STATS.byBackend[entry.backend] = b;
   STATS.byModel[entry.model] = (STATS.byModel[entry.model] || 0) + 1;
+}
+
+// ---- analytics aggregates (dashboard) ----------------------------------------
+//
+// In-memory KPI + bucket store backing /api/dashboard. Fed at every
+// history-entry finalization site via recordAnalytics() and seeded from the
+// JSONL tail at startup so the charts survive restarts. Hour slots are
+// hour-start epoch ms; day slots are UTC-midnight epoch ms. The payload keeps
+// cost/cache/rate fields null until real data exists - null is the contract's
+// "no data" signal, never a fake zero.
+
+const ANALYTICS = {
+  kpis: {
+    requests: 0, ok: 0, errors: 0,
+    promptTokens: 0, completionTokens: 0,
+    cacheHitTokens: 0, cacheMissTokens: 0, cacheKnown: 0,
+    priced: 0, cost: 0, cacheSavings: 0, offPeakSavings: 0, offPeakRequests: 0,
+    models: new Set(), // distinct model ids seen (seeded rows too)
+  },
+  byBackend: new Map(), // backendId -> accumulator (shape below)
+  byModel: new Map(),   // modelId -> accumulator (same shape)
+  hourly: new Map(),    // hourSlot -> {requests, ok, errors, promptTokens, completionTokens, cacheHitTokens, cacheMissTokens, cost, priced, latencySumMs, latencyMaxMs}
+  daily: new Map(),     // daySlot -> {requests, errors, promptTokens, completionTokens, cacheHitTokens, cacheMissTokens, cost, priced}
+  expiredNotified: new Set(), // cooling backends whose expiry already hit the ring
+};
+
+const okStatus = (s) => s >= 200 && s <= 299;
+
+function newAnalyticsAcc() {
+  return { requests: 0, ok: 0, errors: 0, latencySumMs: 0, latencyMaxMs: 0, promptTokens: 0, completionTokens: 0, cost: 0, priced: 0, cacheHits: 0, cacheKnown: 0, cacheHitTokens: 0, cacheMissTokens: 0 };
+}
+
+// One accumulator update for a fully-shaped history entry (live or seeded).
+// Cache denominators only count requests that actually carried a hit/miss
+// split; a signal-less row (hit+miss == 0) must not drag the rate toward 0.
+function recordAnalytics(entry) {
+  const status = entry.status || 0;
+  const promptTokens = entry.promptTokens || 0;
+  const completionTokens = entry.completionTokens || 0;
+  const hit = entry.promptCacheHitTokens || 0;
+  const miss = entry.promptCacheMissTokens || 0;
+  const cost = Number.isFinite(entry.cost) ? entry.cost : null;
+  const k = ANALYTICS.kpis;
+  k.requests++;
+  if (okStatus(status)) k.ok++;
+  else k.errors++;
+  k.promptTokens += promptTokens;
+  k.completionTokens += completionTokens;
+  if (hit + miss > 0) {
+    k.cacheHitTokens += hit;
+    k.cacheMissTokens += miss;
+    k.cacheKnown++;
+  }
+  if (cost != null) {
+    k.priced++;
+    k.cost += cost;
+    if (entry.cacheSavings != null) k.cacheSavings += entry.cacheSavings;
+    if (entry.offPeakSavings != null) k.offPeakSavings += entry.offPeakSavings;
+  }
+  if (entry.offPeak === true) k.offPeakRequests++;
+  if (entry.model != null) k.models.add(entry.model);
+
+  const backend = entry.backend || "none";
+  let b = ANALYTICS.byBackend.get(backend);
+  if (!b) {
+    b = newAnalyticsAcc();
+    ANALYTICS.byBackend.set(backend, b);
+  }
+  b.requests++;
+  if (okStatus(status)) b.ok++;
+  else b.errors++;
+  b.latencySumMs += entry.latencyMs || 0;
+  if ((entry.latencyMs || 0) > b.latencyMaxMs) b.latencyMaxMs = entry.latencyMs || 0;
+  b.promptTokens += promptTokens;
+  b.completionTokens += completionTokens;
+  if (cost != null) { b.priced++; b.cost += cost; }
+  if (entry.cacheHit === true) b.cacheHits++;
+  if (entry.cacheHit === true || entry.cacheHit === false) b.cacheKnown++;
+  if (hit + miss > 0) {
+    b.cacheHitTokens += hit;
+    b.cacheMissTokens += miss;
+  }
+
+  if (entry.model != null) {
+    let m = ANALYTICS.byModel.get(entry.model);
+    if (!m) {
+      m = newAnalyticsAcc();
+      ANALYTICS.byModel.set(entry.model, m);
+    }
+    m.requests++;
+    if (okStatus(status)) m.ok++;
+    else m.errors++;
+    m.latencySumMs += entry.latencyMs || 0;
+    if ((entry.latencyMs || 0) > m.latencyMaxMs) m.latencyMaxMs = entry.latencyMs || 0;
+    m.promptTokens += promptTokens;
+    m.completionTokens += completionTokens;
+    if (cost != null) { m.priced++; m.cost += cost; }
+    if (hit + miss > 0) {
+      m.cacheHitTokens += hit;
+      m.cacheMissTokens += miss;
+    }
+  }
+
+  const hSlot = Math.floor(entry.t / 3600000) * 3600000;
+  let hb = ANALYTICS.hourly.get(hSlot);
+  if (!hb) {
+    hb = { requests: 0, ok: 0, errors: 0, promptTokens: 0, completionTokens: 0, cacheHitTokens: 0, cacheMissTokens: 0, cost: 0, priced: 0, latencySumMs: 0, latencyMaxMs: 0 };
+    ANALYTICS.hourly.set(hSlot, hb);
+  }
+  hb.requests++;
+  if (okStatus(status)) hb.ok++;
+  else hb.errors++;
+  hb.promptTokens += promptTokens;
+  hb.completionTokens += completionTokens;
+  if (hit + miss > 0) {
+    hb.cacheHitTokens += hit;
+    hb.cacheMissTokens += miss;
+  }
+  if (cost != null) { hb.priced++; hb.cost += cost; }
+  hb.latencySumMs += entry.latencyMs || 0;
+  if ((entry.latencyMs || 0) > hb.latencyMaxMs) hb.latencyMaxMs = entry.latencyMs || 0;
+
+  const dSlot = Math.floor(entry.t / 86400000) * 86400000;
+  let db = ANALYTICS.daily.get(dSlot);
+  if (!db) {
+    db = { requests: 0, errors: 0, promptTokens: 0, completionTokens: 0, cacheHitTokens: 0, cacheMissTokens: 0, cost: 0, priced: 0 };
+    ANALYTICS.daily.set(dSlot, db);
+  }
+  db.requests++;
+  if (!okStatus(status)) db.errors++;
+  db.promptTokens += promptTokens;
+  db.completionTokens += completionTokens;
+  if (hit + miss > 0) {
+    db.cacheHitTokens += hit;
+    db.cacheMissTokens += miss;
+  }
+  if (cost != null) { db.priced++; db.cost += cost; }
+}
+
+function coolingCount(now) {
+  let n = 0;
+  for (const h of health.values()) {
+    if (h.state === "cooling" && h.nextAvailableAt > now) n++;
+  }
+  return n;
+}
+
+// Build the exact /api/dashboard payload: windows are generated at read time
+// (exactly 24 hour-slots oldest first, exactly 30 day-slots ending today), so
+// empty slots materialize as zeroed rows without needing a store sweep.
+function dashboardPayload(cfg) {
+  const now = Date.now();
+  const k = ANALYTICS.kpis;
+  const priced = k.priced > 0;
+  const kpis = {
+    requests: k.requests,
+    ok: k.ok,
+    errors: k.errors,
+    errorRate: k.requests > 0 ? k.errors / k.requests : null,
+    promptTokens: k.promptTokens,
+    completionTokens: k.completionTokens,
+    cacheHitTokens: k.cacheHitTokens,
+    cacheMissTokens: k.cacheMissTokens,
+    cacheHitRate: k.cacheKnown > 0 ? k.cacheHitTokens / (k.cacheHitTokens + k.cacheMissTokens) : null,
+    cost: priced ? k.cost : null,
+    cacheSavings: priced ? k.cacheSavings : null,
+    offPeakSavings: priced ? k.offPeakSavings : null,
+    offPeakRequests: k.offPeakRequests,
+    offPeakShare: k.requests > 0 ? k.offPeakRequests / k.requests : null,
+    cooledBackends: coolingCount(now),
+    activeModelCount: k.models.size,
+  };
+
+  const byBackend = cfg.backends.map((b) => {
+    const acc = ANALYTICS.byBackend.get(b.id);
+    const h = health.get(b.id) || {};
+    const isCooling = h.state === "cooling" && h.nextAvailableAt > now;
+    return {
+      id: b.id,
+      requests: acc ? acc.requests : 0,
+      ok: acc ? acc.ok : 0,
+      errors: acc ? acc.errors : 0,
+      errorRate: acc && acc.requests > 0 ? acc.errors / acc.requests : null,
+      latencyAvgMs: acc && acc.requests > 0 ? acc.latencySumMs / acc.requests : null,
+      latencyMaxMs: acc ? acc.latencyMaxMs : 0,
+      promptTokens: acc ? acc.promptTokens : 0,
+      completionTokens: acc ? acc.completionTokens : 0,
+      cost: acc && acc.priced > 0 ? acc.cost : null,
+      cacheHits: acc ? acc.cacheHits : 0,
+      cacheKnown: acc ? acc.cacheKnown : 0,
+      cacheHitRate: acc && acc.cacheKnown > 0 ? acc.cacheHitTokens / (acc.cacheHitTokens + acc.cacheMissTokens) : null,
+      state: isCooling ? "cooling" : "healthy",
+      fails: h.fails || 0,
+      lastErrorKind: (h.lastError && h.lastError.kind) || null,
+      manual: !!(isCooling && h.lastError && h.lastError.kind === "manual"),
+    };
+  });
+
+  const byModel = [];
+  for (const [id, m] of ANALYTICS.byModel) {
+    const mcfg = (cfg.models || {})[id];
+    byModel.push({
+      id,
+      label: (mcfg && mcfg.meta && mcfg.meta.label) || null,
+      requests: m.requests,
+      ok: m.ok,
+      errors: m.errors,
+      errorRate: m.requests > 0 ? m.errors / m.requests : null,
+      latencyAvgMs: m.requests > 0 ? m.latencySumMs / m.requests : null,
+      latencyMaxMs: m.latencyMaxMs,
+      promptTokens: m.promptTokens,
+      completionTokens: m.completionTokens,
+      cost: m.priced > 0 ? m.cost : null,
+      cacheHitRate: m.cacheHitTokens + m.cacheMissTokens > 0 ? m.cacheHitTokens / (m.cacheHitTokens + m.cacheMissTokens) : null,
+    });
+  }
+
+  const curHour = Math.floor(now / 3600000) * 3600000;
+  const hourly = [];
+  for (let i = 23; i >= 0; i--) {
+    const slot = curHour - i * 3600000;
+    const hb = ANALYTICS.hourly.get(slot);
+    hourly.push({
+      t: slot,
+      requests: hb ? hb.requests : 0,
+      ok: hb ? hb.ok : 0,
+      errors: hb ? hb.errors : 0,
+      promptTokens: hb ? hb.promptTokens : 0,
+      completionTokens: hb ? hb.completionTokens : 0,
+      cacheHitTokens: hb ? hb.cacheHitTokens : 0,
+      cacheMissTokens: hb ? hb.cacheMissTokens : 0,
+      cost: hb && hb.priced > 0 ? hb.cost : null,
+      latencyAvgMs: hb && hb.requests > 0 ? hb.latencySumMs / hb.requests : null,
+      latencyMaxMs: hb ? hb.latencyMaxMs : 0,
+    });
+  }
+
+  const curDay = Math.floor(now / 86400000) * 86400000;
+  const daily = [];
+  for (let i = 29; i >= 0; i--) {
+    const slot = curDay - i * 86400000;
+    const db = ANALYTICS.daily.get(slot);
+    daily.push({
+      t: slot,
+      requests: db ? db.requests : 0,
+      errors: db ? db.errors : 0,
+      cost: db && db.priced > 0 ? db.cost : null,
+      tokens: db ? db.promptTokens + db.completionTokens : 0,
+      cacheHitRate: db && db.cacheHitTokens + db.cacheMissTokens > 0 ? db.cacheHitTokens / (db.cacheHitTokens + db.cacheMissTokens) : null,
+    });
+  }
+
+  const pr = cfg.pricing && typeof cfg.pricing === "object" ? cfg.pricing : {};
+  const pricing = {
+    offPeakMultiplier: typeof pr.offPeakMultiplier === "number" ? pr.offPeakMultiplier : 0.5,
+    peakWindows: Array.isArray(pr.peakWindows) ? pr.peakWindows : DEFAULT_PEAK_WINDOWS,
+    modelsWithOffPeak: Object.keys(cfg.models || {}).filter((id) => {
+      const m = cfg.models[id];
+      return !!(m && m.meta && m.meta.pricing && m.meta.pricing.offPeak === true);
+    }),
+  };
+
+  return { since: startedAt, uptimeMs: now - startedAt, kpis, byBackend, byModel, hourly, daily, cooling: COOLING_EVENTS.slice(0, COOLING_EVENT_CAP), pricing };
+}
+
+// Seed the aggregate store from the JSONL tail at startup so the dashboard
+// charts survive restarts. Reads at most the last 20 MB (a pathological
+// history must not delay boot); a partial first line from a tail read is
+// dropped. Malformed lines are skipped; legacy rows still count as requests
+// with zero tokens, exactly like a live entry would.
+function seedAnalytics(file) {
+  let raw;
+  try {
+    const size = statSync(file).size;
+    const MAX_SEED_BYTES = 20 * 1024 * 1024;
+    if (size > MAX_SEED_BYTES) {
+      const fd = openSync(file, "r");
+      try {
+        const buf = Buffer.alloc(MAX_SEED_BYTES);
+        const n = readSync(fd, buf, 0, MAX_SEED_BYTES, size - MAX_SEED_BYTES);
+        raw = buf.subarray(0, n).toString("utf8");
+      } finally {
+        closeSync(fd);
+      }
+      const nl = raw.indexOf("\n");
+      if (nl >= 0) raw = raw.slice(nl + 1);
+    } else {
+      raw = readFileSync(file, "utf8");
+    }
+  } catch {
+    return; // no history file yet - a fresh install
+  }
+  for (const line of raw.split("\n")) {
+    const t = line.trim();
+    if (!t) continue;
+    let row;
+    try {
+      row = JSON.parse(t);
+    } catch {
+      continue;
+    }
+    if (!row || typeof row !== "object" || typeof row.t !== "number" || !Number.isFinite(row.t)) continue;
+    recordAnalytics(row);
+  }
 }
 
 // ---- config normalization ---------------------------------------------------
@@ -1004,10 +1495,7 @@ async function handleChat(req, res, cfg, bodyText) {
   // backends only (soonest nextAvailableAt first); manually cooled backends
   // NEVER participate in the all-cooling fallback.
   const now = Date.now();
-  const healthy = c.ordered.filter((a) => {
-    const h = health.get(a.backend);
-    return !h || h.state !== "cooling" || h.nextAvailableAt <= now;
-  });
+  const healthy = c.ordered.filter((a) => isUsableCurrently(a.backend, now));
   const manualCooled = new Set(
     c.ordered
       .filter((a) => {
@@ -1026,8 +1514,10 @@ async function handleChat(req, res, cfg, bodyText) {
     if (pool.length === 0) {
       const latencyMs = Date.now() - started;
       const detailT = Date.now();
-      const entry = newHistoryEntry({ t: detailT, callId, model: modelId, backend: "none", stream, status: 503, latencyMs, session: sessionKey, routedModel: c.ordered[0] ? c.ordered[0].model : null });
+      const entry = applyCost(newHistoryEntry({ t: detailT, callId, model: modelId, backend: "none", stream, status: 503, latencyMs, session: sessionKey, routedModel: c.ordered[0] ? c.ordered[0].model : null, errorKind: null }), cfg);
       recordHistory(entry);
+      recordAnalytics(entry);
+      fireAlert(cfg, "all_cooling", { manualCooled: manualCooled.size });
       recordStats({ backend: "none", model: modelId, status: 503, latencyMs });
       // Detail record even with no attempts: captures the payload + a "no
       // candidates were eligible" note so the empty-pool 503 is inspectable.
@@ -1043,6 +1533,7 @@ async function handleChat(req, res, cfg, bodyText) {
         completionTokens: 0,
         reasoningTokens: 0,
         cacheHit: null,
+        cacheHitPct: null,
         preview: null,
         errorBody: `all available backends are cooling (${manualCooled.size} manually cooled - uncool to restore)`,
         noEligibleBackends: true,
@@ -1149,13 +1640,16 @@ async function handleChat(req, res, cfg, bodyText) {
       metrics = { ttftMs: latencyMs, cacheHit: false, promptTokens: 0, completionTokens: 0, reasoningTokens: 0, genMs: 0, relayError: String((e && e.message) || e) };
     }
     const genSec = (metrics.genMs || 0) / 1000;
-    const entry = newHistoryEntry({
+    const entry = applyCost(newHistoryEntry({
       t: detailT, callId, model: modelId, backend: attempt.backend, stream, status: 200, latencyMs,
       ttftMs: metrics.ttftMs ?? latencyMs,
       promptTokens: metrics.promptTokens ?? 0,
       completionTokens: metrics.completionTokens ?? 0,
       reasoningTokens: metrics.reasoningTokens ?? 0,
       cacheHit: metrics.cacheHit,
+      cacheHitPct: metrics.cacheHitPct,
+      promptCacheHitTokens: metrics.promptCacheHitTokens,
+      promptCacheMissTokens: metrics.promptCacheMissTokens,
       genMs: metrics.genMs ?? 0,
       tps: genSec > 0 && (metrics.completionTokens || 0) > 0 ? Math.round((metrics.completionTokens / genSec) * 10) / 10 : 0,
       session: sessionKey,
@@ -1164,9 +1658,21 @@ async function handleChat(req, res, cfg, bodyText) {
       retries,
       retryWaitedMs,
       relayError: metrics.relayError || null, // relay cut (idle timeout / upstream drop) for a 200 row
-    });
+      errorKind: null, // upstream returned a 2xx: no failure to classify
+    }), cfg);
     recordHistory(entry);
     recordStats(entry);
+    recordAnalytics(entry);
+    // Persistent bounded capture of the payload behind a big cache miss, and a
+    // push alert when the miss crosses the configured thresholds. Both must
+    // never break the successful response path.
+    captureMiss(cfg, entry, payload);
+    if (typeof metrics.cacheHitPct === "number" && metrics.cacheHitPct < (cfg.alerts && cfg.alerts.ntfy ? (cfg.alerts.ntfy.minMissPct ?? 50) : 50)) {
+      const missTokens = Math.max(0, Math.round((metrics.promptTokens || 0) * (1 - metrics.cacheHitPct / 100)));
+      const amin = cfg.alerts && cfg.alerts.ntfy ? (cfg.alerts.ntfy.minMissTokens ?? 20000) : 20000;
+      if (missTokens >= amin) fireAlert(cfg, "cache_miss", { backend: attempt.backend, cacheHitPct: metrics.cacheHitPct, missTokens, promptTokens: metrics.promptTokens || 0, model: modelId, session: sessionKey });
+    }
+    if (metrics.relayError) fireAlert(cfg, "relay_cut", { backend: attempt.backend, model: modelId, error: metrics.relayError });
     // Finalize the deep-dive detail record (attempt already recorded above) with
     // the response summary.
     finalizeDetail(detailT, {
@@ -1178,6 +1684,7 @@ async function handleChat(req, res, cfg, bodyText) {
       completionTokens: metrics.completionTokens ?? 0,
       reasoningTokens: metrics.reasoningTokens ?? 0,
       cacheHit: metrics.cacheHit,
+      cacheHitPct: metrics.cacheHitPct,
       preview: metrics.preview || null,
       relayError: metrics.relayError || null,
     });
@@ -1187,8 +1694,10 @@ async function handleChat(req, res, cfg, bodyText) {
   // All attempts failed (or were skipped): record the exhausted failure with a
   // 503. The detail record keyed by detailT holds every attempt's outcome.
   const latencyMs = Date.now() - started;
-  const failEntry = newHistoryEntry({ t: detailT, callId, model: modelId, backend: lastTried ? lastTried.backend : "none", stream, status: 503, latencyMs, session: sessionKey, routedModel: c.ordered[0] ? c.ordered[0].model : null });
+  const failEntry = applyCost(newHistoryEntry({ t: detailT, callId, model: modelId, backend: lastTried ? lastTried.backend : "none", stream, status: 503, latencyMs, session: sessionKey, routedModel: c.ordered[0] ? c.ordered[0].model : null, errorKind: lastErr ? classify(lastErr.status, lastErr.body) : null }), cfg);
   recordHistory(failEntry);
+  recordAnalytics(failEntry);
+  fireAlert(cfg, "request_exhausted", { callId, model: modelId, error: lastErr ? String(lastErr.body || lastErr.status) : "all providers unavailable" });
   recordStats({ backend: lastTried ? lastTried.backend : "none", model: modelId, status: 503, latencyMs });
   // A detail record exists whenever at least one attempt ran (recorded per
   // attempt above); finalize it unconditionally.
@@ -1201,6 +1710,7 @@ async function handleChat(req, res, cfg, bodyText) {
     completionTokens: 0,
     reasoningTokens: 0,
     cacheHit: null,
+    cacheHitPct: null,
     preview: null,
     errorBody: lastErr ? lastErr.body : null,
   });
@@ -1218,6 +1728,126 @@ function hasCacheHeader(upstreamRes) {
   return !!(h && h.get && (h.get("x-cache-key") || h.get("cachekey") || h.get("set-cache-key")));
 }
 
+// Per-call cache-hit percentage: 0..100 share of prompt tokens served from
+// cache, rounded to 1 decimal, or null when there is no measurable cache signal.
+// A cache break at message N means everything before N hits and everything from
+// N on misses, so a LOW percentage means the break happened EARLY in the prompt
+// (0% = cold account / break at the very start; 95% = break near the end). This
+// is the number that tells an operator WHERE the break happened, which the
+// boolean cacheHit cannot.
+function cacheHitPctOf(hit, miss, cached, promptTokens) {
+  const hitN = Number(hit);
+  const missN = Number(miss);
+  const cachedN = Number(cached);
+  if (Number.isFinite(hitN) && Number.isFinite(missN)) {
+    const total = hitN + missN;
+    if (total > 0) return Math.round((hitN / total) * 100 * 10) / 10;
+    return null; // both zero = nothing measured
+  }
+  // Folded shapes: some providers only expose cached_tokens (folded into hit),
+  // or hit alone; compare against promptTokens as the denominator.
+  if (Number.isFinite(hitN)) {
+    if (Number.isFinite(Number(promptTokens)) && Number(promptTokens) > 0) return Math.round((hitN / Number(promptTokens)) * 100 * 10) / 10;
+    return null;
+  }
+  if (Number.isFinite(cachedN)) {
+    if (Number.isFinite(Number(promptTokens)) && Number(promptTokens) > 0) return Math.round((cachedN / Number(promptTokens)) * 100 * 10) / 10;
+    return null;
+  }
+  return null;
+}
+
+// ---- per-request cost engine --------------------------------------------------
+//
+// Billing mirrors DeepSeek's published price shape: models declare
+// meta.pricing (USD per 1M tokens, optional cache-split rate) and OPT IN to
+// off-peak pricing with meta.pricing.offPeak === true. Peak windows are
+// weekday UTC hour ranges; everything else (weekends, nights, window gaps) is
+// off-peak at the top-level pricing.offPeakMultiplier (default 0.5 = DeepSeek's
+// half price).
+const DEFAULT_PEAK_WINDOWS = [
+  { days: "1-5", start: "01:00", end: "04:00" },
+  { days: "1-5", start: "06:00", end: "10:00" },
+];
+
+// True when t (epoch ms) is OUTSIDE every peak window. Days are
+// Date.getUTCDay() numbers where "1-5" means Mon-Fri; window times are UTC
+// "HH:MM", start inclusive, end exclusive. Weekends have no windows at all.
+function isOffPeak(t, cfg) {
+  const d = new Date(Number(t) || 0);
+  const day = d.getUTCDay();
+  const mins = d.getUTCHours() * 60 + d.getUTCMinutes();
+  const windows = cfg && cfg.pricing && Array.isArray(cfg.pricing.peakWindows)
+    ? cfg.pricing.peakWindows
+    : DEFAULT_PEAK_WINDOWS;
+  for (const w of windows) {
+    if (!w || typeof w.days !== "string" || typeof w.start !== "string" || typeof w.end !== "string") continue;
+    const dash = w.days.indexOf("-");
+    const dayStart = Number(dash >= 0 ? w.days.slice(0, dash) : w.days);
+    const dayEnd = Number(dash >= 0 ? w.days.slice(dash + 1) : w.days);
+    if (!Number.isFinite(dayStart) || !Number.isFinite(dayEnd) || day < dayStart || day > dayEnd) continue;
+    const [hs, ms] = w.start.split(":").map(Number);
+    const [he, me] = w.end.split(":").map(Number);
+    const startMins = hs * 60 + ms;
+    const endMins = he * 60 + me;
+    if (!Number.isFinite(startMins) || !Number.isFinite(endMins)) continue;
+    if (mins >= startMins && mins < endMins) return false; // inside a peak window
+  }
+  return true; // outside every window (or none configured) -> off-peak
+}
+
+// Fixed precision for reported USD. Token-count * rate/1e6 products sit well
+// below 1e-9 per token, so 10 decimals absorbs binary-fraction noise while
+// keeping exact-number assertions stable.
+const roundCost = (n) => Math.round(n * 1e10) / 1e10;
+
+// Per-request cost in USD from entry + config. Returns null when the model has
+// no meta.pricing (the UI renders "n/a"); otherwise { cost, cacheSavings,
+// offPeakSavings, offPeak } with every number >= 0. cost is the billed amount
+// at effective (possibly off-peak-scaled) rates; cacheSavings is what cache
+// hits saved vs paying full input price, measured at PEAK rates so it does not
+// depend on when the request ran; offPeakSavings is the portion of cost the
+// off-peak discount removed.
+function computeCost(entry, cfg) {
+  const modelCfg = (cfg && cfg.models) ? cfg.models[entry.model] : null;
+  const pricing = modelCfg && modelCfg.meta ? modelCfg.meta.pricing : null;
+  if (!pricing || typeof pricing !== "object") return null;
+  const inputPerM = Number(pricing.inputPerM);
+  const outputPerM = Number(pricing.outputPerM);
+  if (!Number.isFinite(inputPerM) || !Number.isFinite(outputPerM)) return null;
+  const cacheHitInputPerM = pricing.cacheHitInputPerM != null ? Number(pricing.cacheHitInputPerM) : inputPerM;
+  const promptTokens = Math.max(0, Number(entry.promptTokens) || 0);
+  const completionTokens = Math.max(0, Number(entry.completionTokens) || 0);
+  let hitTokens = entry.promptCacheHitTokens == null ? 0 : Number(entry.promptCacheHitTokens);
+  if (!Number.isFinite(hitTokens) || hitTokens < 0) hitTokens = 0;
+  if (hitTokens > promptTokens) hitTokens = promptTokens; // clamp: hits can never exceed the prompt
+  let missTokens = entry.promptCacheMissTokens == null ? NaN : Number(entry.promptCacheMissTokens);
+  if (!Number.isFinite(missTokens)) missTokens = Math.max(0, promptTokens - hitTokens); // miss not reported -> derive from prompt - hit
+  else missTokens = Math.max(0, missTokens);
+  const offPeakTime = isOffPeak(entry.t, cfg);
+  const offPeak = offPeakTime && pricing.offPeak === true; // discount applies only to opted-in models
+  let mult = 1;
+  if (offPeak) {
+    mult = cfg && cfg.pricing && typeof cfg.pricing.offPeakMultiplier === "number" ? cfg.pricing.offPeakMultiplier : 0.5;
+    if (!(mult > 0)) mult = 0.5; // 0/negative multiplier is a config bug; fall back to the standard half price
+  }
+  const cost = roundCost(missTokens * ((inputPerM * mult) / 1e6) + hitTokens * ((cacheHitInputPerM * mult) / 1e6) + completionTokens * ((outputPerM * mult) / 1e6));
+  const cacheSavings = roundCost(hitTokens * ((inputPerM - cacheHitInputPerM) / 1e6)); // peak rates: what the cache hit saved vs full-price miss
+  const offPeakSavings = offPeak ? roundCost(cost * (1 / mult - 1)) : 0; // discount saved vs the peak price
+  return { cost, cacheSavings, offPeakSavings, offPeak };
+}
+
+// Attach the computed cost fields to a history entry in place (all null when
+// the model has no pricing). Returns the entry for chaining.
+function applyCost(entry, cfg) {
+  const c = computeCost(entry, cfg);
+  entry.cost = c ? c.cost : null;
+  entry.cacheSavings = c ? c.cacheSavings : null;
+  entry.offPeakSavings = c ? c.offPeakSavings : null;
+  entry.offPeak = c ? c.offPeak : null;
+  return entry;
+}
+
 // Incremental SSE usage collector. Streaming chat completions normally place
 // the cumulative `usage` object on the final chunk before [DONE], so the LAST
 // usage object seen wins. Chunk boundaries are handled by keeping a partial
@@ -1229,6 +1859,7 @@ function makeUsageCollector() {
   let reasoningTokens = 0;
   let promptCacheHit = 0;
   let promptCacheMiss = 0;
+  let promptCacheMissSeen = false; // miss field actually reported (0 default != "reported zero")
   let cacheFieldSeen = false;
   function consume(line) {
     const t = line.trim();
@@ -1256,7 +1887,10 @@ function makeUsageCollector() {
         if (!Number.isNaN(hit) || !Number.isNaN(miss) || !Number.isNaN(cachedN)) cacheFieldSeen = true;
         if (!Number.isNaN(hit)) promptCacheHit = hit;
         else if (!Number.isNaN(cachedN)) promptCacheHit = cachedN;
-        if (!Number.isNaN(miss)) promptCacheMiss = miss;
+        if (!Number.isNaN(miss)) {
+          promptCacheMiss = miss;
+          promptCacheMissSeen = true;
+        }
       }
     } catch {
       // Non-JSON SSE event (keepalive comment, etc.) — ignore.
@@ -1272,7 +1906,7 @@ function makeUsageCollector() {
     finalize() {
       if (leftover) consume(leftover);
       leftover = "";
-      return { promptTokens, completionTokens, reasoningTokens, promptCacheHit, promptCacheMiss, cacheFieldSeen };
+      return { promptTokens, completionTokens, reasoningTokens, promptCacheHit, promptCacheMiss, promptCacheMissSeen, cacheFieldSeen };
     },
   };
 }
@@ -1516,10 +2150,13 @@ async function relay(res, upstreamRes, stream, backendId, started, callId, idleT
   };
   if (callId) headers["x-router-call"] = callId;
   let cacheHit = null;   // tri-state: true / false / null (unknown - no signal)
+  let cacheHitPct = null; // 0..100 share of prompt tokens from cache; null = no signal
   let promptTokens = 0;
   let completionTokens = 0;
   let reasoningTokens = 0;
   let genMs = 0;
+  let promptCacheHitTokens = 0;  // raw cache-hit prompt tokens (0 = not reported)
+  let promptCacheMissTokens = null; // raw miss tokens; null = not reported -> history derives from prompt - hit
   let preview = null;    // first content fragment, truncated to 200 chars
   let relayError = null; // set when the upstream body was cut mid-relay
   const cap = (s) => (typeof s === "string" ? (s.length > 200 ? s.slice(0, 200) + "…" : s) : s);
@@ -1564,6 +2201,14 @@ async function relay(res, upstreamRes, stream, backendId, started, callId, idleT
       if (cacheHit !== true) {
         cacheHit = usage.cacheFieldSeen ? usage.promptCacheHit > 0 : null;
       }
+      // cached-only upstreams fold their tokens into promptCacheHit while the
+      // miss field stays unset; passing the 0 default would make the ratio read
+      // 100%, so pass NaN unless the miss was actually reported.
+      cacheHitPct = usage.cacheFieldSeen
+        ? cacheHitPctOf(usage.promptCacheHit, usage.promptCacheMissSeen ? usage.promptCacheMiss : NaN, NaN, usage.promptTokens)
+        : null;
+      promptCacheHitTokens = usage.promptCacheHit; // raw cache-hit prompt tokens (0 when the upstream does not report a split)
+      promptCacheMissTokens = usage.promptCacheMissSeen ? usage.promptCacheMiss : null; // null = miss not reported -> history derives it
     } else {
       try {
         let buf = await readBodyWithIdle(upstreamRes.body, idleTimeoutMs);
@@ -1583,6 +2228,10 @@ async function relay(res, upstreamRes, stream, backendId, started, callId, idleT
               const seen = !Number.isNaN(hit) || !Number.isNaN(miss) || !Number.isNaN(cachedN);
               if (seen) cacheHit = (!Number.isNaN(hit) ? hit : cachedN) > 0;
               // else keep null (no signal)
+              cacheHitPct = cacheHitPctOf(hit, miss, cachedN, promptTokens);
+              if (!Number.isNaN(hit)) promptCacheHitTokens = hit;
+              else if (!Number.isNaN(cachedN) && cachedN > 0) promptCacheHitTokens = cachedN;
+              if (!Number.isNaN(miss)) promptCacheMissTokens = miss;
             }
           }
           // Non-stream: normalize the reasoning key on the first choice message.
@@ -1631,7 +2280,7 @@ async function relay(res, upstreamRes, stream, backendId, started, callId, idleT
       /* ignore */
     }
   }
-  return { ttftMs, cacheHit, promptTokens, completionTokens, reasoningTokens, genMs, preview, relayError };
+  return { ttftMs, cacheHit, cacheHitPct, promptCacheHitTokens, promptCacheMissTokens, promptTokens, completionTokens, reasoningTokens, genMs, preview, relayError };
 }
 
 function writeError(res, e) {
@@ -1932,6 +2581,11 @@ function server() {
       );
     }
 
+    if (req.method === "GET" && url === "/api/dashboard") {
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify(dashboardPayload(cfg)));
+    }
+
     if (req.method === "GET" && url === "/api/config") {
       // Safe: cfg.backends carry apiKeyEnv NAMES, never resolved key values.
       res.writeHead(200, { "content-type": "application/json" });
@@ -1972,7 +2626,7 @@ function server() {
         h.lastError = { status: 0, kind: "manual", body: "manually cooled via UI" };
         health.set(id, h);
       } else {
-        markHealthy(id);
+        markHealthy(id, "uncool");
       }
       const h = health.get(id);
       const state = h.state === "cooling" && h.nextAvailableAt > Date.now() ? "cooling" : "healthy";
@@ -2101,6 +2755,7 @@ function server() {
 async function main() {
   loadEnv();
   await loadConfig();
+  seedAnalytics(historyPath);
   watchF(CONFIG_PATH, () => {
     loadConfig().catch((e) => console.error("config reload failed:", e.message));
   });
@@ -2135,4 +2790,4 @@ if (isMain) {
   });
 }
 
-export { candidates, normalizeConfig, buildPayload };
+export { candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost };
