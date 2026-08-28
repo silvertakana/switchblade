@@ -30,11 +30,11 @@
         { "backend": "go-alt", "upstream": "deepseek-v4-flash" },
         { "backend": "go-alt2", "upstream": "deepseek-v4-flash" },
         { "backend": "go-alt3", "upstream": "deepseek-v4-flash" },
-        { "backend": "direct", "upstream": "deepseek-v4-flash" },
         { "backend": "commandcode", "upstream": "deepseek/deepseek-v4-flash" },
-        { "backend": "commandcode-alt", "upstream": "deepseek/deepseek-v4-flash" }
+        { "backend": "commandcode-alt", "upstream": "deepseek/deepseek-v4-flash" },
+        { "backend": "direct", "upstream": "deepseek-v4-flash" }
       ],
-      "affinityPool": 7,
+      "affinityPool": 6,
       "params": { "thinking": { "type": "enabled" }, "reasoning_effort": "high" },
       "meta": {
         "label": "DeepSeek V4 Flash",
@@ -94,7 +94,7 @@
         { "backend": "commandcode-alt", "upstream": "deepseek/deepseek-v4-pro" },
         { "backend": "direct", "upstream": "deepseek-v4-pro" }
       ],
-      "affinityPool": 7,
+      "affinityPool": 6,
       "meta": {
         "label": "DeepSeek V4 Pro",
         "contextWindow": 1000000,
@@ -222,7 +222,7 @@
         { "backend": "commandcode-alt", "upstream": "deepseek/deepseek-v4-flash-vision-exp" },
         { "backend": "direct", "upstream": "deepseek-v4-flash-vision-exp" }
       ],
-      "affinityPool": 7,
+      "affinityPool": 6,
       "params": { "thinking": { "type": "enabled" }, "reasoning_effort": "high" },
       "meta": {
         "label": "DeepSeek V4 Flash Vision Exp",
