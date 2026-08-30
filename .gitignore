@@ -7,5 +7,8 @@ node_modules/
 *.png
 config.json.pre-*
 router-history.jsonl
+# Cache-miss payload capture (holds request payloads - never commit)
+router-misses.jsonl
+router-misses.jsonl.old
 api-keys.json
 *.json.tmp

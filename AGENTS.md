@@ -21,9 +21,9 @@ Strategies (preset level): **affinity** (default, session-sticky spreading), **f
 | File | Role |
 |---|---|
 | `server.mjs` | The whole router (~1660 lines). Starts only when run as a script; exports the internals used by tests. |
-| `test.mjs` | Mock test suite — **105 passing assertions**. Spawns real `server.mjs` children on temp configs against in-process mock backends. No keys, no network. |
+| `test.mjs` | Mock test suite — **183 passing assertions**. Spawns real `server.mjs` children on temp configs against in-process mock backends. No keys, no network. |
 | `config.json` | Live config; **hot-reloads via `fs.watch` (~300 ms)** — no restart for schema/backend/model/preset/backoff changes. Validate JSON before saving. |
-| `.env` | API keys (gitignored). Read at request time; editing needs no restart. Never commit. |
+| `.env` | API keys (gitignored). Read once at startup; a restart is needed after edits. Never commit. |
 | `.env.example` | Placeholder key names (`KEY=` only — CI fails if any example has a value). |
 | `index.html` | Web UI (Dashboard + Playground), single file, inline CSS/JS, zero external assets. |
 | `start.cmd` | Idempotent Windows launcher (logon + scheduled-task keepalive). Skips if 8787 is already listening. |
@@ -32,6 +32,7 @@ Strategies (preset level): **affinity** (default, session-sticky spreading), **f
 | `.github/workflows/ci.yml` | CI: syntax check + test suite on Node 22/24/25, plus a secret-scan job and a `.env.example`-placeholder check. |
 | `docs/UI-PLAN.md`, `docs/VISUAL-PLAN.md` | UI design plans. |
 | `router-history.jsonl` | Request history append log (gitignored; override path with `ROUTER_HISTORY`). |
+| `router-misses.jsonl` | Bounded cache-miss payload capture (gitignored). Controlled by the `missCapture` config block; homelab path: `/data/history/router-misses.jsonl` (durable named volume); rotates to `.old` at `maxFileBytes`. Use for cache-break forensics (see the switchblade skill's Cache miss forensics section). |
 | `api-keys.json` | Issued chat-only keys store (SHA-256 hashes only, gitignored; override path with `LMR_KEYS_FILE`). |
 
 ## Setup Commands
@@ -53,21 +54,21 @@ No build step exists. No lint or format tooling is configured (zero-dependency m
   ```bash
   node -e "JSON.parse(require('fs').readFileSync('config.json','utf8'))"
   ```
-- **`.env` changes**: read at request time, no restart needed. Keys are referenced from config by NAME only (`apiKeyEnv`); values live in `.env`.
+- **`.env` changes**: keys are read once at startup, not at request time; a restart is needed after edits. Keys are referenced from config by NAME only (`apiKeyEnv`); values live in `.env`.
 - **Config reload is non-destructive to health state** (health is keyed by backend id and survives reloads). Manual cools survive reloads too.
 - **Legacy configs keep working**: `normalizeConfig(cfg)` auto-synthesizes both pre-three-layer eras at every load. Old `models[id] = {backends, affinityPool}` and presets-with-`members` shapes normalize to the three-layer form byte-identically for identical effective configs.
 
 ## Testing Instructions
 
 ```bash
-npm test                    # node test.mjs -> expect "105 passed, 0 failed"
+npm test                    # node test.mjs -> expect "183 passed, 0 failed"
 node --check server.mjs     # syntax check (CI also checks test.mjs)
 ```
 
 - The suite **spins up mock backends plus router instances on temp configs — no real keys, no network**. Safe to run anytime, even while the production router is live on 8787 (test children bind port 0).
 - Coverage: health, non-stream + SSE streaming, session affinity, failover/weighted selection, sticky + timed manual cools, fallback exclusion, dialect handling (dropParams/paramMap/developer-role), synthesis from both legacy eras, layered-params merge order and precedence, preset-of-presets nesting (expansion, cycles, ordering), per-model retry/backoff budgets, cache tri-state, history `routedModel`, timeout failover, reasoning-key relay (`reasoning`/`reasoning_content`).
 - **Every behavior change ships with a test in `test.mjs`** (project rule, README Contributing). The legacy (`y*`) and three-layer (`z*`) blocks import `server.mjs` internals; integration blocks spawn the real server as a child.
-- Known environment quirk: the child-port banner capture can transiently crash with `TypeError: fetch failed ... bad port` (observed once 2026-08-22); a plain re-run passes 105/105. Do not treat a single crash as a regression — re-run first.
+- Known environment quirk: the child-port banner capture can transiently crash with `TypeError: fetch failed ... bad port` (observed once 2026-08-22); a plain re-run passes 183/183. Do not treat a single crash as a regression — re-run first.
 
 ## Config Contract (load-bearing — read `DESIGN-3LAYER.md` before touching)
 
@@ -121,13 +122,28 @@ Every request gets a short stable `callId` returned in the `x-router-backend`/`x
 - Comments are rare and explain *why*; the config contract and synthesis paths are the most commented regions for a reason.
 - New endpoints/features must stay in `server.mjs` (or `test.mjs` for tests) unless the design docs say otherwise; `index.html` is the single-file UI.
 
+## Deployment Topology
+
+**Two routers run simultaneously**, as independent instances with separate configs, keys, and histories; changes to one never apply to the other.
+
+- **Local (dev/test)**: `http://127.0.0.1:8787`, `node server.mjs` from this repo, launched by `start.cmd` (Windows logon shortcut) and the scheduled task "LocalModelRouter keepalive". Used for development and the mock test suite. Idle in daily operation.
+- **Production (homelab)**: the Coolify container `a8dyidd8o8id2se9czgauem0-134810439826` on `192.168.68.69:8787`, managed via SSH/Coolify. Both dsh and OpenCode route to the HOMELAB instance (baseURL `http://192.168.68.69:8787/v1`), not the local one.
+
+Production container details:
+
+- Live config is `/app/config.server.json` (env `ROUTER_CONFIG`), a bind mount from `/data/coolify/applications/a8dyidd8o8id2se9czgauem0/app/config.server.json`. `/app/config.json` inside the container is UNUSED.
+- Durable request history is the named volume `/data/history/router-history.jsonl` (env `ROUTER_HISTORY`).
+- Keys: the container reads `/app/.env` at startup. That file lives in the container filesystem and is lost on a Coolify image rebuild; durable keys belong in the Coolify application env vars.
+
 ## Build and Deployment
 
 No build step — `server.mjs` runs directly on the system Node (22+/25).
 
-- **This machine (production)**: `start.cmd` launches `node server.mjs` at Windows logon (Startup shortcut) and a scheduled task "LocalModelRouter keepalive" restarts it if down. It is idempotent: exits 0 if 8787 is already listening. Restart pattern: kill the port owner (`netstat -ano | grep ":8787.*LISTENING"`, `taskkill /PID <pid> /F`), then `nohup node server.mjs > router.log 2>&1 < /dev/null &` from Git Bash.
+- **Local instance (dev/test)**: `start.cmd` launches `node server.mjs` at Windows logon (Startup shortcut) and a scheduled task "LocalModelRouter keepalive" restarts it if down. It is idempotent: exits 0 if 8787 is already listening. Restart pattern: kill the port owner (`netstat -ano | grep ":8787.*LISTENING"`, `taskkill /PID <pid> /F`), then `nohup node server.mjs > router.log 2>&1 < /dev/null &` from Git Bash. This instance is for development and the mock test suite only; it is idle in daily operation (production is the homelab container, see Deployment Topology).
+- **Production instance (homelab)**: the Coolify container `a8dyidd8o8id2se9czgauem0-134810439826` on `192.168.68.69:8787`, managed via SSH/Coolify. Both dsh and OpenCode route here, not to the local machine. Container paths, history, and key handling are in Deployment Topology above.
+- **Production deploy protocol (config changes)**: connect to the host -> backup the host config -> diff/merge the fetched host config (never overwrite it wholesale with the repo config; the host file carries `host: 0.0.0.0`) -> ship the LF-normalized file via scp -> install host-side (`docker cp` INTO the bind mount fails with "device or resource busy") -> md5-verify host vs in-container paths -> verify `/api/config` and `/health` after ~3 s. Config changes hot-reload in ~300 ms; `.env`, `host`, and code changes need `docker restart a8dyidd8o8id2se9czgauem0-134810439826`. Full step-by-step: the `switchblade` dsh skill runbook `C:\Users\silve\.dsh\skills\switchblade\references\add-provider.md`.
 - **CI** (`.github/workflows/ci.yml`): `node --check server.mjs && node --check test.mjs`, then `node test.mjs` on Node 22/24/25; a separate secret-scan job greps tracked files and fails on secret-like patterns, and verifies `.env.example` contains placeholders only.
-- **Consumers of this service**: OpenCode (`~/.config/opencode/opencode.jsonc` local-router provider + tier files) and dsh (`~/.dsh/settings.yaml` + `cordis.patch.yml`). If you change model/preset ids or `/v1/models` ordering, verify those consumers still resolve.
+- **Consumers of this service**: OpenCode (`~/.config/opencode/opencode.jsonc` local-router provider + tier files) and dsh (`~/.dsh/settings.yaml` + `cordis.patch.yml`) both point at the PRODUCTION homelab instance via baseURL `http://192.168.68.69:8787/v1`, not the local dev instance. If you change model/preset ids or `/v1/models` ordering, verify those consumers still resolve.
 
 ## Security Considerations
 
@@ -143,7 +159,7 @@ No build step — `server.mjs` runs directly on the system Node (22+/25).
 ## Pull Request Guidelines
 
 - **Commit messages**: Conventional Commits — `feat:`, `fix:`, `refactor:`, `perf:` (see `git log`). One logical change per commit.
-- **Before pushing**: `node test.mjs` must pass 105/105 and `node --check server.mjs` must pass. CI re-checks on Node 22/24/25 plus secret scan.
+- **Before pushing**: `node test.mjs` must pass 183/183 and `node --check server.mjs` must pass. CI re-checks on Node 22/24/25 plus secret scan.
 - **Project rules (README Contributing)**: keep it zero-dependency (no new npm packages without a strong reason); every behavior change ships with a test in `test.mjs`; the config contract and its synthesis paths are load-bearing — change them only with a documented design note (update `DESIGN-3LAYER.md`).
 
 ## Troubleshooting
@@ -153,9 +169,10 @@ No build step — `server.mjs` runs directly on the system Node (22+/25).
 - **Model 404s**: `model_not_found` means the id is not a configured preset/model. Check `/v1/models`. An empty preset returns 404 `preset '<id>' has no valid models`.
 - **Backends all "cooling"**: check `/health` — weekly-limit pins (GO accounts, `fails: 100`) are normal and last the configured reset window; use `/admin/reset-health` only after verifying upstream limits. Manual cools require `uncool`.
 - **MSYS/Git Bash gotchas**: use forward-slash paths (`C:/dev/...`); `netstat`/`taskkill` need `MSYS_NO_PATHCONV=1`; backgrounding a server needs all three redirects (`> log 2>&1 < /dev/null &`) or the shell hangs.
-- **Stale docs**: README's assertion count (100) lags the actual suite (105). `SPEC.md` is referenced by README and DESIGN docs but does not exist in the repo — rely on `DESIGN-3LAYER.md` as the contract source of truth.
+- **Stale docs**: README's assertion count (100) lags the actual suite (183). `SPEC.md` is referenced by README and DESIGN docs but does not exist in the repo — rely on `DESIGN-3LAYER.md` as the contract source of truth.
 
 ## Additional Notes
 
-- This repo is the machine-local replacement for homelab LiteLLM for the deepseek-v4-flash family; GLM/vision/free historically stayed on LiteLLM, but the live config now also routes glm/qwen/mimo/muse/laguna through this router (6 backends, 13 models, 14 presets as of 2026-08-22). Config evolves — never assume the model/preset list; read `config.json` or `/api/config`.
+- This repo is the machine-local replacement for homelab LiteLLM for the deepseek-v4-flash family; GLM/vision/free historically stayed on LiteLLM, but the live config now also routes glm/qwen/mimo/muse/laguna through this router (7 backends: go-primary, go-alt, go-alt2, go-alt3, direct, commandcode, zai; 13 models, 14 presets as of 2026-08-26). Config evolves — never assume the model/preset list; read `config.json` or `/api/config`.
+- **Cache forensics**: dashboard rows carry per-call `cacheHitPct`; miss payloads land in `router-misses.jsonl` (homelab: `/data/history/router-misses.jsonl`). Warm calls sit below 100% due to 256-token block granularity (ceiling = `floor(promptTokens/256)*256/promptTokens`); a cold first call reports null, not 0. Payload-diff method and known break patterns are documented in the switchblade skill's Cache miss forensics section.
 - The companion operating playbook for this repo is the `local-model-router` skill (`~/.config/opencode/skills/local-model-router/`); the DESIGN docs pin the design contract.
