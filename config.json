@@ -4,296 +4,970 @@
   "masterKeyEnv": "LITELLM_API_KEY",
   "uiPasswordEnv": "LMR_UI_PASSWORD",
   "backends": [
-    { "id": "go-primary", "baseURL": "https://opencode.ai/zen/go/v1",
-      "apiKeyEnv": "OPENCODE_GO_KEY", "translateDeveloperRole": true, "idleTimeoutMs": 120000 },
-    { "id": "go-alt", "baseURL": "https://opencode.ai/zen/go/v1",
-      "apiKeyEnv": "OPENCODE_GO_ALT_KEY", "translateDeveloperRole": true, "idleTimeoutMs": 120000 },
-    { "id": "go-alt2", "baseURL": "https://opencode.ai/zen/go/v1",
-      "apiKeyEnv": "OPENCODE_GO_ALT2_KEY", "translateDeveloperRole": true, "idleTimeoutMs": 120000 },
-    { "id": "go-alt3", "baseURL": "https://opencode.ai/zen/go/v1",
-      "apiKeyEnv": "OPENCODE_GO_ALT3_KEY", "translateDeveloperRole": true, "idleTimeoutMs": 120000 },
-    { "id": "direct", "baseURL": "https://api.deepseek.com/v1",
-      "apiKeyEnv": "DEEPSEEK_API_KEY", "translateDeveloperRole": true, "idleTimeoutMs": 120000 },
-    { "id": "commandcode", "baseURL": "https://api.commandcode.ai/provider/v1",
-      "apiKeyEnv": "COMMANDCODE_API_KEY", "translateDeveloperRole": true,
-      "timeoutMs": 60000, "idleTimeoutMs": 120000 },
-    { "id": "commandcode-alt", "baseURL": "https://api.commandcode.ai/provider/v1",
-      "apiKeyEnv": "COMMANDCODE_ALT_API_KEY", "translateDeveloperRole": true,
-      "timeoutMs": 60000, "idleTimeoutMs": 120000 },
-    { "id": "zai", "baseURL": "https://api.z.ai/api/coding/paas/v4",
-      "apiKeyEnv": "ZAI_API_KEY", "idleTimeoutMs": 120000 }
+    {
+      "id": "go-primary",
+      "baseURL": "https://opencode.ai/zen/go/v1",
+      "apiKeyEnv": "OPENCODE_GO_KEY",
+      "translateDeveloperRole": true,
+      "idleTimeoutMs": 120000
+    },
+    {
+      "id": "go-alt",
+      "baseURL": "https://opencode.ai/zen/go/v1",
+      "apiKeyEnv": "OPENCODE_GO_ALT_KEY",
+      "translateDeveloperRole": true,
+      "idleTimeoutMs": 120000
+    },
+    {
+      "id": "go-alt2",
+      "baseURL": "https://opencode.ai/zen/go/v1",
+      "apiKeyEnv": "OPENCODE_GO_ALT2_KEY",
+      "translateDeveloperRole": true,
+      "idleTimeoutMs": 120000
+    },
+    {
+      "id": "go-alt3",
+      "baseURL": "https://opencode.ai/zen/go/v1",
+      "apiKeyEnv": "OPENCODE_GO_ALT3_KEY",
+      "translateDeveloperRole": true,
+      "idleTimeoutMs": 120000
+    },
+    {
+      "id": "direct",
+      "baseURL": "https://api.deepseek.com/v1",
+      "apiKeyEnv": "DEEPSEEK_API_KEY",
+      "translateDeveloperRole": true,
+      "idleTimeoutMs": 120000
+    },
+    {
+      "id": "commandcode",
+      "baseURL": "https://api.commandcode.ai/provider/v1",
+      "apiKeyEnv": "COMMANDCODE_API_KEY",
+      "translateDeveloperRole": true,
+      "timeoutMs": 60000,
+      "idleTimeoutMs": 120000
+    },
+    {
+      "id": "commandcode-alt",
+      "baseURL": "https://api.commandcode.ai/provider/v1",
+      "apiKeyEnv": "COMMANDCODE_ALT_API_KEY",
+      "translateDeveloperRole": true,
+      "timeoutMs": 60000,
+      "idleTimeoutMs": 120000
+    },
+    {
+      "id": "commandcode-alt2",
+      "baseURL": "https://api.commandcode.ai/provider/v1",
+      "apiKeyEnv": "COMMANDCODE_ALT2_API_KEY",
+      "translateDeveloperRole": true,
+      "timeoutMs": 60000,
+      "idleTimeoutMs": 120000
+    },
+    {
+      "id": "zai",
+      "baseURL": "https://api.z.ai/api/coding/paas/v4",
+      "apiKeyEnv": "ZAI_API_KEY",
+      "idleTimeoutMs": 120000
+    },
+    {
+      "id": "gemini",
+      "baseURL": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "apiKeyEnv": "GEMINI_API_KEY",
+      "idleTimeoutMs": 120000
+    }
   ],
   "models": {
+    "gemini-3.6-flash": {
+      "providers": [
+        {
+          "backend": "gemini",
+          "upstream": "gemini-3.6-flash"
+        }
+      ],
+      "affinityPool": 1,
+      "meta": {
+        "label": "Gemini 3.6 Flash",
+        "contextWindow": 1048576,
+        "pricing": {
+          "inputPerM": 0.3,
+          "outputPerM": 2.5
+        }
+      }
+    },
     "deepseek-v4-flash": {
       "providers": [
-        { "backend": "go-primary", "upstream": "deepseek-v4-flash" },
-        { "backend": "go-alt", "upstream": "deepseek-v4-flash" },
-        { "backend": "go-alt2", "upstream": "deepseek-v4-flash" },
-        { "backend": "go-alt3", "upstream": "deepseek-v4-flash" },
-        { "backend": "commandcode", "upstream": "deepseek/deepseek-v4-flash" },
-        { "backend": "commandcode-alt", "upstream": "deepseek/deepseek-v4-flash" },
-        { "backend": "direct", "upstream": "deepseek-v4-flash" }
+        {
+          "backend": "go-primary",
+          "upstream": "deepseek-v4-flash"
+        },
+        {
+          "backend": "go-alt",
+          "upstream": "deepseek-v4-flash"
+        },
+        {
+          "backend": "go-alt2",
+          "upstream": "deepseek-v4-flash"
+        },
+        {
+          "backend": "go-alt3",
+          "upstream": "deepseek-v4-flash"
+        },
+        {
+          "backend": "commandcode",
+          "upstream": "deepseek/deepseek-v4-flash"
+        },
+        {
+          "backend": "commandcode-alt",
+          "upstream": "deepseek/deepseek-v4-flash"
+        },
+        {
+          "backend": "commandcode-alt2",
+          "upstream": "deepseek/deepseek-v4-flash"
+        },
+        {
+          "backend": "direct",
+          "upstream": "deepseek-v4-flash"
+        }
       ],
-      "affinityPool": 6,
-      "params": { "thinking": { "type": "enabled" }, "reasoning_effort": "high" },
+      "affinityPool": 7,
+      "params": {
+        "thinking": {
+          "type": "enabled"
+        },
+        "reasoning_effort": "high"
+      },
       "meta": {
         "label": "DeepSeek V4 Flash",
         "contextWindow": 128000,
-        "pricing": { "inputPerM": 0.44, "cacheHitInputPerM": 0.014, "outputPerM": 1.32, "offPeak": true }
+        "pricing": {
+          "inputPerM": 0.44,
+          "cacheHitInputPerM": 0.014,
+          "outputPerM": 1.32,
+          "offPeak": true
+        }
       }
     },
     "deepseek-v4-flash-direct": {
       "providers": [
-        { "backend": "direct", "upstream": "deepseek-v4-flash" }
+        {
+          "backend": "direct",
+          "upstream": "deepseek-v4-flash"
+        }
       ],
       "affinityPool": 1,
       "meta": {
         "label": "DeepSeek V4 Flash",
         "contextWindow": 128000,
-        "pricing": { "inputPerM": 0.44, "cacheHitInputPerM": 0.014, "outputPerM": 1.32, "offPeak": true }
+        "pricing": {
+          "inputPerM": 0.44,
+          "cacheHitInputPerM": 0.014,
+          "outputPerM": 1.32,
+          "offPeak": true
+        }
       }
     },
     "deepseek-v4-flash-commandcode": {
       "providers": [
-        { "backend": "commandcode", "upstream": "deepseek/deepseek-v4-flash" },
-        { "backend": "commandcode-alt", "upstream": "deepseek/deepseek-v4-flash" }
+        {
+          "backend": "commandcode",
+          "upstream": "deepseek/deepseek-v4-flash"
+        },
+        {
+          "backend": "commandcode-alt",
+          "upstream": "deepseek/deepseek-v4-flash"
+        },
+        {
+          "backend": "commandcode-alt2",
+          "upstream": "deepseek/deepseek-v4-flash"
+        }
       ],
-      "affinityPool": 2,
-      "params": { "thinking": { "type": "enabled" }, "reasoning_effort": "high" },
+      "affinityPool": 3,
+      "params": {
+        "thinking": {
+          "type": "enabled"
+        },
+        "reasoning_effort": "high"
+      },
       "meta": {
         "label": "DeepSeek V4 Flash (CommandCode only)",
         "contextWindow": 128000,
-        "pricing": { "inputPerM": 0.44, "cacheHitInputPerM": 0.014, "outputPerM": 1.32, "offPeak": true }
+        "pricing": {
+          "inputPerM": 0.44,
+          "cacheHitInputPerM": 0.014,
+          "outputPerM": 1.32,
+          "offPeak": true
+        }
       }
     },
     "glm-5.3": {
       "providers": [
-        { "backend": "zai", "upstream": "glm-5.3" },
-        { "backend": "commandcode", "upstream": "zai-org/GLM-5.3" },
-        { "backend": "commandcode-alt", "upstream": "zai-org/GLM-5.3" },
-        { "backend": "go-primary", "upstream": "glm-5.3" },
-        { "backend": "go-alt", "upstream": "glm-5.3" },
-        { "backend": "go-alt2", "upstream": "glm-5.3" },
-        { "backend": "go-alt3", "upstream": "glm-5.3" }
+        {
+          "backend": "zai",
+          "upstream": "glm-5.3"
+        },
+        {
+          "backend": "commandcode",
+          "upstream": "zai-org/GLM-5.3"
+        },
+        {
+          "backend": "commandcode-alt",
+          "upstream": "zai-org/GLM-5.3"
+        },
+        {
+          "backend": "commandcode-alt2",
+          "upstream": "zai-org/GLM-5.3"
+        },
+        {
+          "backend": "go-primary",
+          "upstream": "glm-5.3"
+        },
+        {
+          "backend": "go-alt",
+          "upstream": "glm-5.3"
+        },
+        {
+          "backend": "go-alt2",
+          "upstream": "glm-5.3"
+        },
+        {
+          "backend": "go-alt3",
+          "upstream": "glm-5.3"
+        }
       ],
       "affinityPool": 7,
-      "params": { "reasoning_effort": "medium" },
+      "params": {
+        "reasoning_effort": "high"
+      },
       "meta": {
         "label": "GLM 5.3",
         "contextWindow": 1000000,
-        "pricing": { "inputPerM": 1.40, "cacheHitInputPerM": 0.26, "outputPerM": 4.40 }
+        "pricing": {
+          "inputPerM": 1.4,
+          "cacheHitInputPerM": 0.26,
+          "outputPerM": 4.4
+        }
+      }
+    },
+    "glm-5.3-flash": {
+      "providers": [
+        {
+          "backend": "go-primary",
+          "upstream": "glm-5.3-flash"
+        },
+        {
+          "backend": "go-alt",
+          "upstream": "glm-5.3-flash"
+        },
+        {
+          "backend": "go-alt2",
+          "upstream": "glm-5.3-flash"
+        },
+        {
+          "backend": "go-alt3",
+          "upstream": "glm-5.3-flash"
+        },
+        {
+          "backend": "commandcode",
+          "upstream": "z-ai/glm-5.3-flash"
+        },
+        {
+          "backend": "commandcode-alt",
+          "upstream": "z-ai/glm-5.3-flash"
+        },
+        {
+          "backend": "commandcode-alt2",
+          "upstream": "z-ai/glm-5.3-flash"
+        }
+      ],
+      "affinityPool": 7,
+      "params": {
+        "reasoning_effort": "high"
+      },
+      "retry": {
+        "maxRetries": 5,
+        "baseMs": 2000,
+        "maxMs": 30000,
+        "multiplier": 2,
+        "totalMs": 30000
+      },
+      "meta": {
+        "label": "GLM 5.3 Flash",
+        "contextWindow": 1000000,
+        "pricing": {
+          "inputPerM": 0.15,
+          "cacheHitInputPerM": 0.03,
+          "outputPerM": 0.5
+        }
+      }
+    },
+    "minimax-m3-free": {
+      "providers": [
+        {
+          "backend": "commandcode",
+          "upstream": "minimax/minimax-m3-free"
+        },
+        {
+          "backend": "commandcode-alt",
+          "upstream": "minimax/minimax-m3-free"
+        },
+        {
+          "backend": "commandcode-alt2",
+          "upstream": "minimax/minimax-m3-free"
+        }
+      ],
+      "affinityPool": 3,
+      "retry": {
+        "maxRetries": 5,
+        "baseMs": 2000,
+        "maxMs": 30000,
+        "multiplier": 2,
+        "totalMs": 30000
+      },
+      "meta": {
+        "label": "MiniMax M3 Free",
+        "contextWindow": 1000000,
+        "pricing": {
+          "inputPerM": 0,
+          "outputPerM": 0
+        }
+      }
+    },
+    "minimax-m2.7-free": {
+      "providers": [
+        {
+          "backend": "commandcode",
+          "upstream": "minimax/minimax-m2.7-free"
+        },
+        {
+          "backend": "commandcode-alt",
+          "upstream": "minimax/minimax-m2.7-free"
+        },
+        {
+          "backend": "commandcode-alt2",
+          "upstream": "minimax/minimax-m2.7-free"
+        }
+      ],
+      "affinityPool": 3,
+      "retry": {
+        "maxRetries": 5,
+        "baseMs": 2000,
+        "maxMs": 30000,
+        "multiplier": 2,
+        "totalMs": 30000
+      },
+      "meta": {
+        "label": "MiniMax M2.7 Free",
+        "contextWindow": 200000,
+        "pricing": {
+          "inputPerM": 0,
+          "outputPerM": 0
+        }
       }
     },
     "deepseek-v4-pro": {
       "providers": [
-        { "backend": "go-primary", "upstream": "deepseek-v4-pro" },
-        { "backend": "go-alt", "upstream": "deepseek-v4-pro" },
-        { "backend": "go-alt2", "upstream": "deepseek-v4-pro" },
-        { "backend": "go-alt3", "upstream": "deepseek-v4-pro" },
-        { "backend": "commandcode", "upstream": "deepseek/deepseek-v4-pro" },
-        { "backend": "commandcode-alt", "upstream": "deepseek/deepseek-v4-pro" },
-        { "backend": "direct", "upstream": "deepseek-v4-pro" }
+        {
+          "backend": "go-primary",
+          "upstream": "deepseek-v4-pro"
+        },
+        {
+          "backend": "go-alt",
+          "upstream": "deepseek-v4-pro"
+        },
+        {
+          "backend": "go-alt2",
+          "upstream": "deepseek-v4-pro"
+        },
+        {
+          "backend": "go-alt3",
+          "upstream": "deepseek-v4-pro"
+        },
+        {
+          "backend": "commandcode",
+          "upstream": "deepseek/deepseek-v4-pro"
+        },
+        {
+          "backend": "commandcode-alt",
+          "upstream": "deepseek/deepseek-v4-pro"
+        },
+        {
+          "backend": "commandcode-alt2",
+          "upstream": "deepseek/deepseek-v4-pro"
+        },
+        {
+          "backend": "direct",
+          "upstream": "deepseek-v4-pro"
+        }
       ],
       "affinityPool": 6,
       "meta": {
         "label": "DeepSeek V4 Pro",
         "contextWindow": 1000000,
-        "pricing": { "inputPerM": 1.32, "cacheHitInputPerM": 0.044, "outputPerM": 3.96, "offPeak": true }
+        "pricing": {
+          "inputPerM": 1.32,
+          "cacheHitInputPerM": 0.044,
+          "outputPerM": 3.96,
+          "offPeak": true
+        }
       }
     },
     "mimo-v2.5-pro": {
       "providers": [
-        { "backend": "go-primary", "upstream": "mimo-v2.5-pro" },
-        { "backend": "go-alt", "upstream": "mimo-v2.5-pro" },
-        { "backend": "go-alt2", "upstream": "mimo-v2.5-pro" },
-        { "backend": "go-alt3", "upstream": "mimo-v2.5-pro" },
-        { "backend": "commandcode", "upstream": "xiaomi/mimo-v2.5-pro" },
-        { "backend": "commandcode-alt", "upstream": "xiaomi/mimo-v2.5-pro" }
+        {
+          "backend": "go-primary",
+          "upstream": "mimo-v2.5-pro"
+        },
+        {
+          "backend": "go-alt",
+          "upstream": "mimo-v2.5-pro"
+        },
+        {
+          "backend": "go-alt2",
+          "upstream": "mimo-v2.5-pro"
+        },
+        {
+          "backend": "go-alt3",
+          "upstream": "mimo-v2.5-pro"
+        },
+        {
+          "backend": "commandcode",
+          "upstream": "xiaomi/mimo-v2.5-pro"
+        },
+        {
+          "backend": "commandcode-alt",
+          "upstream": "xiaomi/mimo-v2.5-pro"
+        },
+        {
+          "backend": "commandcode-alt2",
+          "upstream": "xiaomi/mimo-v2.5-pro"
+        }
       ],
       "affinityPool": 6,
       "meta": {
         "label": "MiMo V2.5 Pro",
         "contextWindow": 1000000,
-        "pricing": { "inputPerM": 0.435, "outputPerM": 0.87 }
+        "pricing": {
+          "inputPerM": 0.435,
+          "outputPerM": 0.87
+        }
       }
     },
     "laguna-s-2.1-free": {
       "providers": [
-        { "backend": "commandcode", "upstream": "poolside/laguna-s-2.1-free" },
-        { "backend": "commandcode-alt", "upstream": "poolside/laguna-s-2.1-free" }
+        {
+          "backend": "commandcode",
+          "upstream": "poolside/laguna-s-2.1-free"
+        },
+        {
+          "backend": "commandcode-alt",
+          "upstream": "poolside/laguna-s-2.1-free"
+        },
+        {
+          "backend": "commandcode-alt2",
+          "upstream": "poolside/laguna-s-2.1-free"
+        }
       ],
       "affinityPool": 2,
-      "retry": { "maxRetries": 5, "baseMs": 2000, "maxMs": 30000, "multiplier": 2, "totalMs": 30000 },
+      "retry": {
+        "maxRetries": 5,
+        "baseMs": 2000,
+        "maxMs": 30000,
+        "multiplier": 2,
+        "totalMs": 30000
+      },
       "meta": {
         "label": "Laguna S 2.1 Free",
         "contextWindow": 256000,
-        "pricing": { "inputPerM": 0, "outputPerM": 0 }
+        "pricing": {
+          "inputPerM": 0,
+          "outputPerM": 0
+        }
       }
     },
     "ox-alpha": {
       "providers": [
-        { "backend": "commandcode", "upstream": "stealth/ox-alpha" },
-        { "backend": "commandcode-alt", "upstream": "stealth/ox-alpha" },
-        { "backend": "go-primary", "upstream": "ox-alpha-free" },
-        { "backend": "go-alt", "upstream": "ox-alpha-free" },
-        { "backend": "go-alt2", "upstream": "ox-alpha-free" },
-        { "backend": "go-alt3", "upstream": "ox-alpha-free" }
+        {
+          "backend": "commandcode",
+          "upstream": "stealth/ox-alpha"
+        },
+        {
+          "backend": "commandcode-alt",
+          "upstream": "stealth/ox-alpha"
+        },
+        {
+          "backend": "commandcode-alt2",
+          "upstream": "stealth/ox-alpha"
+        },
+        {
+          "backend": "go-primary",
+          "upstream": "ox-alpha-free"
+        },
+        {
+          "backend": "go-alt",
+          "upstream": "ox-alpha-free"
+        },
+        {
+          "backend": "go-alt2",
+          "upstream": "ox-alpha-free"
+        },
+        {
+          "backend": "go-alt3",
+          "upstream": "ox-alpha-free"
+        }
       ],
       "affinityPool": 6,
-      "params": { "reasoning_effort": "high" },
-      "retry": { "maxRetries": 5, "baseMs": 2000, "maxMs": 30000, "multiplier": 2, "totalMs": 30000 },
+      "params": {
+        "reasoning_effort": "high"
+      },
+      "retry": {
+        "maxRetries": 5,
+        "baseMs": 2000,
+        "maxMs": 30000,
+        "multiplier": 2,
+        "totalMs": 30000
+      },
       "meta": {
         "label": "Ox Alpha (free, stealth)",
         "contextWindow": 1048576,
-        "pricing": { "inputPerM": 0, "outputPerM": 0 }
+        "pricing": {
+          "inputPerM": 0,
+          "outputPerM": 0
+        }
       }
     },
     "qwen3.7-flash": {
       "providers": [
-        { "backend": "commandcode", "upstream": "Qwen/Qwen3.7-Flash" },
-        { "backend": "commandcode-alt", "upstream": "Qwen/Qwen3.7-Flash" }
+        {
+          "backend": "commandcode",
+          "upstream": "Qwen/Qwen3.7-Flash"
+        },
+        {
+          "backend": "commandcode-alt",
+          "upstream": "Qwen/Qwen3.7-Flash"
+        },
+        {
+          "backend": "commandcode-alt2",
+          "upstream": "Qwen/Qwen3.7-Flash"
+        }
       ],
       "affinityPool": 2,
-      "params": { "thinking": { "type": "enabled" }, "reasoning_effort": "high" },
-      "retry": { "maxRetries": 3, "baseMs": 2000, "maxMs": 30000, "multiplier": 2, "totalMs": 30000 },
+      "params": {
+        "thinking": {
+          "type": "enabled"
+        },
+        "reasoning_effort": "high"
+      },
+      "retry": {
+        "maxRetries": 3,
+        "baseMs": 2000,
+        "maxMs": 30000,
+        "multiplier": 2,
+        "totalMs": 30000
+      },
       "meta": {
         "label": "Qwen 3.7 Flash",
         "contextWindow": 1000000,
-        "pricing": { "inputPerM": 0.03, "outputPerM": 0.13 }
+        "pricing": {
+          "inputPerM": 0.03,
+          "outputPerM": 0.13
+        }
       }
     },
     "muse-spark-1.2-contributor": {
       "providers": [
-        { "backend": "commandcode", "upstream": "meta/muse-spark-1.2-contributor" },
-        { "backend": "commandcode-alt", "upstream": "meta/muse-spark-1.2-contributor" }
+        {
+          "backend": "commandcode",
+          "upstream": "meta/muse-spark-1.2-contributor"
+        },
+        {
+          "backend": "commandcode-alt",
+          "upstream": "meta/muse-spark-1.2-contributor"
+        },
+        {
+          "backend": "commandcode-alt2",
+          "upstream": "meta/muse-spark-1.2-contributor"
+        }
       ],
       "affinityPool": 2,
-      "params": { "reasoning_effort": "medium" },
-      "retry": { "maxRetries": 3, "baseMs": 2000, "maxMs": 30000, "multiplier": 2, "totalMs": 30000 },
+      "params": {
+        "reasoning_effort": "medium"
+      },
+      "retry": {
+        "maxRetries": 3,
+        "baseMs": 2000,
+        "maxMs": 30000,
+        "multiplier": 2,
+        "totalMs": 30000
+      },
       "meta": {
         "label": "Muse Spark 1.2 Contributor",
         "contextWindow": 1048576,
-        "pricing": { "inputPerM": 0.10, "cacheHitInputPerM": 0.002, "outputPerM": 0.20 }
+        "pricing": {
+          "inputPerM": 0.1,
+          "cacheHitInputPerM": 0.002,
+          "outputPerM": 0.2
+        }
       }
     },
     "qwen3.7-plus": {
       "providers": [
-        { "backend": "go-primary", "upstream": "qwen3.7-plus" },
-        { "backend": "go-alt", "upstream": "qwen3.7-plus" },
-        { "backend": "go-alt2", "upstream": "qwen3.7-plus" },
-        { "backend": "go-alt3", "upstream": "qwen3.7-plus" },
-        { "backend": "commandcode", "upstream": "Qwen/Qwen3.7-Plus" },
-        { "backend": "commandcode-alt", "upstream": "Qwen/Qwen3.7-Plus" }
+        {
+          "backend": "go-primary",
+          "upstream": "qwen3.7-plus"
+        },
+        {
+          "backend": "go-alt",
+          "upstream": "qwen3.7-plus"
+        },
+        {
+          "backend": "go-alt2",
+          "upstream": "qwen3.7-plus"
+        },
+        {
+          "backend": "go-alt3",
+          "upstream": "qwen3.7-plus"
+        },
+        {
+          "backend": "commandcode",
+          "upstream": "Qwen/Qwen3.7-Plus"
+        },
+        {
+          "backend": "commandcode-alt",
+          "upstream": "Qwen/Qwen3.7-Plus"
+        },
+        {
+          "backend": "commandcode-alt2",
+          "upstream": "Qwen/Qwen3.7-Plus"
+        }
       ],
       "affinityPool": 6,
-      "params": { "thinking": { "type": "enabled" }, "reasoning_effort": "high" },
-      "retry": { "maxRetries": 3, "baseMs": 2000, "maxMs": 30000, "multiplier": 2, "totalMs": 30000 },
+      "params": {
+        "thinking": {
+          "type": "enabled"
+        },
+        "reasoning_effort": "high"
+      },
+      "retry": {
+        "maxRetries": 3,
+        "baseMs": 2000,
+        "maxMs": 30000,
+        "multiplier": 2,
+        "totalMs": 30000
+      },
       "meta": {
         "label": "Qwen 3.7 Plus",
         "contextWindow": 1000000,
-        "pricing": { "inputPerM": 0.32, "cacheHitInputPerM": 0.032, "outputPerM": 1.28 }
+        "pricing": {
+          "inputPerM": 0.32,
+          "cacheHitInputPerM": 0.032,
+          "outputPerM": 1.28
+        }
       }
     },
     "qwen3.8-max": {
       "providers": [
-        { "backend": "go-primary", "upstream": "qwen3.8-max" },
-        { "backend": "go-alt", "upstream": "qwen3.8-max" },
-        { "backend": "go-alt2", "upstream": "qwen3.8-max" },
-        { "backend": "go-alt3", "upstream": "qwen3.8-max" },
-        { "backend": "commandcode", "upstream": "Qwen/Qwen3.8-Max" },
-        { "backend": "commandcode-alt", "upstream": "Qwen/Qwen3.8-Max" }
+        {
+          "backend": "go-primary",
+          "upstream": "qwen3.8-max"
+        },
+        {
+          "backend": "go-alt",
+          "upstream": "qwen3.8-max"
+        },
+        {
+          "backend": "go-alt2",
+          "upstream": "qwen3.8-max"
+        },
+        {
+          "backend": "go-alt3",
+          "upstream": "qwen3.8-max"
+        },
+        {
+          "backend": "commandcode",
+          "upstream": "Qwen/Qwen3.8-Max"
+        },
+        {
+          "backend": "commandcode-alt",
+          "upstream": "Qwen/Qwen3.8-Max"
+        },
+        {
+          "backend": "commandcode-alt2",
+          "upstream": "Qwen/Qwen3.8-Max"
+        }
       ],
       "affinityPool": 6,
-      "params": { "thinking": { "type": "enabled" }, "reasoning_effort": "high" },
-      "retry": { "maxRetries": 3, "baseMs": 2000, "maxMs": 30000, "multiplier": 2, "totalMs": 30000 },
+      "params": {
+        "thinking": {
+          "type": "enabled"
+        },
+        "reasoning_effort": "high"
+      },
+      "retry": {
+        "maxRetries": 3,
+        "baseMs": 2000,
+        "maxMs": 30000,
+        "multiplier": 2,
+        "totalMs": 30000
+      },
       "meta": {
         "label": "Qwen 3.8 Max",
         "contextWindow": 1000000,
-        "pricing": { "inputPerM": 2.00, "outputPerM": 6.00 }
+        "pricing": {
+          "inputPerM": 2,
+          "outputPerM": 6
+        }
       }
     },
     "deepseek-v4-flash-vision-exp": {
       "providers": [
-        { "backend": "go-primary", "upstream": "deepseek-v4-flash-vision-exp" },
-        { "backend": "go-alt", "upstream": "deepseek-v4-flash-vision-exp" },
-        { "backend": "go-alt2", "upstream": "deepseek-v4-flash-vision-exp" },
-        { "backend": "go-alt3", "upstream": "deepseek-v4-flash-vision-exp" },
-        { "backend": "commandcode", "upstream": "deepseek/deepseek-v4-flash-vision-exp" },
-        { "backend": "commandcode-alt", "upstream": "deepseek/deepseek-v4-flash-vision-exp" },
-        { "backend": "direct", "upstream": "deepseek-v4-flash-vision-exp" }
+        {
+          "backend": "go-primary",
+          "upstream": "deepseek-v4-flash-vision-exp"
+        },
+        {
+          "backend": "go-alt",
+          "upstream": "deepseek-v4-flash-vision-exp"
+        },
+        {
+          "backend": "go-alt2",
+          "upstream": "deepseek-v4-flash-vision-exp"
+        },
+        {
+          "backend": "go-alt3",
+          "upstream": "deepseek-v4-flash-vision-exp"
+        },
+        {
+          "backend": "commandcode",
+          "upstream": "deepseek/deepseek-v4-flash-vision-exp"
+        },
+        {
+          "backend": "commandcode-alt",
+          "upstream": "deepseek/deepseek-v4-flash-vision-exp"
+        },
+        {
+          "backend": "commandcode-alt2",
+          "upstream": "deepseek/deepseek-v4-flash-vision-exp"
+        },
+        {
+          "backend": "direct",
+          "upstream": "deepseek-v4-flash-vision-exp"
+        }
       ],
       "affinityPool": 6,
-      "params": { "thinking": { "type": "enabled" }, "reasoning_effort": "high" },
+      "params": {
+        "thinking": {
+          "type": "enabled"
+        },
+        "reasoning_effort": "high"
+      },
       "meta": {
         "label": "DeepSeek V4 Flash Vision Exp",
         "contextWindow": 1000000,
-        "pricing": { "inputPerM": 0.44, "cacheHitInputPerM": 0.014, "outputPerM": 1.32, "offPeak": true }
+        "pricing": {
+          "inputPerM": 0.44,
+          "cacheHitInputPerM": 0.014,
+          "outputPerM": 1.32,
+          "offPeak": true
+        }
       }
     }
   },
   "pricing": {
     "offPeakMultiplier": 0.5,
     "peakWindows": [
-      { "days": "1-5", "start": "01:00", "end": "04:00" },
-      { "days": "1-5", "start": "06:00", "end": "10:00" }
+      {
+        "days": "1-5",
+        "start": "01:00",
+        "end": "04:00"
+      },
+      {
+        "days": "1-5",
+        "start": "06:00",
+        "end": "10:00"
+      }
     ]
   },
   "presets": {
+    "gemini-3.6-flash": {
+      "strategy": "failover",
+      "models": [
+        "gemini-3.6-flash"
+      ],
+      "meta": {
+        "tier": "fast",
+        "whenToUse": "Gemini flash-class model (priced near-free)"
+      }
+    },
     "deepseek-v4-flash": {
       "strategy": "affinity",
-      "models": ["deepseek-v4-flash"]
+      "models": [
+        "deepseek-v4-flash"
+      ],
+      "meta": {
+        "tier": "fast",
+        "whenToUse": "Default daily driver: most chat and coding work"
+      }
     },
     "deepseek-v4-flash-alt": {
       "strategy": "affinity",
-      "models": ["deepseek-v4-flash"]
+      "models": [
+        "deepseek-v4-flash"
+      ],
+      "meta": {
+        "tier": "fast",
+        "whenToUse": "Same flash model, alternate provider routing"
+      }
     },
     "deepseek-v4-flash-direct": {
       "strategy": "failover",
-      "models": ["deepseek-v4-flash-direct"]
+      "models": [
+        "deepseek-v4-flash-direct"
+      ],
+      "meta": {
+        "tier": "fast",
+        "whenToUse": "Flash via direct backend (fallback route)"
+      }
     },
     "deepseek-v4-flash-commandcode": {
       "strategy": "failover",
-      "models": ["deepseek-v4-flash-commandcode"]
+      "models": [
+        "deepseek-v4-flash-commandcode"
+      ],
+      "meta": {
+        "tier": "fast",
+        "whenToUse": "Flash hosted on CommandCode"
+      }
     },
     "glm-5.3": {
       "strategy": "failover",
-      "models": ["glm-5.3"]
+      "models": [
+        "glm-5.3"
+      ],
+      "meta": {
+        "tier": "heavy",
+        "whenToUse": "Deep reasoning / complex architecture (sequential chains)"
+      }
     },
     "deepseek-v4-pro": {
       "strategy": "affinity",
-      "models": ["deepseek-v4-pro"]
+      "models": [
+        "deepseek-v4-pro"
+      ],
+      "meta": {
+        "tier": "mid",
+        "whenToUse": "Escalate when flash is not enough (harder judgment)"
+      }
     },
     "mimo-v2.5-pro": {
       "strategy": "affinity",
-      "models": ["mimo-v2.5-pro"]
+      "models": [
+        "mimo-v2.5-pro"
+      ],
+      "meta": {
+        "tier": "mid",
+        "whenToUse": "Multimodal / vision-capable mid tier"
+      }
     },
     "laguna-s-2.1-free": {
       "strategy": "failover",
-      "models": ["laguna-s-2.1-free"]
+      "models": [
+        "laguna-s-2.1-free"
+      ],
+      "meta": {
+        "tier": "free",
+        "whenToUse": "Free tier bulk / mechanical fan-out"
+      }
     },
     "super": {
       "strategy": "failover",
-      "models": ["ox-alpha", "glm-5.3"]
+      "models": [
+        "ox-alpha",
+        "glm-5.3"
+      ],
+      "meta": {
+        "tier": "heavy",
+        "whenToUse": "Failover: ox-alpha (free) first, then glm-5.3 — may run free stealth"
+      }
     },
     "qwen3.7-flash": {
       "strategy": "failover",
-      "models": ["qwen3.7-flash"]
+      "models": [
+        "qwen3.7-flash"
+      ],
+      "meta": {
+        "tier": "near-free",
+        "whenToUse": "Cheap general work (near-free tier)"
+      }
     },
     "muse-spark-1.2-contributor": {
       "strategy": "failover",
-      "models": ["muse-spark-1.2-contributor"]
+      "models": [
+        "muse-spark-1.2-contributor"
+      ],
+      "meta": {
+        "tier": "free",
+        "whenToUse": "Free contributor model"
+      }
     },
     "qwen3.7-plus": {
       "strategy": "failover",
-      "models": ["qwen3.7-plus"]
+      "models": [
+        "qwen3.7-plus"
+      ],
+      "meta": {
+        "tier": "mid",
+        "whenToUse": "Mid-tier general"
+      }
     },
     "qwen3.8-max": {
       "strategy": "failover",
-      "models": ["qwen3.8-max"]
+      "models": [
+        "qwen3.8-max"
+      ],
+      "meta": {
+        "tier": "heavy",
+        "whenToUse": "Priciest tier; only when nothing else suffices"
+      }
     },
     "deepseek-v4-flash-vision-exp": {
       "strategy": "failover",
-      "models": ["deepseek-v4-flash-vision-exp"]
+      "models": [
+        "deepseek-v4-flash-vision-exp"
+      ],
+      "meta": {
+        "tier": "fast",
+        "whenToUse": "Vision/image-input tasks (flash family)"
+      }
+    },
+    "glm-5.3-flash": {
+      "strategy": "failover",
+      "models": [
+        "glm-5.3-flash"
+      ],
+      "meta": {
+        "tier": "near-free",
+        "whenToUse": "Near-free capable reasoning"
+      }
+    },
+    "minimax-m3-free": {
+      "strategy": "failover",
+      "models": [
+        "minimax-m3-free"
+      ],
+      "meta": {
+        "tier": "free",
+        "whenToUse": "Free tier bulk (1M context)"
+      }
+    },
+    "minimax-m2.7-free": {
+      "strategy": "failover",
+      "models": [
+        "minimax-m2.7-free"
+      ],
+      "meta": {
+        "tier": "free",
+        "whenToUse": "Free tier bulk (200K context)"
+      }
     }
   },
   "backoff": {
