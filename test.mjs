@@ -1516,7 +1516,7 @@ async function main() {
     const missFields = { backend: "b1", cacheHitPct: 10, missTokens: 100, promptTokens: 1000, model: "m", session: "s" };
     const a1 = buildAlert(cfgn, "cache_miss", missFields);
     assert(
-      a1 && a1.url === "http://x/t" && a1.body.topic === "t" &&
+      a1 && a1.url === "http://x" && a1.body.topic === "t" &&
       typeof a1.body.message === "string" && a1.body.message.includes("Cache break") &&
       a1.body.message.includes("b1") && Array.isArray(a1.body.tags) && a1.body.tags.length === 1 &&
       typeof a1.body.priority === "number",
@@ -1945,6 +1945,82 @@ async function main() {
       childZ20.kill();
       clientSrv.close();
       await rm(dirZ20, { recursive: true, force: true });
+    }
+  }
+
+  // z21) billing error (400 insufficient credits) FAILS OVER to the next
+  //      provider and cools the dry account; an all-dry pool exhausts to 503.
+  {
+    const billingBody = { error: { message: "You have insufficient credits to make this request. Please purchase more credits to continue using the service.", type: "invalid_request_error", code: "BAD_REQUEST" } };
+    const drySrv = http.createServer((req, res) => {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify(billingBody));
+    });
+    const drySrv2 = http.createServer((req, res) => {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify(billingBody));
+    });
+    const okSrv = mockBackend("z21ok", {});
+    const [dryPort, dry2Port, okPort] = await Promise.all([listen(drySrv), listen(drySrv2), listen(okSrv.srv)]);
+    okSrv.port = okPort;
+    const cfgZ21 = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "z21dry", baseURL: `http://${HOST}:${dryPort}`, apiKeyEnv: "KEY_Z21DRY" },
+        { id: "z21dry2", baseURL: `http://${HOST}:${dry2Port}`, apiKeyEnv: "KEY_Z21DRY2" },
+        { id: "z21ok", baseURL: `http://${HOST}:${okSrv.port}`, apiKeyEnv: "KEY_Z21OK" },
+      ],
+      models: {
+        "m21a": {
+          providers: [{ backend: "z21dry", upstream: "u21" }, { backend: "z21ok", upstream: "u21" }],
+          affinityPool: 1,
+        },
+        "m21b": {
+          providers: [{ backend: "z21dry", upstream: "u21" }, { backend: "z21dry2", upstream: "u21" }],
+          affinityPool: 1,
+        },
+      },
+      presets: {
+        "p21a": { strategy: "failover", models: ["m21a"] },
+        "p21b": { strategy: "failover", models: ["m21b"] },
+      },
+      backoff: BO,
+    };
+    const { child: childZ21, base: baseZ21, dir: dirZ21 } = await startRouterCfg(cfgZ21, "KEY_Z21DRY=k\nKEY_Z21DRY2=k\nKEY_Z21OK=k\n");
+    try {
+      // Dry first, healthy second: the request must succeed via failover, and
+      // the dry backend must be cooled out of rotation.
+      const rr = await fetch(baseZ21 + "/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer local-master" },
+        body: JSON.stringify({ model: "p21a", messages: [] }),
+        signal: AbortSignal.timeout(8000),
+      });
+      const bb = await rr.json();
+      assert(
+        rr.status === 200 && bb.choices && /^mock:z21ok/.test(bb.choices[0].message.content),
+        "z21a) billing 400 fails over to the next provider (status=" + rr.status + ")"
+      );
+      const hb = await (await api(baseZ21, "/health", { method: "GET" })).json();
+      const dry = hb.backends.find((b) => b.id === "z21dry");
+      assert(dry && dry.state === "cooling", "z21b) billing 400 cools the dry backend (state=" + (dry && dry.state) + ")");
+      // All-dry pool: the loop exhausts and surfaces a 503 with errorKind billing.
+      const rr2 = await fetch(baseZ21 + "/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer local-master" },
+        body: JSON.stringify({ model: "p21b", messages: [] }),
+        signal: AbortSignal.timeout(8000),
+      });
+      assert(rr2.status === 503, "z21c) all-dry pool exhausts to 503 (status=" + rr2.status + ")");
+      const hh = await (await api(baseZ21, "/api/history?limit=10", { method: "GET" })).json();
+      const last = hh.entries && hh.entries.find((e) => e.model === "p21b");
+      assert(last && last.errorKind === "billing", "z21d) exhausted billing failure records errorKind=billing (got " + (last && last.errorKind) + ")");
+    } finally {
+      childZ21.kill();
+      drySrv.close();
+      drySrv2.close();
+      okSrv.srv.close();
+      await rm(dirZ21, { recursive: true, force: true });
     }
   }
 

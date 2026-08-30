@@ -103,7 +103,13 @@ function classify(status, bodyText) {
   if (status === 401 || status === 403) return "auth";
   if (status >= 500) return "server";
   if (status === 0) return "server"; // network error
-  if (status === 400 || status === 422) return "client"; // our payload bug, not backend health
+  if (status === 400 || status === 422) {
+    // Billing failures (insufficient credits/quota) are a backend-resource
+    // problem, not a payload bug: they must fail over to the next provider
+    // instead of aborting the whole request, and they cool the dry account.
+    if (/insufficient (credits|quota)|insufficient_quota|out of credits|billing error/i.test(bodyText || "")) return "billing";
+    return "client"; // our payload bug, not backend health
+  }
   return "server";
 }
 
@@ -374,7 +380,7 @@ function buildAlert(cfg, kind, fields) {
   if (Date.now() - last < cooldownMs) return null;
   alertCooldowns.set(kind, Date.now());
   return {
-    url: (n.baseUrl || NTFY_DEFAULT_BASE).replace(/\/$/, "") + "/" + n.topic,
+    url: (n.baseUrl || NTFY_DEFAULT_BASE).replace(/\/$/, ""),
     body: {
       topic: n.topic,
       title: ALERT_DEFS[kind].title,
