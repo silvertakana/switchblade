@@ -35,7 +35,9 @@ function mockBackend(id, responses) {
     const auth = req.headers["authorization"] || "";
     const cache = req.headers["x-cache-key"] || null;
     const sess = req.headers["x-session-affinity"] || null;
-    const rec = { method: req.method, url: req.url, auth, cache, sess, body };
+    const ocSession = req.headers["x-opencode-session"] || null;
+    const ua = req.headers["user-agent"] || null;
+    const rec = { method: req.method, url: req.url, auth, cache, sess, ocSession, ua, body };
     hits.push(rec);
     const wantStream = body.includes("\"stream\":true") || body.includes("\"stream\": true");
     const spec = responses[req.url] || responses["default"] || { status: 200, body: { id: "mock", object: "chat.completion", choices: [{ message: { role: "assistant", content: `mock:${id}` } }] } };
@@ -3117,6 +3119,39 @@ async function main() {
         childM6.kill();
         srvM6.close();
         await rm(dirM6, { recursive: true, force: true });
+      }
+    }
+
+    // zM7) Console Go compliance: upstream requests carry x-opencode-session
+    //      (client header wins, else the resolved session key) and an
+    //      identifiable user-agent instead of Node's default.
+    {
+      const srvM7 = mockBackend("sess-p", {});
+      const portM7 = await listen(srvM7.srv);
+      const cfgM7 = {
+        port: 0, prefix: "/v1", masterKeyEnv: null,
+        backends: [{ id: "sess-p", baseURL: `http://${HOST}:${portM7}`, apiKeyEnv: "KEY_SESS_P" }],
+        models: { "mf": { providers: [{ backend: "sess-p", upstream: "u" }] } },
+        backoff: BO,
+      };
+      const { child: childM7, base: baseM7, dir: dirM7 } = await startRouterCfg(cfgM7, "KEY_SESS_P=k\n");
+      try {
+        await api(baseM7, "/v1/chat/completions", { body: { model: "mf", messages: [] }, headers: { "x-session-affinity": "sess-X" } });
+        let rec = srvM7.hits[srvM7.hits.length - 1];
+        assert(rec.ocSession === "sess-X", "zM7a) x-opencode-session = session key (x-session-affinity) (got " + rec.ocSession + ")");
+        assert(rec.ua && !rec.ua.toLowerCase().startsWith("node"), "zM7b) user-agent is identifiable, not Node default (got " + rec.ua + ")");
+
+        await api(baseM7, "/v1/chat/completions", { body: { model: "mf", messages: [] } });
+        rec = srvM7.hits[srvM7.hits.length - 1];
+        assert(rec.ocSession === "no-session", "zM7c) no client session -> x-opencode-session no-session (got " + rec.ocSession + ")");
+
+        await api(baseM7, "/v1/chat/completions", { body: { model: "mf", messages: [] }, headers: { "x-opencode-session": "client-oc" } });
+        rec = srvM7.hits[srvM7.hits.length - 1];
+        assert(rec.ocSession === "client-oc", "zM7d) client x-opencode-session header passes through (got " + rec.ocSession + ")");
+      } finally {
+        childM7.kill();
+        srvM7.srv.close();
+        await rm(dirM7, { recursive: true, force: true });
       }
     }
   }

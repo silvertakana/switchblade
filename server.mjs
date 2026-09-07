@@ -1393,7 +1393,7 @@ function buildPayload(body, cfg, preset, model, provider, backend) {
 
 // ---- request forwarding ----------------------------------------------------
 
-async function forward(req, cfg, backend, payload, incomingHeaders, stream) {
+async function forward(req, cfg, backend, payload, incomingHeaders, stream, sessionKey) {
   const key = process.env[backend.apiKeyEnv];
   const upstream = backend.baseURL.replace(/\/$/, "") + "/chat/completions";
 
@@ -1401,6 +1401,13 @@ async function forward(req, cfg, backend, payload, incomingHeaders, stream) {
     "content-type": "application/json",
     authorization: `Bearer ${key}`,
     accept: stream ? "text/event-stream" : "application/json",
+    // Console Go refuses service without a session id (400 MissingSessionID)
+    // and OpenCode Go's docs require an identifiable client UA for abuse
+    // monitoring. Prefer the client's own session header, else reuse the
+    // router's resolved session key (x-session-affinity -> x-session-id ->
+    // user -> no-session) so per-conversation routing/caching still works.
+    "x-opencode-session": incomingHeaders["x-opencode-session"] || sessionKey || "no-session",
+    "user-agent": "switchblade/1.0",
   };
   // Forward prompt-cache headers verbatim.
   for (const h of ["x-cache-key", "cachekey", "set-cache-key"]) {
@@ -1584,7 +1591,7 @@ async function handleChat(req, res, cfg, bodyText) {
     let result = null;
     const attemptStarted = Date.now();
     while (true) {
-      result = await forward(req, cfg, backend, payload, req.headers, stream);
+      result = await forward(req, cfg, backend, payload, req.headers, stream, sessionKey);
       if (result.err && isRetryableError(result.err.status, result.err.body) && retries < maxRetries) {
         const retryCount = retries + 1;
         const waitMs = Math.min(retryBaseMs * retryMult ** (retryCount - 1), retryMaxMs);
