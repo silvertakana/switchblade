@@ -1,5 +1,22 @@
 # AGENTS.md
 
+## Purpose & Role
+
+This repo is **Switchblade**. The directory name `local-model-router` is the legacy name, kept for compatibility. In this project the agent's job is:
+
+- **Diagnose and fix router and inference issues** — routing failures, upstream/provider problems, stream cuts, cache misses, model resolution, and anything that breaks how requests are routed or answered.
+- **Develop on Switchblade** — backends / models / presets, `config.json`, the `index.html` UI, and new features in `server.mjs`.
+
+**When the user pastes a bare router log id (e.g. `cm9Qz3V4oQ`), treat it as a `callId`.** Resolve it via `GET /api/history?limit=N` then `GET /api/history/detail?call=<callId>` (or grep the JSONL). Full method: the `switchblade` skill, `references/logs.md`.
+
+Working rules:
+
+- **Verify against the homelab production router** (`192.168.68.69:8787`) — it is the real deploy target; dsh and OpenCode route through it. The local instance (`127.0.0.1:8787`) is for dev and the mock test suite only.
+- **Debug UI issues locally first**, then ship via a PR/push to GitHub — pushing auto-deploys to the homelab.
+- **The API keys on the server are authorized for use** in testing and verification.
+- **Recommended: replay/mock the request locally** to isolate variables before changing config or code (see the `switchblade` skill's diagnose references).
+- Operational playbooks: the `switchblade` and `server-dev` dsh skills — load them before acting on this repo.
+
 ## Project Overview
 
 Switchblade (repo dir: `local-model-router`) is a **zero-dependency, single-process local model router** for OpenAI-compatible LLM APIs. It load-balances chat requests across multiple upstream accounts (OpenCode Go, DeepSeek, CommandCode, Z.ai, or any OpenAI-compatible base URL) with session-affinity hashing, per-backend health tracking, exponential backoff, and a web dashboard. It runs on `127.0.0.1:8787`, needs no database or container stack, and was designed to be maintained by AI agents: every behavior is pinned by a mock-based test suite that runs in seconds with no keys and no network.
