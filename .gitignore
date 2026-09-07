@@ -12,3 +12,12 @@ router-misses.jsonl
 router-misses.jsonl.old
 api-keys.json
 *.json.tmp
+
+# Scratch/working area for the LOCAL dev instance and ad-hoc tooling. Kept on
+# disk but NEVER committed: holds homelab host-config backups, history exports,
+# smoke scripts, and analysis scratch. Add a temp/README.md to document it.
+temp/
+# Stale config snapshots taken before host/config merges (e.g. bak-kimi-add).
+# Subsumed by config.json or the homelab host config - never commit.
+*.bak-*
+config.json.bak-*
