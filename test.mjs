@@ -1118,6 +1118,100 @@ async function main() {
     }
   }
 
+  // z11a) reasoning-off: model default {thinking enabled, reasoning_effort high}
+  //       + client body {thinking:{type:"disabled"}} -> disabled wins AND the
+  //       config-default reasoning_effort is stripped (no contradictory pair).
+  {
+    const z11a = mockBackend("z11a", {});
+    const portZ11a = await listen(z11a.srv);
+    z11a.port = portZ11a;
+    const cfgZ11a = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "z11a", baseURL: `http://${HOST}:${z11a.port}`, apiKeyEnv: "KEY_Z11A" }],
+      models: {
+        "m11a": { providers: [{ backend: "z11a", upstream: "deepseek-v4-flash" }], params: { thinking: { type: "enabled" }, reasoning_effort: "high" } },
+      },
+      presets: { "p11a": { strategy: "affinity", models: ["m11a"] } },
+      backoff: BO,
+    };
+    const { child: childZ11a, base: baseZ11a, dir: dirZ11a } = await startRouterCfg(cfgZ11a, "KEY_Z11A=test-key-z11a\n");
+    try {
+      await api(baseZ11a, "/v1/chat/completions", { body: { model: "p11a", messages: [], thinking: { type: "disabled" } } });
+      const sent = JSON.parse(z11a.hits[z11a.hits.length - 1].body);
+      assert(
+        sent.thinking.type === "disabled" && !("reasoning_effort" in sent) && sent.model === "deepseek-v4-flash",
+        "z11a) thinking:disabled strips config-default reasoning_effort (" + JSON.stringify(sent) + ")"
+      );
+    } finally {
+      childZ11a.kill();
+      z11a.srv.close();
+      await rm(dirZ11a, { recursive: true, force: true });
+    }
+  }
+
+  // z11b) reasoning-off control: same model defaults, client body WITHOUT any
+  //       reasoning keys -> default path untouched (thinking enabled + effort
+  //       high both forwarded).
+  {
+    const z11b = mockBackend("z11b", {});
+    const portZ11b = await listen(z11b.srv);
+    z11b.port = portZ11b;
+    const cfgZ11b = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "z11b", baseURL: `http://${HOST}:${z11b.port}`, apiKeyEnv: "KEY_Z11B" }],
+      models: {
+        "m11b": { providers: [{ backend: "z11b", upstream: "deepseek-v4-flash" }], params: { thinking: { type: "enabled" }, reasoning_effort: "high" } },
+      },
+      presets: { "p11b": { strategy: "affinity", models: ["m11b"] } },
+      backoff: BO,
+    };
+    const { child: childZ11b, base: baseZ11b, dir: dirZ11b } = await startRouterCfg(cfgZ11b, "KEY_Z11B=test-key-z11b\n");
+    try {
+      await api(baseZ11b, "/v1/chat/completions", { body: { model: "p11b", messages: [] } });
+      const sent = JSON.parse(z11b.hits[z11b.hits.length - 1].body);
+      assert(
+        sent.thinking.type === "enabled" && sent.reasoning_effort === "high" && sent.model === "deepseek-v4-flash",
+        "z11b) control: no body reasoning keys -> model defaults intact (" + JSON.stringify(sent) + ")"
+      );
+    } finally {
+      childZ11b.kill();
+      z11b.srv.close();
+      await rm(dirZ11b, { recursive: true, force: true });
+    }
+  }
+
+  // z11c) reasoning-off authoritative: model default has reasoning_effort only
+  //       (no thinking default); client body explicitly sets BOTH thinking
+  //       disabled AND reasoning_effort high -> disable still wins, effort is
+  //       stripped even when the client itself sent it.
+  {
+    const z11c = mockBackend("z11c", {});
+    const portZ11c = await listen(z11c.srv);
+    z11c.port = portZ11c;
+    const cfgZ11c = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "z11c", baseURL: `http://${HOST}:${z11c.port}`, apiKeyEnv: "KEY_Z11C" }],
+      models: {
+        "m11c": { providers: [{ backend: "z11c", upstream: "deepseek-v4-flash" }], params: { reasoning_effort: "high" } },
+      },
+      presets: { "p11c": { strategy: "affinity", models: ["m11c"] } },
+      backoff: BO,
+    };
+    const { child: childZ11c, base: baseZ11c, dir: dirZ11c } = await startRouterCfg(cfgZ11c, "KEY_Z11C=test-key-z11c\n");
+    try {
+      await api(baseZ11c, "/v1/chat/completions", { body: { model: "p11c", messages: [], thinking: { type: "disabled" }, reasoning_effort: "high" } });
+      const sent = JSON.parse(z11c.hits[z11c.hits.length - 1].body);
+      assert(
+        sent.thinking.type === "disabled" && !("reasoning_effort" in sent) && sent.model === "deepseek-v4-flash",
+        "z11c) thinking:disabled strips explicit reasoning_effort too (" + JSON.stringify(sent) + ")"
+      );
+    } finally {
+      childZ11c.kill();
+      z11c.srv.close();
+      await rm(dirZ11c, { recursive: true, force: true });
+    }
+  }
+
   // z12) validation + empty 404: unknown strategy defaults; preset whose model
   //      ref is dropped -> 404 "preset '<id>' has no valid models".
   {

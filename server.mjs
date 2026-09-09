@@ -1375,6 +1375,12 @@ function buildPayload(body, cfg, preset, model, provider, backend) {
   delete out.model; // reserved in config layers
   Object.assign(out, body); // request body wins
   out.model = provider.upstream; // always
+  // An explicit thinking:disabled is authoritative for the reasoning group:
+  // strip any config-default reasoning_effort so upstream never receives the
+  // contradictory pair (disabled thinking + effort set). 2026-09-09 fix.
+  if (out.thinking && out.thinking.type === 'disabled' && 'reasoning_effort' in out) {
+    delete out.reasoning_effort;
+  }
   // Dialect: drop FIRST (public/request key space), then rename survivors.
   const drop = new Set([...(backend.dropParams || []), ...(provider.dropParams || [])]);
   for (const k of drop) delete out[k];
