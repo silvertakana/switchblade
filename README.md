@@ -145,7 +145,9 @@ cp .env.example .env      # add your API keys
 ## Quickstart
 
 1. Add your API keys to `.env` (key names are referenced from `config.json`
-   via `apiKeyEnv`). A `.env.example` documents the known ones.
+   via `apiKeyEnv`). A `.env.example` documents the known ones. You can also add
+   and change them from the Config tab once the router is running: those writes
+   go to the managed `secrets.json` and apply without a restart.
 2. Edit `config.json` to your backends/models/presets (see below).
 3. Run:
 
@@ -181,18 +183,18 @@ Top-level keys: `port`, `prefix`, `masterKeyEnv`, `uiPasswordEnv`, `backends`,
       "apiKeyEnv": "DEEPSEEK_API_KEY" }
   ],
   "models": {
-    "deepseek-v4-flash": {
+    "deepseek-v4.1-flash": {
       "providers": [
-        { "backend": "go-1", "upstream": "deepseek-v4-flash" },
-        { "backend": "direct", "upstream": "deepseek-v4-flash" }
+        { "backend": "go-1", "upstream": "deepseek-v4.1-flash" },
+        { "backend": "direct", "upstream": "deepseek-flash" }
       ],
       "affinityPool": 2,
-      "meta": { "label": "DeepSeek V4 Flash", "contextWindow": 128000,
-                "pricing": { "inputPerM": 0.18, "outputPerM": 0.87 } }
+      "meta": { "label": "DeepSeek V4.1 Flash", "contextWindow": 1000000,
+                "pricing": { "inputPerM": 0.30, "outputPerM": 1.20 } }
     }
   },
   "presets": {
-    "flash": { "strategy": "affinity", "models": ["deepseek-v4-flash"] }
+    "flash": { "strategy": "affinity", "models": ["deepseek-v4.1-flash"] }
   }
 }
 ```
@@ -217,18 +219,32 @@ that reuse each other:
 ```jsonc
 "presets": {
   "glm":  { "strategy": "failover", "models": ["glm-5.3"] },
-  "os-alpha": { "strategy": "affinity", "models": ["deepseek-v4-flash", "mimo-v2.5-pro"] },
+  "os-alpha": { "strategy": "affinity", "models": ["deepseek-v4.1-flash", "mimo-v2.5-pro"] },
   "super": { "strategy": "failover", "models": ["glm", "os-alpha"] }
 }
 ```
 
-`super` routes through `[glm-5.3, deepseek-v4-flash, mimo-v2.5-pro]` in
+`super` routes through `[glm-5.3, deepseek-v4.1-flash, mimo-v2.5-pro]` in
 declared order (failover). Cycles (`A -> B -> A`) are cut with a one-time
 warning and never hang the router. See `DESIGN-3LAYER.md` section 3a for the
 full contract.
 
 Config hot-reloads via `fs.watch` (~300 ms) — no restart needed. Validate JSON
 before saving.
+
+### Environment variables
+
+Three layers, highest precedence first: the **real process environment** (a
+variable exported in your shell, or injected by a platform such as Coolify),
+then the **managed `secrets.json`** written by the Config tab, then **`.env`**.
+The managed store also hot-reloads via `fs.watch`, so a value saved in the UI
+reaches the running process without a restart.
+
+`.env` is read once at startup and is the bootstrapping fallback: it wins for
+nothing that a higher layer defines. A variable the real environment owns is
+never overridden by the store, and the UI labels it `shell` so the shadowing is
+visible rather than silent. `GET /api/env` reports `source` and `live` per
+variable for exactly this reason.
 
 ### Backward compatibility
 
@@ -254,6 +270,10 @@ three-layer shape at load, byte-identically for identical effective configs.
 | GET | `/api/keys` | issued chat-only keys (`id`, `name`, `createdAt`, `revoked`; never hashes or raw values); master key required |
 | POST | `/api/keys` | `{name}` -> issues a chat-only key, raw value returned once; master key required |
 | DELETE | `/api/keys?id=<id>` | revokes an issued key; master key required |
+| GET | `/api/env` | env var NAMES with `set`/`editable`/`reloadable`/`source`/`live`; never values; admin required |
+| POST | `/api/env` | `{name, value, baseRevision}` -> writes the managed secrets store; 409 on a stale revision; admin required |
+| POST | `/api/env/reveal` | `{name}` -> `{name, value}` for ONE variable; admin required |
+| DELETE | `/api/env?name=X` | removes a managed variable; 409 for `.env`/shell-sourced names; admin required |
 | POST | `/admin/reset-health` | reset all cooling states |
 | POST | `/admin/backend` | `{id, action: "cool"\|"uncool", forMs?}` manual cool/uncool |
 | GET | `/` | web UI |
@@ -274,6 +294,17 @@ History lives in an in-memory ring buffer (500 entries) and appends to
 - **Issued keys are chat-only** — keys created via `POST /api/keys` unlock chat
   completions but never `/admin/*` (admin stays master-key-only). Only SHA-256
   hashes are stored, in `api-keys.json` (gitignored).
+- **Env editor** — the Config tab can add and change credential env vars. Values
+  live in a managed `secrets.json` (gitignored, snapshotted to `secrets.history/`;
+  override the path with `ROUTER_SECRETS`). The list endpoint serves NAMES and
+  state only; a value is returned solely by the explicit per-variable reveal
+  call. `masterKeyEnv` and `uiPasswordEnv` are rejected on write server-side,
+  because they are the credentials that unlock the editor itself, and they are
+  also refused by reveal: the dashboard session is gated by `uiPasswordEnv`,
+  while the master key is a wider-scope machine credential, so exposing it would
+  let a dashboard password escalate to the machine credential. Writes
+  hot-reload in roughly 300 ms; names in `STARTUP_ONLY_VARS` take effect on the
+  next start and are reported as `reloadable: false`.
 - **Read-only endpoints stay open** — `/health`, `/v1/models`, `/api/stats`,
   `/api/history`, `/api/config`, `/api/auth/*`, and `/` never require a key.
 
@@ -330,13 +361,15 @@ restarts; the contract is in DESIGN-3LAYER.md section 14.
 npm test   # node test.mjs
 ```
 
-The suite (245 assertions) spins up mock backends and router instances on temp
+The suite (349 assertions) spins up mock backends plus router instances on temp
 configs — no keys, no network. It covers health, streaming, session affinity,
 failover, weighted selection, sticky/timed manual cools, fallback exclusion,
 dialect handling, synthesis from both legacy eras, the layered-params merge
 order, preset-of-presets nesting (expansion, cycle detection, ordering rules),
-per-model retry/backoff, the request-detail endpoint, and the analytics
-dashboard (cost engine, /api/dashboard aggregates, cooling timeline).
+per-model retry/backoff, the request-detail endpoint, the analytics
+dashboard (cost engine, /api/dashboard aggregates, cooling timeline), and the
+env editor (auth gate, list scoping, precedence, protected names, stale-revision
+conflicts, snapshots, and hot reload).
 
 ## Design docs
 

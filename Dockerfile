@@ -4,6 +4,9 @@ WORKDIR /app
 
 ENV NODE_ENV=production
 ENV ROUTER_CONFIG=/app/config.server.json
+# /data is the durable named volume; the managed secrets store must live there,
+# or a Coolify image rebuild would silently wipe the operator's saved keys.
+ENV ROUTER_SECRETS=/data/secrets.json
 
 COPY package.json server.mjs index.html config.json config.server.json ./
 

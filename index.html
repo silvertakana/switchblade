@@ -19,6 +19,19 @@
     --red: #f87171;
     --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     --radius: 8px;
+    /* Panel accent + its tints. Tints are declared here rather than inline
+       because the same three values color the Environment card's managed
+       badge and its inline buttons. */
+    --accent: #a78bfa;
+    --accent-soft: rgba(167,139,250,.12);
+    --accent-line: rgba(167,139,250,.32);
+    /* ---- shared layout scale (keeps the five views on one rhythm) ---- */
+    --sec-gap: 28px;
+    --card-radius: 12px;
+    --control-h: 34px;
+    /* One controlled display face for data surfaces, so tables and chips stop
+       drifting toward different type scales per view. */
+    --data-font: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -49,9 +62,12 @@
   button.primary:hover { background: #ffffff; }
   button.primary:disabled { background: #666; border-color: #666; color: #ccc; }
   button.danger { border-color: rgba(248, 113, 113, 0.4); color: var(--red); }
-  section { margin-bottom: 28px; }
-  h2 { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 1.2px; margin-bottom: 10px; font-weight: 600; }
-  h2 svg { width: 13px; height: 13px; margin-right: 6px; vertical-align: -2px; }
+  section { margin-bottom: var(--sec-gap); }
+  h2 { font-size: 12px; color: var(--text); text-transform: uppercase; letter-spacing: 1.2px; margin-bottom: 10px; font-weight: 600; display: flex; align-items: center; gap: 7px; }
+  h2::after { content: ""; flex: 1; height: 1px; background: linear-gradient(90deg, var(--border), transparent); }
+  h2 svg { width: 13px; height: 13px; flex-shrink: 0; color: var(--muted); }
+  /* An h2 that heads its own card must not carry the trailing rule. */
+  .cfg-sec-head h2::after, .card h2::after { display: none; }
   .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 14px; }
   .card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; }
   .card h3 { font-size: 14px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-weight: 500; line-height: 1.35; }
@@ -79,18 +95,36 @@
   .bar-pct { position: absolute; top: 50%; right: 6px; transform: translateY(-50%); font-size: 9px; font-weight: 700; color: #0a0a0a; letter-spacing: 0.3px; line-height: 1; }
   .stat-overview { display: flex; gap: 12px 28px; flex-wrap: wrap; margin-bottom: 12px; padding: 12px 16px; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); color: var(--muted); font-size: 13px; }
   .stat-overview b { color: var(--text); font-family: var(--mono); font-weight: 500; }
-  table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; font-size: 13px; }
-  th, td { text-align: left; padding: 6px 12px; border-bottom: 1px solid var(--border); }
+  table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--border); border-radius: var(--card-radius); overflow: hidden; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border); }
   th { color: var(--muted); font-weight: 500; text-transform: uppercase; font-size: 11px; letter-spacing: 0.5px; background: var(--panel-2); position: sticky; top: 0; z-index: 2; }
   tr:last-child td { border-bottom: none; }
+  /* Numeric columns read as digit columns only when they are right-aligned on
+     tabular figures; left-flushed proportional digits turn a latency scan into
+     a per-row read. */
+  th.num, td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  th .unit { text-transform: none; letter-spacing: 0; font-weight: 400; color: var(--faint); margin-left: 3px; font-size: 10px; }
+  tbody tr:hover td { background: rgba(255, 255, 255, 0.02); }
+  /* Empty states live inside the table to keep column rhythm, but must not
+     read as a data row with a sentence in the first cell. */
+  td.empty-cell { text-align: center; color: var(--muted); padding: 26px 12px; font-size: 13px; }
+  td.empty-cell .hint { display: block; margin-top: 5px; font-size: 12px; color: var(--faint); }
   td.mono, .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
   .status-ok { color: var(--green); }
   .status-err { color: var(--red); }
   .test-panel { display: flex; flex-direction: column; gap: 10px; }
   .test-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
-  select, textarea, input[type="text"], input[type="number"] {
+  /* password inputs were missing here and fell back to the browser default
+     white box, which read as the brightest element on the Playground. */
+  select, textarea, input[type="text"], input[type="number"], input[type="password"] {
     background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
     border-radius: var(--radius); padding: 6px 10px; font-size: 13px; font-family: inherit;
+  }
+  select, input[type="text"], input[type="number"], input[type="password"] { min-height: var(--control-h); }
+  select:focus-visible, textarea:focus-visible, input:focus-visible {
+    outline: 2px solid rgba(242, 242, 242, 0.35);
+    outline-offset: 1px;
+    border-color: var(--muted);
   }
   textarea { width: 100%; min-height: 80px; resize: vertical; font-family: var(--mono); }
   label.check { display: flex; align-items: center; gap: 6px; color: var(--muted); cursor: pointer; user-select: none; }
@@ -114,7 +148,10 @@
   }
   input[type="checkbox"]:hover { border-color: var(--muted); }
   input[type="checkbox"]:active { transform: scale(0.92); }
-  input[type="checkbox"]:checked { background: var(--text); border-color: var(--text); }
+  /* Checked uses the panel accent, not --text: a near-white fill made every
+     checked box the loudest element on the page, out-shouting the page title
+     and the KPI numbers it sits beside. */
+  input[type="checkbox"]:checked { background: var(--muted); border-color: var(--muted); }
   input[type="checkbox"]:checked::after {
     content: "";
     position: absolute;
@@ -176,29 +213,222 @@
   .login-master input { width: 100%; }
 
   /* ---- api keys tab ---- */
-  .keys-header { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 14px; }
-  .keys-form { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-  .keys-form input { min-width: 220px; }
-  .master-key { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; color: var(--muted); font-size: 12px; }
-  .master-key input { width: 300px; font-family: var(--mono); }
+  /* Two unrelated operations share this row, so they get equal tracks and a
+     real gutter: read horizontally, the old layout merged them into one form
+     and implied the master key was an argument to issuing a key. */
+  .keys-header { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 32px; align-items: end; margin-bottom: 16px; }
+  .keys-form { display: flex; gap: 8px; align-items: flex-end; flex-wrap: wrap; }
+  .keys-form label { display: flex; flex-direction: column; gap: 6px; }
+  .keys-form .lbl, .master-key .lbl { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); }
+  .keys-form input { width: 240px; }
+  .keys-form button { min-height: var(--control-h); }
+  .master-key { display: flex; flex-direction: column; gap: 6px; color: var(--muted); font-size: 12px; }
+  .master-key .row { display: flex; align-items: center; gap: 8px; }
+  .master-key input { flex: 1; max-width: 320px; font-family: var(--mono); min-height: var(--control-h); }
+  .master-key .hint { font-size: 11px; color: var(--faint); }
   .master-hint { color: var(--faint); font-size: 11px; }
-  .keys-list { display: flex; flex-direction: column; gap: 8px; }
-  .key-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 14px; font-size: 13px; }
+  .keys-list { display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: var(--card-radius); overflow: hidden; background: var(--panel); }
+  /* One grid for every row, so ids and dates stack into readable columns
+     instead of drifting with each row's content width. */
+  .key-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; padding: 11px 14px; font-size: 13px; border-bottom: 1px solid var(--border); }
+  .key-row:last-child { border-bottom: none; }
   .key-row.revoked { opacity: 0.5; }
-  .key-name { font-weight: 500; }
+  .key-main { display: flex; align-items: baseline; gap: 9px; min-width: 0; flex-wrap: wrap; }
+  .key-name { font-weight: 500; color: var(--text); }
+  .key-row.revoked .key-name { text-decoration: line-through; text-decoration-color: var(--faint); }
   .key-meta { color: var(--muted); font-size: 12px; font-family: var(--mono); }
+  .key-time { color: var(--faint); font-size: 12px; }
   .key-row .badge { text-transform: uppercase; }
   .badge.revoked { background: rgba(154, 154, 154, 0.15); color: var(--muted); }
-  .key-row button { margin-left: auto; }
-  .key-empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
+  /* Revoke is destructive but must not be the heaviest thing in the row: a
+     smaller ghost button keeps it discoverable without dominating the name. */
+  .key-row button.danger { margin-left: auto; font-size: 12px; padding: 5px 12px; min-height: 0; border-radius: 6px; }
+  .key-empty { color: var(--muted); font-size: 13px; padding: 20px 14px; }
+  .key-empty .hint { display: block; margin-top: 4px; font-size: 12px; color: var(--faint); }
   .key-created { color: var(--faint); font-size: 12px; padding: 10px 14px; }
-  .raw-key { display: flex; align-items: center; gap: 8px; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 14px; font-size: 13px; margin-bottom: 10px; }
-  .raw-key code { flex: 1; font-family: var(--mono); font-size: 12px; word-break: break-all; color: var(--green); }
+  /* The reveal is the one unrecoverable moment on this page, so it gets a
+     distinct block rather than a line inside the issue row. */
+  .raw-key { display: flex; align-items: center; gap: 10px; background: var(--panel); border: 1px solid rgba(74, 222, 128, 0.4); border-radius: var(--card-radius); padding: 12px 14px; font-size: 13px; margin-bottom: 14px; }
+  .raw-key code { flex: 1; font-family: var(--mono); font-size: 13px; word-break: break-all; color: var(--green); user-select: all; }
   .note.err { color: var(--red); }
+
+  /* ---- config editor ---- */
+  .cfg-bar { position: sticky; top: 0; z-index: 30; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; background: linear-gradient(180deg, var(--panel), #101010); border: 1px solid var(--border); border-radius: 12px; padding: 12px 16px; margin-bottom: 18px; box-shadow: 0 6px 20px rgba(0,0,0,.35); }
+  .cfg-bar .spacer { flex: 1; }
+  .cfg-status { display: flex; align-items: center; gap: 9px; font-size: 13px; color: var(--muted); }
+  .cfg-status .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 3px rgba(74,222,128,.12); flex-shrink: 0; }
+  .cfg-status.warn .dot { background: var(--amber); box-shadow: 0 0 0 3px rgba(251,191,36,.14); }
+  .cfg-status.err .dot { background: var(--red); box-shadow: 0 0 0 3px rgba(248,113,113,.14); }
+  .cfg-status b { color: var(--text); font-weight: 600; }
+  .cfg-status.err b { color: var(--red); }
+  .cfg-status.warn b { color: var(--amber); }
+  .cfg-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .cfg-actions button { display: inline-flex; align-items: center; gap: 7px; }
+  .cfg-actions .sep { width: 1px; height: 22px; background: var(--border); margin: 0 2px; }
+
+  .cfg-sec { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; margin-bottom: 18px; overflow: hidden; }
+  .cfg-sec-head { display: flex; align-items: center; gap: 12px; padding: 14px 16px; border-bottom: 1px solid var(--border); background: rgba(255,255,255,.012); }
+  .cfg-sec-head .ico { width: 30px; height: 30px; border-radius: 9px; background: var(--panel-2); border: 1px solid var(--border); display: flex; align-items: center; justify-content: center; color: var(--muted); flex-shrink: 0; }
+  .cfg-sec-head .ico svg { width: 15px; height: 15px; }
+  .cfg-sec-head h3 { font-size: 14px; font-weight: 600; letter-spacing: .1px; }
+  .cfg-sec-head .desc { color: var(--muted); font-size: 12px; margin-top: 2px; max-width: 74ch; line-height: 1.45; }
+  .cfg-sec-head .desc b { color: var(--text); font-weight: 500; }
+  .cfg-sec-head .desc code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; font-size: 11px; }
+  .cfg-sec-head .count { margin-left: auto; font-size: 11px; font-family: var(--mono); color: var(--muted); background: var(--panel-2); border: 1px solid var(--border); border-radius: 20px; padding: 3px 10px; flex-shrink: 0; }
+  .cfg-sec-body { padding: 0; }
+  .cfg-sec-foot { padding: 12px 16px; border-top: 1px solid var(--border); }
+
+  .cfg-wrap { overflow-x: auto; }
+  table.cfg-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.cfg-table th { text-align: left; font-size: 10.5px; text-transform: uppercase; letter-spacing: .8px; color: var(--faint); font-weight: 600; padding: 9px 16px; background: rgba(255,255,255,.015); border-bottom: 1px solid var(--border); white-space: nowrap; }
+  table.cfg-table td { padding: 12px 16px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  table.cfg-table tbody tr:last-child td { border-bottom: none; }
+  table.cfg-table tbody tr { transition: background-color 140ms ease; }
+  table.cfg-table tbody tr:hover { background: rgba(255,255,255,.022); }
+  table.cfg-table td.actions { white-space: nowrap; text-align: right; width: 1%; }
+  table.cfg-table svg, .cfg-sec-head svg, .cfg-bar button svg, .cfg-actions button svg, .add-row button svg { flex-shrink: 0; }
+  table.cfg-table svg { width: 13px; height: 13px; margin: 0; vertical-align: -2px; }
+  .cfg-td-name { font-family: var(--mono); font-size: 12.5px; color: var(--text); display: flex; align-items: center; gap: 8px; }
+  .cfg-td-sub { font-family: var(--mono); font-size: 11.5px; color: var(--muted); margin-top: 3px; }
+  .cfg-mono { font-family: var(--mono); font-size: 12px; }
+  .cfg-sub { color: var(--muted); font-size: 12px; }
+  .cfg-empty { padding: 22px 16px; color: var(--faint); font-size: 13px; text-align: center; }
+
+  .cfg-iconbtn { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; padding: 0; border-radius: 8px; background: transparent; border: 1px solid transparent; color: var(--muted); vertical-align: middle; }
+  .cfg-iconbtn + .cfg-iconbtn { margin-left: 3px; }
+  .cfg-iconbtn:hover { background: var(--panel-2); border-color: var(--border); color: var(--text); }
+  .cfg-iconbtn.danger:hover { border-color: rgba(248,113,113,.45); color: var(--red); background: rgba(248,113,113,.07); }
+  .cfg-iconbtn svg { width: 14px; height: 14px; margin: 0; }
+
+  .cfg-pill { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; padding: 2px 8px; border-radius: 6px; background: var(--panel-2); border: 1px solid var(--border); color: var(--muted); margin: 2px 3px 2px 0; font-family: var(--mono); white-space: nowrap; }
+  .cfg-pill b { color: var(--text); font-weight: 500; }
+  .cfg-pill .arrow { color: var(--faint); }
+  .cfg-pill.bad { border-color: rgba(248,113,113,.45); color: var(--red); background: rgba(248,113,113,.06); }
+  .cfg-pill.good { border-color: rgba(74,222,128,.28); }
+  .cfg-pills { display: flex; flex-wrap: wrap; }
+
+  .cfg-badge { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 600; padding: 2px 9px; border-radius: 20px; letter-spacing: .3px; border: 1px solid transparent; }
+  .cfg-badge svg { width: 11px; height: 11px; margin: 0; }
+  .cfg-badge.ok { background: rgba(74,222,128,.1); color: var(--green); border-color: rgba(74,222,128,.25); }
+  .cfg-badge.warn { background: rgba(251,191,36,.1); color: var(--amber); border-color: rgba(251,191,36,.28); }
+  .cfg-badge.bad { background: rgba(248,113,113,.1); color: var(--red); border-color: rgba(248,113,113,.28); }
+  .cfg-badge.neutral { background: var(--panel-2); color: var(--muted); border-color: var(--border); }
+
+  .cfg-issues { border-radius: 10px; padding: 13px 16px; margin-bottom: 16px; font-size: 12.5px; display: flex; gap: 11px; align-items: flex-start; }
+  .cfg-issues > svg { width: 16px; height: 16px; flex-shrink: 0; margin-top: 1px; }
+  .cfg-issues.error { background: rgba(248,113,113,.07); border: 1px solid rgba(248,113,113,.3); color: var(--red); }
+  .cfg-issues.warn { background: rgba(251,191,36,.07); border: 1px solid rgba(251,191,36,.3); color: var(--amber); }
+  .cfg-issues.ok { background: rgba(74,222,128,.07); border: 1px solid rgba(74,222,128,.3); color: var(--green); }
+  .cfg-issues ul { margin: 5px 0 0 15px; }
+  .cfg-issues li { margin-top: 3px; word-break: break-word; }
+  .cfg-issues code { background: rgba(255,255,255,.06); padding: 1px 5px; border-radius: 4px; font-size: 11.5px; }
+  .cfg-issues:empty { display: none; }
+
+  .cfg-modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,.68); backdrop-filter: blur(2px); z-index: 60; display: flex; align-items: flex-start; justify-content: center; padding: 40px 16px; overflow-y: auto; }
+  .cfg-modal { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; width: 100%; max-width: 720px; box-shadow: 0 24px 60px rgba(0,0,0,.55); overflow: hidden; }
+  .cfg-modal-head { display: flex; align-items: center; gap: 11px; padding: 16px 20px; border-bottom: 1px solid var(--border); }
+  .cfg-modal-head .ico { width: 30px; height: 30px; border-radius: 9px; background: var(--panel-2); border: 1px solid var(--border); display: flex; align-items: center; justify-content: center; color: var(--muted); flex-shrink: 0; }
+  .cfg-modal-head .ico svg { width: 15px; height: 15px; margin: 0; }
+  .cfg-modal-head h3 { font-size: 15px; font-weight: 600; }
+  .cfg-modal-head .close-x { margin-left: auto; width: 30px; height: 30px; padding: 0; border-radius: 8px; color: var(--muted); font-size: 18px; line-height: 1; }
+  .cfg-modal-body { padding: 18px 20px 4px; }
+  .cfg-modal .cfg-issues { margin: 0 20px 16px; }
+  .cfg-modal-actions { display: flex; gap: 10px; justify-content: flex-end; padding: 14px 20px; border-top: 1px solid var(--border); background: rgba(255,255,255,.012); }
+
+  .cfg-field { display: flex; flex-direction: column; gap: 5px; margin-bottom: 14px; }
+  .cfg-field > label { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  .cfg-field > label b { color: var(--text); font-weight: 500; }
+  .cfg-field input, .cfg-field select, .cfg-field textarea { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 8px 11px; font-size: 13px; font-family: inherit; width: 100%; transition: border-color 130ms ease, box-shadow 130ms ease; }
+  .cfg-field input, .cfg-field select { font-family: var(--mono); }
+  .cfg-field input:focus, .cfg-field select:focus, .cfg-field textarea:focus { outline: none; border-color: #3d3d3d; box-shadow: 0 0 0 3px rgba(255,255,255,.05); }
+  .cfg-field textarea { font-family: var(--mono); min-height: 74px; resize: vertical; line-height: 1.55; }
+  .cfg-field .sub { color: var(--faint); font-size: 11px; line-height: 1.5; }
+  .cfg-field .sub code { background: var(--panel-2); padding: 1px 4px; border-radius: 3px; }
+  .cfg-group { border: 1px solid var(--border); border-radius: 10px; padding: 14px 14px 0; margin-bottom: 14px; background: rgba(255,255,255,.012); }
+  .cfg-group > .cfg-group-title { font-size: 11px; text-transform: uppercase; letter-spacing: .8px; color: var(--faint); font-weight: 600; margin-bottom: 12px; display: flex; align-items: center; gap: 7px; }
+  .cfg-group > .cfg-group-title svg { width: 12px; height: 12px; margin: 0; }
+  .cfg-grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 14px; }
+  .cfg-grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0 14px; }
+  .cfg-rowline { display: flex; gap: 8px; align-items: flex-end; margin-bottom: 9px; }
+  .cfg-rowline .cfg-field { flex: 1; margin-bottom: 0; }
+  .cfg-rowline button { flex-shrink: 0; }
+  .cfg-rowline .rm { width: 34px; height: 34px; padding: 0; border-radius: 8px; display: inline-flex; align-items: center; justify-content: center; color: var(--muted); }
+  .cfg-rowline .rm:hover { color: var(--red); border-color: rgba(248,113,113,.4); }
+  .cfg-rowline .rm svg { width: 14px; height: 14px; margin: 0; }
+  .cfg-emptylist { color: var(--faint); font-size: 12px; padding: 4px 0 10px; }
+
+  .cfg-raw { width: 100%; min-height: 460px; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; color: var(--text); font-family: var(--mono); font-size: 12.5px; line-height: 1.6; padding: 16px 18px; resize: vertical; white-space: pre; overflow-wrap: normal; overflow-x: auto; tab-size: 2; }
+  .cfg-raw:focus { outline: none; border-color: #3d3d3d; box-shadow: 0 0 0 3px rgba(255,255,255,.05); }
+  .cfg-rawbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 10px 0 14px; }
+  .cfg-rawbar .spacer { flex: 1; }
+  .cfg-note { color: var(--muted); font-size: 12px; line-height: 1.55; max-width: 90ch; }
+  .cfg-note code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; font-size: 11.5px; }
+
+  .cfg-snap { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; padding: 11px 16px; border-bottom: 1px solid var(--border); font-size: 12px; transition: background-color 140ms ease; }
+  .cfg-snap:last-child { border-bottom: none; }
+  .cfg-snap:hover { background: rgba(255,255,255,.022); }
+  .cfg-snap .ico { width: 28px; height: 28px; border-radius: 8px; background: var(--panel-2); border: 1px solid var(--border); display: flex; align-items: center; justify-content: center; color: var(--muted); flex-shrink: 0; }
+  .cfg-snap .ico svg { width: 13px; height: 13px; margin: 0; }
+  .cfg-snap .when { color: var(--text); font-weight: 500; }
+  .cfg-snap .file { font-family: var(--mono); font-size: 11px; color: var(--faint); }
+  .cfg-snap .grow { flex: 1; min-width: 120px; }
+  .cfg-snap.is-latest .ico { color: var(--green); border-color: rgba(74,222,128,.3); }
+  .cfg-snap button { display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0; }
+  .cfg-snap button svg { width: 13px; height: 13px; margin: 0; }
+  .cfg-footnote { padding: 16px; color: var(--faint); font-size: 12px; text-align: center; }
+  .cfg-inline-input { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 6px 10px; font-family: var(--mono); font-size: 12px; width: 220px; }
+  .cfg-inline-input:focus { outline: none; border-color: #3d3d3d; box-shadow: 0 0 0 3px rgba(255,255,255,.05); }
+
+  /* ---- config editor: environment (managed secrets store) ---- */
+  /* Values come from three layers and only one of them is ours, so the source
+     badge outranks the value in the row: read it left to right and you see
+     where a name lives before you see what it says. */
+  .env-grid { display: flex; align-items: flex-end; gap: 10px; padding: 14px 16px; border-bottom: 1px solid var(--border); }
+  .env-grid label { display: flex; flex-direction: column; gap: 6px; min-width: 0; flex: 1 1 auto; }
+  .env-grid input, .env-grid textarea { width: 100%; font-family: var(--mono); align-self: stretch; }
+  .env-grid .lbl { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); }
+  .env-grid .env-name-field { max-width: 260px; flex: 0 0 240px; }
+  .env-grid textarea { min-height: var(--control-h); padding: 6px 10px; line-height: 1.45; resize: vertical; }
+  /* A fixed square keeps the icon button the same height as the fields beside
+     it, and end-alignment drops it level with their bottoms rather than their
+     labels, which have a text line above the control. */
+  .env-grid button { align-self: flex-end; flex: none; width: var(--control-h); height: var(--control-h); min-height: var(--control-h); padding: 0; }
+  .env-mask { font-family: var(--data-font); font-size: 13px; letter-spacing: 1.5px; color: var(--muted); }  .env-root { padding: 16px; }
+  .env-root .env-cell { flex-direction: row; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .env-root .env-note-cell { width: auto; }
+  .env-root .env-note-cell .cfg-inline-input { margin-left: 0; }
+  .env-root .env-lock { display: inline; }
+  .env-root .env-lock svg { vertical-align: -3px; }
+  .env-root .actions { text-align: left; width: auto; }
+  .env-root .actions .env-lock { margin-left: 4px; }
+  .env-root .env-value, .env-root .env-mask { display: inline; }
+  .env-value { font-family: var(--data-font); font-size: 12px; color: var(--text); word-break: break-all; user-select: all; }
+  .env-cell { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
+  .env-edit { display: flex; align-items: center; gap: 6px; }
+  .env-note-cell { width: 1%; }
+  .env-note-cell .cfg-inline-input { width: 180px; margin-left: 6px; }
+  .env-note-cell button { padding: 5px 10px; font-size: 12px; }
+  .env-note { font-size: 11.5px; line-height: 1.45; }
+  .env-lock { display: inline-flex; align-items: center; gap: 6px; color: var(--faint); font-size: 12px; }
+  .env-lock svg { width: 14px; height: 14px; margin: 0; flex-shrink: 0; }
+  .cfg-badge.managed { background: var(--accent-soft); color: var(--accent); border-color: var(--accent-line); }
+  .cfg-iconbtn.warn:hover { border-color: rgba(251,191,36,.45); color: var(--amber); background: rgba(251,191,36,.07); }
+  table.cfg-table .env-note code { background: var(--panel-2); padding: 1px 4px; border-radius: 4px; font-size: 11px; }
+  @media (max-width: 860px) {
+    .cfg-grid2, .cfg-grid3 { grid-template-columns: 1fr; }
+    .cfg-bar { position: static; }
+    .cfg-actions { width: 100%; }
+    .env-grid { flex-direction: column; align-items: stretch; }
+    .env-grid input, .env-grid textarea { width: 100%; }
+    .env-grid .env-name-field { max-width: none; flex: 1 1 auto; }
+    .env-grid button { align-self: flex-start; }
+    table.cfg-table th, table.cfg-table td { padding-left: 12px; padding-right: 12px; }
+  }
   .status-dot.down { background: var(--red); box-shadow: 0 0 0 0 rgba(248,113,113,.5); animation: pulse-red 2s ease-in-out infinite; }
   @keyframes pulse-red { 0% { box-shadow: 0 0 0 0 rgba(248,113,113,.45); } 70% { box-shadow: 0 0 0 7px rgba(248,113,113,0); } 100% { box-shadow: 0 0 0 0 rgba(248,113,113,0); } }
-  .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 20px; }
-  .tab { padding: 8px 16px; font-size: 13px; color: var(--muted); cursor: pointer; border: none; background: none; border-bottom: 2px solid transparent; border-radius: 0; }
+  .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 20px; position: relative; }
+  .tab { padding: 9px 16px; font-size: 13px; color: var(--muted); cursor: pointer; border: none; background: none; border-bottom: 2px solid transparent; border-radius: 0; display: inline-flex; align-items: center; gap: 7px; }
+  .tab svg { width: 14px; height: 14px; flex-shrink: 0; }
   .tab:hover { color: var(--text); border-color: var(--faint); }
   .tab.active { color: var(--text); border-bottom-color: var(--text); font-weight: 600; }
   .view { display: none; }
@@ -210,6 +440,11 @@
   .msg { max-width: 85%; padding: 10px 14px; border-radius: var(--radius); font-size: 14px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
   .msg.user { align-self: flex-end; background: #f2f2f2; color: #0a0a0a; padding: 12px 16px; }
   .msg.assistant { align-self: flex-start; background: var(--panel); border: 1px solid rgba(42, 42, 42, 0.6); color: var(--text); }
+  /* A failed request is a state, not a chat turn: mark it and keep the raw
+     envelope out of the visible text (it stays in Raw response below). */
+  .msg.assistant.err { border-color: rgba(248, 113, 113, 0.45); background: rgba(248, 113, 113, 0.05); }
+  .msg.assistant.err .role { color: var(--red); }
+  .msg.assistant .errmsg { color: var(--red); }
   .msg .role { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); margin-bottom: 4px; font-weight: 600; }
   .msg.user .role { color: rgba(10,10,10,.55); }
   .msg.reasoning { align-self: flex-start; background: var(--panel); border: 1px dashed var(--border); color: var(--muted); font-size: 12px; font-family: var(--mono); }
@@ -217,8 +452,24 @@
   .rTok { color: var(--accent); font-size: 11px; margin-left: 4px; }
   .chat-input-row { display: flex; gap: 10px; align-items: flex-end; }
   .chat-input-row textarea { flex: 1; min-height: 60px; max-height: 160px; }
-  .chat-controls { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; color: var(--muted); font-size: 13px; }
-  .chat-controls label { display: flex; align-items: center; gap: 5px; cursor: pointer; }
+  .chat { position: relative; }
+  /* The compose block is the page's most-used control, so it gets a surface of
+     its own rather than floating loose in the column. */
+  .chat-compose { background: var(--panel); border: 1px solid var(--border); border-radius: var(--card-radius); padding: 12px; }
+  .chat-compose .keyhint { font-size: 11px; color: var(--faint); margin-top: 7px; }
+  /* Control groups: a wider gap between clusters than within them is the
+     grouping signal, so no labels are needed to separate request inputs from
+     set-once environment controls. */
+  .chat-controls { display: flex; gap: 18px; align-items: center; flex-wrap: wrap; color: var(--muted); font-size: 13px; }
+  .chat-controls .grp { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+  .chat-controls .grp + .grp { padding-left: 18px; border-left: 1px solid var(--border); }
+  .chat-controls label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+  .chat-controls label > span.lbl { color: var(--faint); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+  /* Session affinity is the feature this tab exists to demonstrate, so its
+     control outranks the set-once ones beside it. */
+  .chat-controls label.session > span.lbl { color: var(--text); font-weight: 600; }
+  .chat-controls label.session input { width: 170px; border-color: rgba(242, 242, 242, 0.28); font-family: var(--mono); }
+  .chat-controls label.session input:not(:placeholder-shown) { color: var(--text); border-color: var(--muted); }
   .debug-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 12px; margin-top: 10px; }
   .debug-cell { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; font-size: 13px; }
   .debug-cell .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
@@ -231,8 +482,15 @@
   .linkbtn:hover { color: var(--text); border-color: var(--muted); }
 
   /* ---- playground: action bar (Send primary + grouped secondary) ---- */
+  /* Send is the one action performed dozens of times per session; the export
+     strip is used rarely. Previously the outlined exports out-weighed it. */
+  #pgSend { min-height: var(--control-h); padding: 0 20px; font-weight: 600; }
   .chat-actions { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
-  .chat-actions-right { display: flex; gap: 8px; flex-wrap: wrap; }
+  .chat-actions-right { display: flex; gap: 6px; flex-wrap: wrap; }
+  .chat-actions button.ghost { background: none; border-color: transparent; color: var(--muted); }
+  .chat-actions button.ghost:hover { background: var(--panel-2); border-color: var(--border); color: var(--text); }
+  .chat-actions #pgClear { color: var(--muted); }
+  .chat-actions #pgClear:hover { color: var(--red); border-color: rgba(248, 113, 113, 0.4); }
 
   /* ---- playground: compact debug panel ---- */
   .debug-compact { display: flex; flex-direction: column; gap: 6px; margin-top: 10px; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; }
@@ -382,15 +640,27 @@
 
   /* ---- analytics dashboard ---- */
   .dash-grid { display: flex; flex-direction: column; gap: 16px; }
-  .kpi-strip { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 10px; }
-  .kpi { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: clamp(10px, 1.2vw, 14px) clamp(12px, 1.6vw, 14px); min-width: 0; }
-  .kpi .k { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.7px; display: flex; align-items: center; gap: 5px; }
-  .kpi .k svg { width: 12px; height: 12px; flex-shrink: 0; }
-  .kpi .v { font-size: clamp(20px, 0.8vw + 17px, 24px); font-weight: 600; font-family: var(--mono); font-variant-numeric: tabular-nums; margin-top: 4px; line-height: 1.15; }
+  .kpi-strip { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 10px; align-items: stretch; }
+  .kpi { background: var(--panel); border: 1px solid var(--border); border-radius: var(--card-radius); padding: clamp(10px, 1.2vw, 14px) clamp(12px, 1.6vw, 14px); min-width: 0; display: flex; flex-direction: column; }
+  .kpi .k { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.7px; display: flex; align-items: flex-start; gap: 5px; line-height: 1.3; }
+  .kpi .k svg { width: 12px; height: 12px; flex-shrink: 0; margin-top: 1px; }
+  /* Every card reserves the same label height so the eight values share one
+     baseline. Without this, the labels that wrap to two lines push their
+     value down and the left-to-right sweep needs a per-card re-fixation. */
+  .kpi .k > span { min-height: 2.6em; }
+  .kpi .v { font-size: clamp(20px, 0.8vw + 17px, 24px); font-weight: 600; font-family: var(--mono); font-variant-numeric: tabular-nums; margin-top: auto; line-height: 1.15; }
   .kpi .v.na { color: var(--muted); font-weight: 400; font-size: 16px; }
-  .kpi .s { font-size: 10px; color: var(--faint); margin-top: 3px; letter-spacing: 0.2px; }
-  .peak-badge { display: inline-flex; align-items: center; gap: 8px; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 9px 14px; font-size: 12px; color: var(--muted); }
-  .peak-badge .pill { font-weight: 700; letter-spacing: 0.5px; padding: 2px 10px; border-radius: 11px; text-transform: uppercase; font-size: 11px; }
+  .kpi .s { font-size: 10px; color: var(--faint); margin-top: 3px; letter-spacing: 0.2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  /* Sub-lines must stay on one line: a single wrapping sub-line made the strip
+     look misaligned even when every card had the same height. Keep the copy
+     short enough to fit and let the tooltip carry the exact figures. */
+  .kpi .s[title] { cursor: help; }
+  /* Cooled backends is the one KPI whose bad value changes what the operator
+     does next, so it earns a state border instead of looking like its siblings. */
+  .kpi.alert { border-color: rgba(251, 191, 36, 0.45); background: linear-gradient(180deg, rgba(251,191,36,.06), transparent); }
+  .kpi.alert .v { color: var(--amber); }
+  .peak-badge { display: inline-flex; align-items: center; gap: 14px; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 9px 16px; font-size: 12px; color: var(--muted); }
+  .peak-badge .pill { font-weight: 700; letter-spacing: 0.5px; padding: 3px 11px; border-radius: 11px; text-transform: uppercase; font-size: 11px; }
   .peak-badge .pill.peak { background: rgba(251,191,36,.14); color: var(--amber); }
   .peak-badge .pill.offpeak { background: rgba(74,222,128,.14); color: var(--green); }
   .peak-badge .pill.na { background: rgba(154,154,154,.15); color: var(--muted); }
@@ -400,8 +670,11 @@
   .chart-grid.row-a { grid-template-columns: repeat(3, 1fr); }
   .chart-grid.row-b { grid-template-columns: 1.7fr 1fr; }
   .chart-grid.row-c { grid-template-columns: 1.1fr 1fr; }
-  .chart-card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px; min-width: 0; }
+  .chart-card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--card-radius); padding: 14px 16px; min-width: 0; }
   .chart-card h3 { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.9px; margin-bottom: 10px; font-weight: 600; display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+  /* A chart with no stated window forces the operator to guess whether its
+     numbers reconcile with the KPI strip above it. */
+  .chart-card h3 .scope { text-transform: none; letter-spacing: 0; font-weight: 400; font-size: 10px; color: var(--faint); }
   .chart-card h3 .togglers { display: inline-flex; gap: 4px; }
   .chart-card h3 .togglers button { padding: 2px 9px; font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px; border-radius: 6px; }
   .chart-card h3 .togglers button.on { background: var(--text); color: #0a0a0a; border-color: var(--text); font-weight: 700; }
@@ -458,9 +731,14 @@
 
   /* ---- history filters ---- */
   .filter-bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 10px; }
-  .filter-bar input[type="text"] { min-width: 130px; }
-  .filter-bar select { padding: 6px 8px; }
-  .filter-bar label.check { white-space: nowrap; }
+  /* Identical height, radius and border across all four controls so the row
+     reads as one toolbar instead of three unrelated widgets. */
+  .filter-bar input[type="text"] { width: 170px; }
+  .filter-bar select { padding: 0 8px; height: var(--control-h); }
+  .filter-bar label.check { white-space: nowrap; color: var(--muted); font-size: 13px; }
+  .filter-bar .spacer { flex: 1; }
+  .filter-bar .field-label { color: var(--faint); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+  #historyFilterCount { color: var(--faint); font-size: 12px; }
   .cost-na { color: var(--faint); }
 
   @media (max-width: 1000px) {
@@ -614,6 +892,7 @@
   <button class="tab" id="tab-history" role="tab" aria-selected="false" data-view="history" data-icon="clock">History</button>
   <button class="tab" id="tab-playground" role="tab" aria-selected="false" data-view="playground" data-icon="chat">Playground</button>
   <button class="tab" id="tab-keys" role="tab" aria-selected="false" data-view="keys" data-icon="key">API Keys</button>
+  <button class="tab" id="tab-config" role="tab" aria-selected="false" data-view="config" data-icon="sliders">Config</button>
 </nav>
 
 <main>
@@ -631,15 +910,15 @@
       <h2 data-icon="pie">Traffic &amp; cache</h2>
       <div class="chart-grid row-a">
         <div class="chart-card">
-          <h3>By provider</h3>
+          <h3>By provider <span class="scope" id="scopeProvider">-</span></h3>
           <div class="chart-body" id="donutBackend"><div class="skeleton"></div></div>
         </div>
         <div class="chart-card">
-          <h3>By model</h3>
+          <h3>By model <span class="scope" id="scopeModel">-</span></h3>
           <div class="chart-body" id="donutModel"><div class="skeleton"></div></div>
         </div>
         <div class="chart-card">
-          <h3>Cache split</h3>
+          <h3>Cache split <span class="scope" id="scopeCache">-</span></h3>
           <div class="chart-body" id="donutCache"><div class="skeleton"></div></div>
           <div class="spark" id="cacheTrendWrap" style="display:none">
             <div class="spark-head">Cache hit rate by day</div>
@@ -736,8 +1015,8 @@
       <h2 data-icon="clock">Request history</h2>
       <div id="historyCacheSummary" class="stat-overview" style="margin-bottom:10px;display:none"></div>
       <div class="filter-bar" id="historyFilters">
-        <input type="text" id="hfModel" placeholder="Filter model..." spellcheck="false" autocomplete="off">
-        <input type="text" id="hfBackend" placeholder="Filter backend..." spellcheck="false" autocomplete="off">
+        <input type="text" id="hfModel" placeholder="Filter model..." spellcheck="false" autocomplete="off" aria-label="Filter by model">
+        <input type="text" id="hfBackend" placeholder="Filter backend..." spellcheck="false" autocomplete="off" aria-label="Filter by backend">
         <select id="hfCache" aria-label="Cache state filter">
           <option value="">Cache: all</option>
           <option value="hit">hit</option>
@@ -745,12 +1024,18 @@
           <option value="unknown">unknown</option>
         </select>
         <label class="check" title="Only rows with a failure (status >= 400 or an upstream error kind)"><input type="checkbox" id="hfErrors"> errors only</label>
+        <span class="spacer"></span>
         <span id="historyFilterCount" class="cost-na"></span>
       </div>
       <div style="overflow-x:auto">
         <table>
+          <colgroup>
+            <col style="width:78px"><col style="width:84px"><col style="width:186px"><col style="width:126px">
+            <col style="width:74px"><col style="width:76px"><col style="width:104px"><col style="width:96px">
+            <col style="width:80px"><col style="width:76px"><col style="width:84px"><col style="width:140px">
+          </colgroup>
           <thead>
-            <tr><th scope="col">Call</th><th scope="col">Time</th><th scope="col">Model</th><th scope="col">Backend</th><th scope="col">Stream</th><th scope="col">Status</th><th scope="col">Latency (ms)</th><th scope="col">TTFT (ms)</th><th scope="col">Tokens</th><th scope="col">Cache</th><th scope="col">Cost</th><th scope="col">Session</th></tr>
+            <tr><th scope="col">Call</th><th scope="col">Time</th><th scope="col">Model</th><th scope="col">Backend</th><th scope="col">Stream</th><th scope="col">Status</th><th scope="col" class="num">Latency <span class="unit">ms</span></th><th scope="col" class="num">TTFT <span class="unit">ms</span></th><th scope="col" class="num">Tokens</th><th scope="col">Cache</th><th scope="col" class="num">Cost <span class="unit">$</span></th><th scope="col">Session</th></tr>
           </thead>
           <tbody id="historyBody"><tr><td colspan="12"><div class="skeleton"></div></td></tr></tbody>
         </table>
@@ -763,28 +1048,34 @@
       <h2>Playground</h2>
       <div class="chat">
         <div class="chat-controls">
-          <label>Model
-            <select id="pgModel"></select>
-          </label>
-          <label class="check"><input type="checkbox" id="pgStream" checked> stream</label>
-          <label class="check"><input type="checkbox" id="pgShowReasoning" checked> show reasoning</label>
-          <label>Session ID
-            <input type="text" id="pgSession" placeholder="(none)" style="width:140px" spellcheck="false">
-          </label>
-          <label>Template
-            <select id="pgTemplate" aria-label="Prompt template">
-              <option value="">(none)</option>
-              <option value="review">Code review</option>
-              <option value="bug">Bug analysis</option>
-              <option value="refactor">Refactoring</option>
-              <option value="test">Test generation</option>
-              <option value="docs">Documentation</option>
-            </select>
-          </label>
-          <label title="Optional; only needed if the router requires authentication">API key
-            <input type="password" id="pgKey" placeholder="(none)" autocomplete="off" spellcheck="false" style="width:160px">
-          </label>
-          <button class="linkbtn" id="pgAdvancedToggle" data-icon="sliders">Advanced</button>
+          <div class="grp">
+            <label>Model
+              <select id="pgModel"></select>
+            </label>
+            <label class="session"><span class="lbl">Session ID</span>
+              <input type="text" id="pgSession" placeholder="(none)" spellcheck="false">
+            </label>
+          </div>
+          <div class="grp">
+            <label class="check"><input type="checkbox" id="pgStream" checked> stream</label>
+            <label class="check"><input type="checkbox" id="pgShowReasoning" checked> show reasoning</label>
+          </div>
+          <div class="grp">
+            <label>Template
+              <select id="pgTemplate" aria-label="Prompt template">
+                <option value="">(none)</option>
+                <option value="review">Code review</option>
+                <option value="bug">Bug analysis</option>
+                <option value="refactor">Refactoring</option>
+                <option value="test">Test generation</option>
+                <option value="docs">Documentation</option>
+              </select>
+            </label>
+            <label title="Optional; only needed if the router requires authentication">API key
+              <input type="password" id="pgKey" placeholder="(none)" autocomplete="off" spellcheck="false" style="width:160px">
+            </label>
+            <button class="linkbtn" id="pgAdvancedToggle" data-icon="sliders">Advanced</button>
+          </div>
         </div>
         <div class="collapsed" id="pgAdvanced">
           <div class="chat-controls">
@@ -812,17 +1103,20 @@
         <div class="chat-thread" id="pgThread" aria-live="polite">
           <p class="empty">Send a message to start chatting. Watch which backend serves each request in the debug panel below.</p>
         </div>
-        <div class="chat-input-row">
-          <textarea id="pgInput" placeholder="Message the model... (Enter to send, Shift+Enter for newline)" spellcheck="false"></textarea>
-          <button class="primary" id="pgSend" data-icon="send">Send</button>
+        <div class="chat-compose">
+          <div class="chat-input-row">
+            <textarea id="pgInput" placeholder="Message the model..." spellcheck="false"></textarea>
+            <button class="primary" id="pgSend" data-icon="send">Send</button>
+          </div>
+          <div class="keyhint">Enter to send, Shift+Enter for newline.</div>
         </div>
         <div class="chat-actions">
           <button id="pgClear" data-icon="trash">Clear</button>
           <div class="chat-actions-right">
-            <button id="pgExportText" data-icon="copy">Copy text</button>
-            <button id="pgExportJson" data-icon="copy">Copy JSON</button>
-            <button id="pgDownloadMd" data-icon="download">Download MD</button>
-            <button id="pgCompareToggle" data-icon="columns">Compare</button>
+            <button class="ghost" id="pgExportText" data-icon="copy">Copy text</button>
+            <button class="ghost" id="pgExportJson" data-icon="copy">Copy JSON</button>
+            <button class="ghost" id="pgDownloadMd" data-icon="download">Download MD</button>
+            <button class="ghost" id="pgCompareToggle" data-icon="columns">Compare</button>
           </div>
         </div>
         <div class="collapsed" id="pgComparePanel" aria-label="Model comparison">
@@ -883,15 +1177,18 @@
       <h2 data-icon="key">API Keys</h2>
       <div class="keys-header">
         <form id="keyCreateForm" class="keys-form">
-          <label>Name
+          <label><span class="lbl">Name</span>
             <input type="text" id="keyName" placeholder="e.g. opencode, cli script..." maxlength="64" spellcheck="false">
           </label>
           <button class="primary" id="keyCreate" data-icon="key" type="submit">Issue key</button>
         </form>
         <label class="master-key" title="Optional: only needed if you are not logged into the dashboard. Logging in with the password unlocks admin actions and key management. Stored in this browser only.">
-          <span>Master key <em>(optional if logged in)</em></span>
-          <input type="password" id="masterKeyInput" placeholder="(none)" autocomplete="off" spellcheck="false">
-          <span class="master-hint">local only</span>
+          <span class="lbl">Master key</span>
+          <span class="row">
+            <input type="password" id="masterKeyInput" placeholder="(none)" autocomplete="off" spellcheck="false">
+            <span class="master-hint">local only</span>
+          </span>
+          <span class="hint">Optional when logged in.</span>
         </label>
       </div>
       <div id="rawKeyBox" class="raw-key" style="display:none"></div>
@@ -899,7 +1196,143 @@
       <div id="keysList" class="keys-list"><p class="key-empty">Loading keys...</p></div>
     </section>
   </div>
+
+  <div id="view-config" class="view" role="tabpanel" aria-labelledby="tab-config">
+    <div class="cfg-bar">
+      <span id="cfgState" class="cfg-status"><span class="dot"></span>Loading config...</span>
+      <span class="spacer"></span>
+      <div class="cfg-actions">
+        <button id="cfgModeToggle" class="primary" data-icon="code" title="Switch between the form editors and the raw JSON view">Raw JSON</button>
+        <span class="sep"></span>
+        <button id="cfgReload" data-icon="refresh" title="Discard local edits and reload the file from disk">Reload</button>
+        <button id="cfgValidate" title="Run the same validation the server runs on save, without writing">Validate</button>
+        <button id="cfgSave" class="primary" data-icon="save" title="Write config.json (snapshotted first; the router hot-reloads in about 300ms)">Save</button>
+      </div>
+    </div>
+    <div id="cfgIssues" class="cfg-issues"></div>
+
+    <div id="cfgFormsInner">
+      <section class="cfg-sec">
+        <div class="cfg-sec-head">
+          <span class="ico" data-icon="server"></span>
+          <div>
+            <h3>Backends</h3>
+            <div class="desc">Upstream accounts. <b>Key env</b> is the NAME of an environment variable, never the key itself; the value lives in <code>.env</code>.</div>
+          </div>
+          <span class="count" id="cfgCountBackends">-</span>
+        </div>
+        <div class="cfg-sec-body"><div class="cfg-wrap"><table class="cfg-table" id="cfgBackendsTable"></table></div></div>
+        <div class="cfg-sec-foot"><button id="cfgAddBackend" data-icon="plus">Add backend</button></div>
+      </section>
+
+      <section class="cfg-sec">
+        <div class="cfg-sec-head">
+          <span class="ico" data-icon="box"></span>
+          <div>
+            <h3>Models</h3>
+            <div class="desc">A logical model id bound to one or more providers (backend + upstream). Declared order is the failover order.</div>
+          </div>
+          <span class="count" id="cfgCountModels">-</span>
+        </div>
+        <div class="cfg-sec-body"><div class="cfg-wrap"><table class="cfg-table" id="cfgModelsTable"></table></div></div>
+        <div class="cfg-sec-foot"><button id="cfgAddModel" data-icon="plus">Add model</button></div>
+      </section>
+
+      <section class="cfg-sec">
+        <div class="cfg-sec-head">
+          <span class="ico" data-icon="route"></span>
+          <div>
+            <h3>Presets</h3>
+            <div class="desc">Routing policies exposed to clients as model ids. A preset may list other presets (tier nesting); the top-level strategy governs.</div>
+          </div>
+          <span class="count" id="cfgCountPresets">-</span>
+        </div>
+        <div class="cfg-sec-body"><div class="cfg-wrap"><table class="cfg-table" id="cfgPresetsTable"></table></div></div>
+        <div class="cfg-sec-foot"><button id="cfgAddPreset" data-icon="plus">Add preset</button></div>
+      </section>
+
+      <section class="cfg-sec">
+        <div class="cfg-sec-head">
+          <span class="ico" data-icon="sliders"></span>
+          <div>
+            <h3>Settings</h3>
+            <div class="desc">Server-level blocks. <code>port</code> and <code>host</code> are bound at startup and are not editable here.</div>
+          </div>
+        </div>
+        <div class="cfg-sec-body"><div class="cfg-wrap"><table class="cfg-table" id="cfgSettingsTable"></table></div></div>
+      </section>
+
+      <section class="cfg-sec">
+        <div class="cfg-sec-head">
+          <span class="ico" data-icon="key"></span>
+          <div>
+            <h3>Environment</h3>
+            <div class="desc">Where each name comes from, and whether the running process has it yet. <b>managed</b> values live in the secrets store and are editable here; <b>shell</b> and <b>.env</b> values are owned outside this editor and must be changed there.</div>
+          </div>
+          <span class="count" id="cfgCountEnv">-</span>
+        </div>
+        <div id="envBanner" class="cfg-issues warn" role="status"></div>
+        <div id="envNote" class="cfg-issues error" role="alert"></div>
+        <div class="cfg-sec-body">
+        <div class="env-grid">
+          <label class="env-name-field">
+            <span class="lbl">New variable name</span>
+            <input type="text" id="envAddName" placeholder="OPENCODE_GO_KEY" spellcheck="false" autocomplete="off" aria-label="New environment variable name">
+          </label>
+          <label>
+            <span class="lbl">Value</span>
+            <textarea id="envAddValue" rows="1" placeholder="the value to store" spellcheck="false" autocomplete="off" aria-label="New environment variable value"></textarea>
+          </label>
+          <button id="envAdd" class="primary" type="button" data-icon="plus" aria-label="Add variable" title="Add variable"></button>
+        </div>
+        <div id="envTableRoot" class="env-root"><table class="cfg-table" id="cfgEnvTable"></table></div>
+      </div>
+        <div class="cfg-sec-foot"><span class="cfg-footnote" style="padding:0;text-align:left">Values are fetched one at a time by <b>Reveal</b> and never sent with this list.</span></div>
+      </section>
+
+      <section class="cfg-sec">
+        <div class="cfg-sec-head">
+          <span class="ico" data-icon="history"></span>
+          <div>
+            <h3>Change history</h3>
+            <div class="desc">The previous file is snapshotted before every save, newest first (last 20 kept). Restoring also snapshots what it replaces, so it is undoable.</div>
+          </div>
+        </div>
+        <div class="cfg-sec-body" id="cfgSnapshots"></div>
+      </section>
+    </div>
+
+    <div id="cfgRawInner" style="display:none">
+      <div class="cfg-rawbar">
+        <p class="cfg-note">
+          The whole file. Keys the form editors do not model (<code>pricing</code>, <code>missCapture</code>, <code>alerts</code>, anything custom) live here and are never dropped by a form save.
+        </p>
+      </div>
+      <textarea id="cfgRawText" class="cfg-raw" spellcheck="false" aria-label="Raw config JSON"></textarea>
+      <div class="cfg-rawbar">
+        <button id="cfgFormat" data-icon="code">Format</button>
+        <button id="cfgRawFromForms" data-icon="refresh" title="Replace the text with the current draft from the form editors">Take from forms</button>
+      </div>
+    </div>
+  </div>
 </main>
+
+<!-- Config editor modal (add/edit for one entry) -->
+<div class="cfg-modal-bg" id="cfgModalBg" style="display:none">
+  <div class="cfg-modal" role="dialog" aria-modal="true" aria-labelledby="cfgModalTitle">
+    <div class="cfg-modal-head">
+      <span class="ico" id="cfgModalIcon" data-icon="sliders"></span>
+      <h3 id="cfgModalTitle">Edit</h3>
+      <button class="close-x" id="cfgModalX" aria-label="Close" title="Close (Esc)">&times;</button>
+    </div>
+    <div class="cfg-modal-body" id="cfgModalBody"></div>
+    <div id="cfgModalIssues" class="cfg-issues"></div>
+    <div class="cfg-modal-actions">
+      <button id="cfgModalCancel">Cancel</button>
+      <button id="cfgModalApply" class="primary">Done</button>
+    </div>
+  </div>
+</div>
 
 <!-- Request detail slide-out panel (deep dive per history row) -->
 <div id="detailOverlay" class="detail-overlay"></div>
@@ -1255,13 +1688,25 @@ const ICONS = {
   copy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
   trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>',
   sliders: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>',
+  plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>',
+  save: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>',
+  code: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>',
+  pencil: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>',
+  clipboard: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
+  x: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>',
+  history: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M12 7v5l4 2"/></svg>',
+  route: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="19" r="3"/><path d="M9 19h8.5a3.5 3.5 0 0 0 0-7h-11a3.5 3.5 0 0 1 0-7H15"/><circle cx="18" cy="5" r="3"/></svg>',
+  info: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>',
+  undo: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 14 4 9 9 4"/><path d="M20 20v-7a4 4 0 0 0-4-4H4"/></svg>',
   terminal: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>',
   dollar: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>',
   pie: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21.21 15.89A10 10 0 1 1 8 2.83"/><path d="M22 12A10 10 0 0 0 12 2v10z"/></svg>',
   columns: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="12" y1="3" x2="12" y2="21"/></svg>',
   download: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>',
   key: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0 3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>',
-  logout: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>',
+  eye: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>',
+  "eye-off": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>',
+  lock: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>',
 };
 
 // Inject icons into static elements tagged with data-icon (single source of truth).
@@ -1360,15 +1805,15 @@ function renderPeakBadge() {
   const snap = { peak, mult, opt };
   if (!sectionChanged("peakBadge", snap)) return;
   const why = peak
-    ? "Standard pricing now. Off-peak (half price for " + opt + " off-peak model(s)) resumes when the window ends."
+    ? "Standard pricing. The discount resumes when the window ends (" + opt + " off-peak model(s))."
     : (mult < 1
-        ? "Off-peak: " + Math.round((1 - mult) * 100) + "% off (" + mult + "x multiplier) for " + opt + " off-peak model(s)."
-        : "Off-peak now - no discount multiplier configured.");
+        ? Math.round((1 - mult) * 100) + "% off (" + mult + "x multiplier) for " + opt + " off-peak model(s)."
+        : "No discount multiplier configured.");
   host.innerHTML = '<span class="pill ' + (peak ? "peak" : "offpeak") + '">' + (peak ? "Peak now" : "Off-peak now") + "</span><span class=\"why\">" + esc(why) + "</span>";
 }
 
-function kpiCell(label, value, sub, icon, cls) {
-  return '<div class="kpi"><span class="k">' + (ICONS[icon] || "") + esc(label) + '</span><div class="v' + (cls ? " " + cls : "") + '">' + value + "</div>" + (sub ? '<div class="s">' + sub + "</div>" : "") + "</div>";
+function kpiCell(label, value, sub, icon, cls, alert, tip) {
+  return '<div class="kpi' + (alert ? " alert" : "") + '"><span class="k">' + (ICONS[icon] || "") + "<span>" + esc(label) + '</span></span><div class="v' + (cls ? " " + cls : "") + '">' + value + "</div>" + (sub ? '<div class="s"' + (tip ? ' title="' + esc(tip) + '"' : "") + ">" + sub + "</div>" : "") + "</div>";
 }
 
 function renderKpis() {
@@ -1386,19 +1831,46 @@ function renderKpis() {
   const snap = { k, since: state.dash.since };
   if (!sectionChanged("kpis", snap)) return;
   const totalTokens = (k.promptTokens || 0) + (k.completionTokens || 0);
+  // Charts must state their window: without it the operator cannot tell
+  // whether a per-provider count reconciles with the KPI strip above.
+  const scopeText = state.dash.since ? "since " + fmtTime(state.dash.since) : "session";
+  for (const id of ["scopeProvider", "scopeModel", "scopeCache"]) {
+    const el = $(id);
+    if (el) el.textContent = scopeText;
+  }
   // After a router restart the dashboard endpoint may briefly 404; keep the
   // last good snapshot visible and mark the data as stale.
   const staleNote = state.dashOk ? "" : '<div class="empty" style="grid-column:1/-1;padding:0;font-size:11px;color:var(--amber)">Showing last snapshot \u00b7 reconnecting to /api/dashboard...</div>';
   host.innerHTML =
-    kpiCell("Requests", fmtCompact(k.requests), fmtTime(state.dash.since) + " since", "activity") +
+    kpiCell("Requests", fmtCompact(k.requests), "since " + fmtTime(state.dash.since), "activity") +
     kpiCell("Total tokens", fmtCompact(totalTokens), fmtCompact(k.promptTokens || 0) + " in / " + fmtCompact(k.completionTokens || 0) + " out", "hash") +
-    kpiCell("Spend", fmtMoney(k.cost), k.cost == null ? "pricing not configured" : "incl. off-peak discounts", "dollar", k.cost == null ? "na" : "") +
-    kpiCell("Cache hit rate", fmtPct(k.cacheHitRate), fmtCompact(k.cacheHitTokens != null ? k.cacheHitTokens : 0) + " hit / " + fmtCompact(k.cacheMissTokens != null ? k.cacheMissTokens : 0) + " miss tokens", "database", k.cacheHitRate == null ? "na" : "") +
-    kpiCell("Error rate", fmtPct(k.errorRate), k.errors + " failed of " + k.requests, "warn", k.errorRate == null ? "na" : "") +
-    kpiCell("Cooled", String(k.cooledBackends != null ? k.cooledBackends : 0), "backends cooling", "snowflake") +
-    kpiCell("Off-peak share", fmtPct(k.offPeakShare), fmtCompact(k.offPeakRequests || 0) + " requests off-peak", "sun", k.offPeakShare == null ? "na" : "") +
+    kpiCell("Spend", fmtMoney(k.cost), k.cost == null ? "no pricing" : "incl. off-peak", "dollar", k.cost == null ? "na" : "", false, k.cost == null ? "No model in this window declares pricing" : "Includes the off-peak discount and cache savings") +
+    kpiCell("Cache hit", fmtPct(k.cacheHitRate), fmtCompact(k.cacheHitTokens != null ? k.cacheHitTokens : 0) + " hit / " + fmtCompact(k.cacheMissTokens != null ? k.cacheMissTokens : 0) + " miss", "database", k.cacheHitRate == null ? "na" : "", false, "Cached input tokens vs full-price misses, over this window") +
+    kpiCell("Error rate", fmtPct(k.errorRate), k.errors + " of " + k.requests, "warn", k.errorRate == null ? "na" : "", false, k.errors + " failed of " + k.requests + " requests") +
+    kpiCell(
+      "Cooled",
+      String(k.cooledBackends != null ? k.cooledBackends : 0),
+      cooledSummary(),
+      "snowflake",
+      "",
+      (k.cooledBackends || 0) > 0
+    ) +
+    kpiCell("Off-peak", fmtPct(k.offPeakShare), fmtCompact(k.offPeakRequests || 0) + " discounted", "sun", k.offPeakShare == null ? "na" : "", false, fmtCompact(k.offPeakRequests || 0) + " requests served at the off-peak discount") +
     kpiCell("Uptime", fmtUptime(state.dash.uptimeMs), "", "clock") +
     staleNote;
+}
+
+// "Cooled" is the one KPI whose bad value changes what the operator does next,
+// so its sub-line names the backend and the remaining time instead of restating
+// the unit. Zero stays quiet.
+function cooledSummary() {
+  const bs = state.dash && Array.isArray(state.dash.byBackend) ? state.dash.byBackend : [];
+  const cooled = bs.filter((b) => b && b.state === "cooling");
+  if (!cooled.length) return "all healthy";
+  const first = cooled[0];
+  const msLeft = first.nextAvailableAt != null ? first.nextAvailableAt - Date.now() : null;
+  const when = msLeft != null && msLeft > 0 ? " - " + fmtUptime(msLeft) : "";
+  return cooled.length === 1 ? first.id + when : first.id + when + " +" + (cooled.length - 1) + " more";
 }
 
 function renderDonutProvider() {
@@ -1638,7 +2110,7 @@ function renderHistory() {
   const pct = known > 0 ? Math.round((hits / known) * 100) : 0;
   if (entries.length === 0) {
     sum.style.display = "none";
-    body.innerHTML = '<tr><td colspan="12" class="empty">No requests yet.</td></tr>';
+    body.innerHTML = '<tr><td colspan="12" class="empty-cell">No requests recorded yet.<span class="hint">Requests appear here once the router handles traffic. History keeps the most recent 500 calls.</span></td></tr>';
     $("historyFilterCount").textContent = "";
     return;
   }
@@ -1653,7 +2125,7 @@ function renderHistory() {
     "<span>Known <b>" + known + "</b></span>";
   $("historyFilterCount").textContent = filtered.length === entries.length ? "" : filtered.length + " of " + entries.length + " shown";
   if (!filtered.length) {
-    body.innerHTML = '<tr><td colspan="12" class="empty">No requests match the current filters.</td></tr>';
+    body.innerHTML = '<tr><td colspan="12" class="empty-cell">No requests match the current filters.<span class="hint">Clear a filter above to widen the results.</span></td></tr>';
     return;
   }
   body.innerHTML = filtered.map((e) => {
@@ -1671,12 +2143,12 @@ function renderHistory() {
     '<td data-label="Backend">' + esc(e.backend) + "</td>" +
     '<td data-label="Stream">' + (e.stream ? "yes" : "no") + "</td>" +
     '<td class="mono ' + (e.status >= 400 ? "status-err" : "status-ok") + '" data-label="Status">' + e.status + "</td>" +
-    '<td class="mono" data-label="Latency">' + (e.latencyMs != null ? Math.round(e.latencyMs) + "ms" : "-") + "</td>" +
-    '<td class="mono" data-label="TTFT">' + (e.ttftMs != null ? Math.round(e.ttftMs) + "ms" : "-") + "</td>" +
-    '<td class="mono" data-label="Tokens">' + (e.promptTokens != null ? e.promptTokens + "/" + (e.completionTokens != null ? e.completionTokens : "?") : "-") +
+    '<td class="mono num" data-label="Latency">' + (e.latencyMs != null ? Math.round(e.latencyMs) : "-") + "</td>" +
+    '<td class="mono num" data-label="TTFT">' + (e.ttftMs != null ? Math.round(e.ttftMs) : "-") + "</td>" +
+    '<td class="mono num" data-label="Tokens">' + (e.promptTokens != null ? e.promptTokens + "/" + (e.completionTokens != null ? e.completionTokens : "?") : "-") +
       (e.reasoningTokens > 0 ? ' <span class="rTok" title="reasoning tokens">🧠' + e.reasoningTokens + "</span>" : "") + "</td>" +
     '<td class="mono ' + cacheClass + '" data-label="Cache">' + cacheText + "</td>" +
-    '<td class="mono" data-label="Cost" title="' + (e.cost != null ? "cache savings " + fmtMoney(e.cacheSavings) + " / off-peak savings " + fmtMoney(e.offPeakSavings) : "no pricing configured for this model") + '">' + costText + "</td>" +
+    '<td class="mono num" data-label="Cost" title="' + (e.cost != null ? "cache savings " + fmtMoney(e.cacheSavings) + " / off-peak savings " + fmtMoney(e.offPeakSavings) : "no pricing configured for this model") + '">' + costText + "</td>" +
     '<td data-label="Session">' + esc(e.session) + "</td>" +
     "</tr>"
     );
@@ -1998,16 +2470,28 @@ function setKeysStatus(msg) {
   $("keysStatus").textContent = msg || "";
 }
 
+// Compact, unambiguous stamp for an audit row: 24-hour, no seconds, so AM/PM
+// never has to be decoded at a glance.
+function fmtKeyTime(ts) {
+  if (!ts) return "-";
+  const d = new Date(ts);
+  const p = (n) => String(n).padStart(2, "0");
+  return d.getMonth() + 1 + "/" + d.getDate() + " " + p(d.getHours()) + ":" + p(d.getMinutes());
+}
+
 function keyRowHtml(k) {
-  const created = k.createdAt ? new Date(k.createdAt).toLocaleString() : "-";
+  const created = fmtKeyTime(k.createdAt);
   const revoke = k.revoked
     ? ""
     : '<button class="danger" data-revoke="' + esc(k.id) + '" data-revoke-name="' + esc(k.name) + '">' + ICONS.trash + "Revoke</button>";
   return (
     '<div class="key-row' + (k.revoked ? " revoked" : "") + '">' +
+    '<div class="key-main">' +
     '<span class="key-name">' + esc(k.name) + "</span>" +
-    '<span class="key-meta">' + esc((k.id || "").slice(0, 8)) + " &middot; " + esc(created) + "</span>" +
+    '<span class="key-meta">' + esc((k.id || "").slice(0, 8)) + "</span>" +
+    '<span class="key-time">' + esc(k.revoked ? "revoked " + created : created) + "</span>" +
     (k.revoked ? '<span class="badge revoked">Revoked</span>' : "") +
+    "</div>" +
     revoke +
     "</div>"
   );
@@ -2016,7 +2500,7 @@ function keyRowHtml(k) {
 function renderKeysList(keys) {
   const host = $("keysList");
   if (!Array.isArray(keys) || keys.length === 0) {
-    host.innerHTML = '<p class="key-empty">No keys issued yet.</p>';
+    host.innerHTML = '<p class="key-empty">No keys issued yet.<span class="hint">Issue one above. Its value is shown once and cannot be retrieved again.</span></p>';
     return;
   }
   host.innerHTML = keys.map(keyRowHtml).join("");
@@ -2759,9 +3243,29 @@ function renderThread() {
       : (m.reasoning
         ? '<div class="msg reasoning-hidden"><span class="role">Reasoning</span><span class="hint">hidden - check "show reasoning" to display</span></div>'
         : "");
-    return reasoning + '<div class="msg assistant"><span class="role">Assistant</span>' + esc(m.content) + "</div>";
+    return reasoning + '<div class="msg assistant' + (m.error ? " err" : "") + '"><span class="role">' + (m.error ? "Error" + (m.errorStatus ? " " + m.errorStatus : "") : "Assistant") + "</span>" + renderAssistantBody(m) + "</div>";
   }).join("");
   host.scrollTop = host.scrollHeight;
+}
+
+// An upstream failure arrives as a JSON error envelope. Rendering it escaped
+// made the Playground show {"error":{"message":...}} while the dashboard showed
+// the same failure as readable prose. Detect the envelope and unwrap it.
+function renderAssistantBody(m) {
+  const raw = m.content == null ? "" : String(m.content);
+  // Errors get unwrapped; normal replies get inline markdown, matching the
+  // reasoning panel so **bold** no longer shows as literal asterisks.
+  if (!m.error) return fmtInline(raw);
+  let msg = raw;
+  try {
+    const parsed = JSON.parse(raw);
+    const inner = parsed && parsed.error ? parsed.error : parsed;
+    if (inner && typeof inner.message === "string") msg = inner.message;
+    else if (typeof inner === "string") msg = inner;
+  } catch {
+    /* not JSON: show it as-is */
+  }
+  return '<span class="errmsg">' + esc(msg) + "</span>";
 }
 
 function setDebug(k, v, cls) {
@@ -2930,10 +3434,12 @@ async function pgSend() {
 
     if (!resp.ok) {
       const errText = await resp.text();
+      pg.msgs[idx].error = true;
+      pg.msgs[idx].errorStatus = resp.status;
       if (resp.status === 401 && !auth) {
         pg.msgs[idx].content = "Authentication required. Paste the router API key in the 'API key' field above (it is kept only in this browser) and send again.";
       } else {
-        pg.msgs[idx].content = "HTTP " + resp.status + "\n" + errText.slice(0, 2000);
+        pg.msgs[idx].content = errText.slice(0, 2000);
       }
       pg.lastRaw = "HTTP " + resp.status + "\n" + errText;
       $("pgRaw").textContent = pg.lastRaw;
@@ -3035,6 +3541,7 @@ async function pgSend() {
       renderThread();
     }
   } catch (e) {
+    pg.msgs[idx].error = true;
     pg.msgs[idx].content = "Request failed: " + e;
     pg.lastLatencyMs = Date.now() - started;
     setLatencyMetric(pg.lastLatencyMs, null);
@@ -3288,11 +3795,1431 @@ $("pgDownloadMd").addEventListener("click", () => {
   setTimeout(() => URL.revokeObjectURL(url), 2000);
 });
 
-// ---- tabs (URL-hash driven) ---------------------------------------------------
+// ---- config editor ------------------------------------------------------------
+//
+// Two representations of the same truth: `cfgDisk` is the file as it is on
+// disk, `cfgDraft` is what the user is editing. Only Save writes, and Save
+// snapshots first on the server. The form editors mutate cfgDraft directly and
+// re-render; the raw view is a text projection of cfgDraft, so switching modes
+// carries edits across (invalid JSON blocks the switch back).
+//
+// Deliberately NOT built on /api/config: that endpoint serves the NORMALIZED
+// config, which drops top-level keys normalization does not model (pricing,
+// missCapture, alerts). Loading from it and saving back would silently destroy
+// them. The editor reads /api/config/raw and never normalizes.
+
+const cfg = {
+  loaded: false,
+  disk: null,        // last loaded file content (object)
+  draft: null,       // working copy (object)
+  text: null,        // raw textarea content while in raw mode
+  revision: null,    // mtimeMs of the file the draft is based on
+  envNames: [],
+  snapshots: [],
+  mode: "forms",     // "forms" | "raw"
+  dirty: false,
+  errors: [],
+  warnings: [],
+  modal: null,       // { kind, index|key, data, context }
+};
+
+function cfgDeepCopy(o) { return JSON.parse(JSON.stringify(o)); }
+
+function cfgClone(v) {
+  if (v === undefined || v === null) return undefined;
+  try { return cfgDeepCopy(v); } catch { return undefined; }
+}
+
+function cfgEqual(a, b) { return JSON.stringify(a === undefined ? null : a) === JSON.stringify(b === undefined ? null : b); }
+
+// Mutate the draft and mark it dirty. `path` is the JSON path used by server
+// validation, so we can highlight the exact field a rejected save complained
+// about.
+function cfgMutate(fn) {
+  if (!cfg.draft) cfg.draft = {};
+  fn(cfg.draft);
+  cfg.dirty = true;
+  renderConfig();
+}
+
+function cfgAlias(kind) {
+  const c = cfg.draft || {};
+  return kind === "backends" ? (c.backends || []) : kind === "settings" ? [] : Object.keys(c[kind] || {});
+}
+
+function cfgEnvNames() {
+  // Names that will be present at runtime: what the server reported plus what
+  // this config already references (so an existing backend never shows blank).
+  const set = new Set(cfg.envNames || []);
+  for (const b of (cfg.draft && cfg.draft.backends) || []) if (b && b.apiKeyEnv) set.add(b.apiKeyEnv);
+  return Array.from(set).sort();
+}
+
+function cfgParseMaybeJson(v) {
+  // Field helper for the "advanced" textareas: empty -> undefined, invalid JSON
+  // -> the raw string (the server rejects it with a clear message rather than
+  // the UI silently dropping it).
+  if (v === undefined || v === null) return undefined;
+  const s = String(v).trim();
+  if (!s) return undefined;
+  try { return JSON.parse(s); } catch { return s; }
+}
+
+function cfgJsonText(v) { return v === undefined ? "" : JSON.stringify(v, null, 2); }
+
+function loadRawConfig() {
+  return fetch("/api/config/raw", { headers: keysApiAuth() || {} }).then(async (r) => {
+    if (r.status === 401) {
+      cfg.loaded = false;
+      showAuthBanner("Config editing needs the master key or a dashboard login (401).", true);
+      renderConfig();
+      return null;
+    }
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    return r.json();
+  });
+}
+
+function applyRawPayload(p) {
+  cfg.disk = p.config;
+  cfg.draft = cfgDeepCopy(p.config);
+  cfg.revision = p.revision;
+  cfg.envNames = p.envNames || [];
+  cfg.snapshots = p.snapshots || [];
+  cfg.text = null;
+  cfg.dirty = false;
+  cfg.errors = [];
+  cfg.warnings = [];
+  cfg.loaded = true;
+}
+
+async function refreshConfigFromDisk(keepIssues) {
+  try {
+    const p = await loadRawConfig();
+    if (!p) return;
+    applyRawPayload(p);
+    if (!keepIssues) { cfg.errors = []; cfg.warnings = []; }
+    hideAuthBanner();
+  } catch (e) {
+    cfg.errors = [{ path: "", message: "Could not load the config: " + e.message }];
+  }
+  renderConfig();
+}
+
+// Current draft as text, whichever mode the user is in. In raw mode the
+// textarea is the source of truth; it is parsed on demand.
+function cfgCurrentObject() {
+  if (cfg.mode !== "raw") return cfg.draft;
+  try {
+    return JSON.parse(cfg.text);
+  } catch {
+    return null;
+  }
+}
+
+function cfgRawParseError() {
+  if (cfg.mode !== "raw") return null;
+  try {
+    JSON.parse(cfg.text);
+    return null;
+  } catch (e) {
+    return [{ path: "", message: "JSON syntax error: " + e.message }];
+  }
+}
+
+async function cfgPost(path, body) {
+  const headers = Object.assign({ "content-type": "application/json" }, keysApiAuth() || {});
+  const r = await fetch(path, { method: "POST", headers, body: JSON.stringify(body) });
+  let payload = null;
+  try { payload = await r.json(); } catch { /* non-JSON error body */ }
+  return { status: r.status, payload };
+}
+
+async function cfgValidate() {
+  if (cfg.mode === "raw") {
+    const syn = cfgRawParseError();
+    if (syn) { cfg.errors = syn; cfg.warnings = []; renderConfig(); return false; }
+  }
+  const obj = cfgCurrentObject();
+  if (!obj) return false;
+  const { status, payload } = await cfgPost("/api/config", { config: obj, dryRun: true });
+  if (status === 401) {
+    showAuthBanner("Validation needs the master key or a dashboard login (401).", true);
+    return false;
+  }
+  cfg.errors = (payload && payload.errors) || [];
+  cfg.warnings = (payload && payload.warnings) || [];
+  renderConfig();
+  return status === 200 && cfg.errors.length === 0;
+}
+
+async function cfgSave() {
+  if (cfg.mode === "raw") {
+    const syn = cfgRawParseError();
+    if (syn) { cfg.errors = syn; cfg.warnings = []; renderConfig(); return; }
+  }
+  const obj = cfgCurrentObject();
+  if (!obj) return;
+  const btn = $("cfgSave");
+  btn.disabled = true;
+  try {
+    let { status, payload } = await cfgPost("/api/config", { config: obj, baseRevision: cfg.revision });
+    if (status === 401) {
+      showAuthBanner("Saving needs the master key or a dashboard login (401).", true);
+      return;
+    }
+    if (status === 409) {
+      // The file moved underneath this draft. Never clobber silently: show the
+      // new content and let the user decide.
+      const ok = confirm(
+        "The config file changed on disk since this page loaded it" +
+        (payload && payload.error ? " (" + payload.error.message + ")" : "") +
+        ".\n\nOK = save anyway and overwrite the on-disk change.\nCancel = reload from disk and keep your edits in the raw view so you can merge by hand."
+      );
+      if (!ok) {
+        cfg.text = JSON.stringify(obj, null, 2);
+        if (cfg.mode !== "raw") toggleCfgMode(true);
+        const p = await loadRawConfig();
+        if (p) { applyRawPayload(p); cfg.text = JSON.stringify(obj, null, 2); cfg.dirty = true; }
+        renderConfig();
+        return;
+      }
+      ({ status, payload } = await cfgPost("/api/config", { config: obj, baseRevision: cfg.revision, force: true }));
+    }
+    if (status === 400 && payload && payload.errors) {
+      cfg.errors = payload.errors;
+      cfg.warnings = payload.warnings || [];
+      renderConfig();
+      return;
+    }
+    if (status !== 200) {
+      cfg.errors = [{ path: "", message: (payload && payload.error && payload.error.message) || ("save failed (HTTP " + status + ")") }];
+      cfg.warnings = [];
+      renderConfig();
+      return;
+    }
+    cfg.warnings = (payload && payload.warnings) || [];
+    cfg.errors = [];
+    await refreshConfigFromDisk(true);
+  } catch (e) {
+    cfg.errors = [{ path: "", message: "Save failed: " + e.message }];
+    renderConfig();
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function cfgRestore(name) {
+  if (!confirm("Restore config.json from the snapshot " + name + "?\n\nThe current file is snapshotted first, so this is undoable.")) return;
+  const { status, payload } = await cfgPost("/api/config/reset", { snapshot: name });
+  if (status === 401) { showAuthBanner("Restoring needs the master key or a dashboard login (401).", true); return; }
+  if (status !== 200) {
+    cfg.errors = [{ path: "", message: (payload && payload.error && payload.error.message) || ("restore failed (HTTP " + status + ")") }];
+    renderConfig();
+    return;
+  }
+  cfg.warnings = (payload && payload.warnings) || [];
+  await refreshConfigFromDisk(true);
+}
+
+function toggleCfgMode(forceRaw) {
+  const toRaw = forceRaw === true ? true : cfg.mode !== "raw";
+  if (toRaw) {
+    const obj = cfg.draft;
+    cfg.text = JSON.stringify(obj, null, 2);
+    cfg.mode = "raw";
+  } else {
+    let parsed;
+    try {
+      parsed = JSON.parse(cfg.text);
+    } catch (e) {
+      cfg.errors = [{ path: "", message: "Fix the JSON syntax before switching to the form editors: " + e.message }];
+      renderConfig();
+      return;
+    }
+    cfg.draft = parsed;
+    cfg.mode = "forms";
+  }
+  cfg.errors = [];
+  renderConfig();
+}
+
+// ---- config editor: render ----------------------------------------------------
+
+// A path like models.mymodel.providers[0].backend maps to a highlightable
+// location. We only need the top-level entry for the "jump to it" affordance.
+function cfgIssueTarget(path) {
+  const m = /^([A-Za-z]+)(?:\.([^.[\]]+))?/.exec(path || "");
+  if (!m) return null;
+  return { kind: m[1], id: m[2] || null };
+}
+
+function renderConfig() {
+  if (!cfg.loaded) {
+    const st0 = $("cfgState");
+    st0.className = "cfg-status err";
+    st0.innerHTML = "<span class='dot'></span>Config unavailable. Check the master key or log in.";
+    return;
+  }
+  const btn = $("cfgModeToggle");
+  if (btn) {
+    const raw = cfg.mode === "raw";
+    btn.dataset.icon = raw ? "sliders" : "code";
+    btn.textContent = raw ? "Form editors" : "Raw JSON";
+    btn.title = raw ? "Switch to the form editors" : "Switch to the raw JSON view";
+    btn.innerHTML = (ICONS[btn.dataset.icon] || "") + esc(btn.textContent);
+  }
+  $("cfgFormsInner").style.display = cfg.mode === "raw" ? "none" : "";
+  $("cfgRawInner").style.display = cfg.mode === "raw" ? "" : "none";
+  if (cfg.mode === "raw" && $("cfgRawText").value !== cfg.text) $("cfgRawText").value = cfg.text || "";
+  $("cfgSave").disabled = !cfg.dirty;
+
+  const st = $("cfgState");
+  const nIssues = cfg.errors.length;
+  if (nIssues) {
+    st.className = "cfg-status err";
+    st.innerHTML = "<span class='dot'></span><b>" + nIssues + "</b> validation error" + (nIssues === 1 ? "" : "s") + " &middot; not saved";
+  } else if (cfg.dirty) {
+    st.className = "cfg-status warn";
+    st.innerHTML = "<span class='dot'></span><b>Unsaved changes</b> &middot; the router is still running the old config";
+  } else {
+    st.className = "cfg-status";
+    st.innerHTML = "<span class='dot'></span>In sync with disk &middot; <b>" + (cfg.revision ? new Date(cfg.revision).toLocaleTimeString() : "-") + "</b>";
+  }
+
+  const issues = $("cfgIssues");
+  if (cfg.errors.length) {
+    issues.className = "cfg-issues error";
+    issues.innerHTML = ICONS.warn + "<div><b>Rejected by the server - the file was not changed:</b><ul>" +
+      cfg.errors.map((e) => "<li>" + (e.path ? "<code>" + esc(e.path) + "</code> " : "") + esc(e.message) + "</li>").join("") +
+      "</ul></div>";
+  } else if (cfg.warnings.length) {
+    issues.className = "cfg-issues warn";
+    issues.innerHTML = ICONS.warn + "<div><b>Saved, with warnings:</b><ul>" +
+      cfg.warnings.map((w) => "<li>" + (w.path ? "<code>" + esc(w.path) + "</code> " : "") + esc(w.message) + "</li>").join("") +
+      "</ul></div>";
+  } else {
+    issues.className = "cfg-issues";
+    issues.innerHTML = "";
+  }
+
+  if (cfg.mode === "forms") {
+    renderCfgBackends();
+    renderCfgModels();
+    renderCfgPresets();
+    renderCfgSettings();
+    renderEnv();
+  }
+  renderCfgSnapshots();
+}
+
+function cfgTableHead(cols) {
+  return "<thead><tr>" + cols.map((c) => "<th scope='col'>" + esc(c) + "</th>").join("") + "</tr></thead>";
+}
+
+// A table row's action cluster: icon buttons with accessible names, so the
+// rows read as data instead of a wall of words.
+function cfgRowActions(kind, key) {
+  return (
+    "<td class='actions'>" +
+    "<button class='cfg-iconbtn' data-cfg-edit='" + esc(kind) + ":" + esc(key) + "' title='Edit' aria-label='Edit " + esc(key) + "' data-ic='pencil'></button>" +
+    "<button class='cfg-iconbtn' data-cfg-dup='" + esc(kind) + ":" + esc(key) + "' title='Duplicate' aria-label='Duplicate " + esc(key) + "' data-ic='clipboard'></button>" +
+    "<button class='cfg-iconbtn danger' data-cfg-del='" + esc(kind) + ":" + esc(key) + "' title='Delete' aria-label='Delete " + esc(key) + "' data-ic='trash'></button>" +
+    "</td>"
+  );
+}
+
+// Icons are injected after innerHTML by JavaScript (not by data-icon alone),
+// because these nodes are rebuilt constantly and decorate() only runs once.
+function cfgInjectIcons(root) {
+  (root || document).querySelectorAll("[data-ic]").forEach((el) => {
+    if (el.firstElementChild) return;
+    const icon = ICONS[el.dataset.ic];
+    if (icon) el.insertAdjacentHTML("afterbegin", icon);
+  });
+}
+
+function cfgUnload() {
+  // Leaving the tab drops revealed values: a secret must not survive in the DOM
+  // (or in this module state) for a view the user is no longer looking at.
+  env.revealed = {};
+  env.editing = null;
+  env.draftValue = "";
+  renderEnv();
+}
+
+function cfgSetCount(id, n) {
+  const el = $(id);
+  if (el) el.textContent = n + (n === 1 ? " entry" : " entries");
+}
+
+function cfgPlural(n, word) {
+  return n + " " + word + (n === 1 ? "" : "s");
+}
+
+function renderCfgBackends() {
+  const list = cfg.draft.backends || [];
+  const envs = cfgEnvNames();
+  const rows = list.map((b, i) => {
+    const badKey = b.apiKeyEnv && !envs.includes(b.apiKeyEnv);
+    return (
+      "<tr>" +
+      "<td><div class='cfg-td-name'>" + esc(b.id || "(no id)") + "</div>" +
+        (b.translateDeveloperRole ? "<div class='cfg-td-sub'>developer role &rarr; system</div>" : "") + "</td>" +
+      "<td class='cfg-mono'>" + esc(b.baseURL || "<span class='cfg-sub'>-</span>") + "</td>" +
+      "<td>" + (b.apiKeyEnv
+        ? "<span class='cfg-pill" + (badKey ? " bad" : " good") + "'>" + (badKey ? ICONS.warn : ICONS.check) + " " + esc(b.apiKeyEnv) + "</span>"
+        : "<span class='cfg-badge bad'>" + ICONS.warn + "missing</span>") +
+        (badKey ? "<div class='cfg-td-sub' style='color:var(--red)'>not set in this environment</div>" : "") + "</td>" +
+      "<td class='cfg-mono'>" + (b.timeoutMs ? esc(b.timeoutMs) + " ms" : "<span class='cfg-sub'>-</span>") + "</td>" +
+      cfgRowActions("backends", i) +
+      "</tr>"
+    );
+  });
+  $("cfgBackendsTable").innerHTML = cfgTableHead(["Backend", "Base URL", "Key env", "Timeout", "Actions"]) +
+    "<tbody>" + (rows.length ? rows.join("") : "<tr><td colspan='5' class='cfg-empty'>No backends configured.</td></tr>") + "</tbody>";
+  cfgSetCount("cfgCountBackends", list.length);
+  cfgInjectIcons($("cfgBackendsTable"));
+}
+
+function renderCfgModels() {
+  const backendIds = new Set((cfg.draft.backends || []).map((b) => b && b.id).filter(Boolean));
+  const entries = Object.entries(cfg.draft.models || {});
+  const rows = entries.map(([id, m]) => {
+    const provs = Array.isArray(m.providers) ? m.providers : [];
+    const pills = provs.length
+      ? "<div class='cfg-pills'>" + provs.map((p) => {
+          const dangling = !backendIds.has(p.backend);
+          return "<span class='cfg-pill" + (dangling ? " bad" : "") + "'>" + esc(p.backend) + "<span class='arrow'>&rarr;</span><b>" + esc(p.upstream || "?") + "</b></span>";
+        }).join("") + "</div>"
+      : "<span class='cfg-badge bad'>" + ICONS.warn + "no providers</span>";
+    const price = m.meta && m.meta.pricing ? m.meta.pricing : null;
+    const fmtP = (v) => (v == null ? "?" : "$" + v);
+    const priceCell = price
+      ? "<span class='cfg-mono'>" + esc(fmtP(price.inputPerM)) + "</span> <span class='cfg-sub'>in</span><div class='cfg-td-sub'>" + esc(fmtP(price.outputPerM)) + " out</div>"
+      : "<span class='cfg-sub'>-</span>";
+    const label = m.meta && m.meta.label ? "<div class='cfg-td-sub'>" + esc(m.meta.label) + "</div>" : "";
+    const pool = m.affinityPool == null ? 1 : m.affinityPool;
+    const poolWarn = provs.length && pool > provs.length;
+    return (
+      "<tr>" +
+      "<td><div class='cfg-td-name'>" + esc(id) + "</div>" + label + "</td>" +
+      "<td>" + pills + "</td>" +
+      "<td>" + (poolWarn
+        ? "<span class='cfg-badge warn'>" + ICONS.warn + pool + " of " + provs.length + "</span>"
+        : "<span class='cfg-mono'>" + pool + " of " + provs.length + "</span>") + "</td>" +
+      "<td>" + priceCell + "</td>" +
+      cfgRowActions("models", id) +
+      "</tr>"
+    );
+  });
+  $("cfgModelsTable").innerHTML = cfgTableHead(["Model", "Providers", "Affinity pool", "Price / M", "Actions"]) +
+    "<tbody>" + (rows.length ? rows.join("") : "<tr><td colspan='5' class='cfg-empty'>No models configured.</td></tr>") + "</tbody>";
+  cfgSetCount("cfgCountModels", entries.length);
+  cfgInjectIcons($("cfgModelsTable"));
+}
+
+function renderCfgPresets() {
+  const modelIds = new Set(Object.keys(cfg.draft.models || {}));
+  const presetIds = new Set(Object.keys(cfg.draft.presets || {}));
+  const entries = Object.entries(cfg.draft.presets || {});
+  const strategyBadge = (s) => {
+    const cls = s === "failover" ? "neutral" : s === "weighted" ? "warn" : "ok";
+    return "<span class='cfg-badge " + cls + "'>" + esc(s || "affinity") + "</span>";
+  };
+  const rows = entries.map(([id, p]) => {
+    const list = Array.isArray(p.models) ? p.models : [];
+    const pills = list.length
+      ? "<div class='cfg-pills'>" + list.map((e) => {
+          const ref = typeof e === "string" ? e : (e && e.model);
+          const w = typeof e === "object" && e && e.weight != null ? " x" + e.weight : "";
+          const dangling = !modelIds.has(ref) && !presetIds.has(ref);
+          const isPreset = !modelIds.has(ref) && presetIds.has(ref);
+          return "<span class='cfg-pill" + (dangling ? " bad" : "") + "'>" + (isPreset ? "&#8627; " : "") + esc(ref) + esc(w) + "</span>";
+        }).join("") + "</div>"
+      : "<span class='cfg-badge bad'>" + ICONS.warn + "empty</span>";
+    const shadows = modelIds.has(id) ? "<div class='cfg-td-sub' style='color:var(--amber)'>shadows a model id</div>" : "";
+    const tier = p.meta && p.meta.tier ? " <span class='cfg-pill'>" + esc(p.meta.tier) + "</span>" : "";
+    return (
+      "<tr>" +
+      "<td><div class='cfg-td-name'>" + esc(id) + tier + "</div>" + shadows + "</td>" +
+      "<td>" + strategyBadge(p.strategy) + "</td>" +
+      "<td>" + pills + "</td>" +
+      "<td class='cfg-mono'>" + (p.affinityPool == null ? "<span class='cfg-sub'>-</span>" : esc(p.affinityPool)) + "</td>" +
+      cfgRowActions("presets", id) +
+      "</tr>"
+    );
+  });
+  $("cfgPresetsTable").innerHTML = cfgTableHead(["Preset", "Strategy", "Models", "Pool", "Actions"]) +
+    "<tbody>" + (rows.length ? rows.join("") : "<tr><td colspan='5' class='cfg-empty'>No presets configured.</td></tr>") + "</tbody>";
+  cfgSetCount("cfgCountPresets", entries.length);
+  cfgInjectIcons($("cfgPresetsTable"));
+}
+
+function renderCfgSettings() {
+  const c = cfg.draft;
+  const block = (key, icon, label, note) => {
+    const has = c[key] !== undefined && c[key] !== null;
+    return (
+      "<tr><td><div class='cfg-td-name'>" + ICONS[icon] + " " + esc(label) + "</div>" +
+      "<div class='cfg-td-sub' style='font-family:inherit'>" + esc(note) + "</div></td>" +
+      "<td>" + (has ? "<span class='cfg-badge ok'>" + ICONS.check + cfgPlural(Object.keys(c[key]).length, "key") + "</span>" : "<span class='cfg-badge neutral'>not set</span>") + "</td>" +
+      "<td class='actions'><button class='cfg-iconbtn' data-cfg-edit='settings:" + key + "' title='Edit " + esc(label) + "' aria-label='Edit " + esc(label) + "' data-ic='pencil'></button></td></tr>"
+    );
+  };
+  const simple = (key, icon, label, note) =>
+    "<tr><td><div class='cfg-td-name'>" + ICONS[icon] + " " + esc(label) + "</div>" +
+    "<div class='cfg-td-sub' style='font-family:inherit'>" + esc(note) + "</div></td>" +
+    "<td><input class='cfg-inline-input' data-cfg-set='" + key + "' value='" + esc(c[key] == null ? "" : c[key]) + "' spellcheck='false' aria-label='" + esc(label) + "'></td>" +
+    "<td class='actions'></td></tr>";
+
+  $("cfgSettingsTable").innerHTML =
+    cfgTableHead(["Setting", "Value", "Actions"]) +
+    "<tbody>" +
+    simple("prefix", "route", "API prefix", "Path prefix for the OpenAI-compatible endpoints (default /v1)") +
+    simple("masterKeyEnv", "key", "Master key env", "Env var NAME gating chat, admin and this editor") +
+    simple("uiPasswordEnv", "key", "UI password env", "Env var NAME for the dashboard login") +
+    block("pricing", "dollar", "Pricing", "Off-peak multiplier and peak windows used by the cost model") +
+    block("missCapture", "database", "Cache miss capture", "Payload capture on low-cache-hit requests") +
+    block("alerts", "zap", "Alerts", "ntfy pushes when the cache hit rate drops") +
+    block("backoff", "clock", "Backoff", "Per-failure-class cooling windows") +
+    "</tbody>";
+  cfgInjectIcons($("cfgSettingsTable"));
+}
+
+// ---- config editor: environment (managed secrets store) ------------------------
+//
+// This card reads its own endpoint rather than the config draft: the values it
+// manages are deliberately absent from every list response. A revealed value
+// lives in exactly one place at a time - the `env.revealed` map, which is keyed
+// by name and cleared on refresh and on hide - so nothing survives a re-render.
+
+const env = {
+  vars: [],
+  revision: null,
+  restartRequired: false,
+  loaded: false,
+  issue: null,          // last error shown above the table
+  revealed: {},         // name -> value, only while the row is expanded
+  editing: null,        // name currently being edited inline
+  draftValue: "",       // that row's unsaved input, preserved across a 409 refresh
+  busy: {},             // name -> in-flight action, so re-renders cannot double-submit
+  copied: null,
+  status: {},
+};
+let envCopySeq = 0;
+
+async function loadEnvVars(opts) {
+  const keepIssue = opts && opts.keepIssue;
+  if (!keepIssue) env.issue = null;
+  const headers = keysApiAuth() || {};
+  let r;
+  try {
+    r = await fetch("/api/env", { headers, cache: "no-store" });
+  } catch (e) {
+    env.loaded = true;
+    env.issue = { kind: "error", text: "Could not reach the router: " + e.message };
+    renderEnv();
+    return;
+  }
+  if (r.status === 401) {
+    env.loaded = true;
+    env.issue = { kind: "error", text: "The environment editor needs the master key or a dashboard login (401)." };
+    showAuthBanner("Environment editing needs the master key or a dashboard login (401).", true);
+    renderEnv();
+    return;
+  }
+  if (!r.ok) {
+    env.loaded = true;
+    env.issue = { kind: "error", text: "The router refused the request (HTTP " + r.status + ")." };
+    renderEnv();
+    return;
+  }
+  let p;
+  try {
+    p = await r.json();
+  } catch {
+    env.loaded = true;
+    env.issue = { kind: "error", text: "The router sent a response that is not JSON." };
+    renderEnv();
+    return;
+  }
+  applyEnvPayload(p);
+  if (!keepIssue) hideAuthBanner();
+  renderEnv();
+}
+
+function applyEnvPayload(p) {
+  env.vars = Array.isArray(p.vars) ? p.vars : [];
+  env.revision = p.revision == null ? null : p.revision;
+  env.restartRequired = !!p.restartRequired;
+  env.loaded = true;
+  // Values never outlive the render that fetched them.
+  env.revealed = {};
+  env.copied = null;
+}
+
+async function envPost(path, body) {
+  const headers = Object.assign({ "content-type": "application/json" }, keysApiAuth() || {});
+  try {
+    const r = await fetch(path, { method: "POST", headers, body: JSON.stringify(body), cache: "no-store" });
+    let payload = null;
+    try { payload = await r.json(); } catch { /* non-JSON error body */ }
+    return { status: r.status, payload, netError: false };
+  } catch (e) {
+    return { status: 0, payload: null, netError: true };
+  }
+}
+
+function envErrText(status, payload) {
+  const msg = payload && payload.error && payload.error.message ? payload.error.message : null;
+  if (status === 0) return "Could not reach the router.";
+  if (status === 401) return "Not authorized (401). Log in, or set the master key in the API Keys tab.";
+  if (status === 403) return "Not authorized (403). Log in, or set the master key in the API Keys tab.";
+  if (status === 409) return msg || "The secrets file changed on disk since this page loaded it.";
+  return msg || "The router rejected the request (HTTP " + status + ").";
+}
+
+// An action that failed for lack of auth must look like one: the banner is the
+// page's single "you are not the admin" affordance, so reuse it rather than
+// inventing a second one.
+function envFlagsAuth(status) {
+  if (status !== 401 && status !== 403) return;
+  showAuthBanner("Environment editing needs the master key or a dashboard login (" + status + ").", true);
+}
+
+function envSourceBadge(v) {
+  const label = v.source === "secrets" ? "managed" : v.source === "shell" ? "shell" : v.source === "env" ? ".env" : v.source;
+  const cls = v.source === "secrets" ? "managed" : "neutral";
+  return "<span class='cfg-badge " + cls + "'>" + esc(label || "?") + "</span>";
+}
+
+function envStateBadge(v) {
+  if (v.live) return "<span class='cfg-badge ok'>" + ICONS.check + "live</span>";
+  if (v.reloadable === false) return "<span class='cfg-badge neutral'>" + ICONS.clock + "next start</span>";
+  return "<span class='cfg-badge warn'>" + ICONS.warn + "stale</span>";
+}
+
+function envAct(v, key, icon, tip) {
+  const busy = !!env.busy[v.name];
+  const on = v.name === env.editing || !!env.revealed[v.name] || env.copied === v.name;
+  return "<button class='cfg-iconbtn" + (on ? " warn" : "") + "' data-env-act='" + key + "' data-env-name='" + esc(v.name) + "'" +
+    (busy ? " disabled" : "") + " title='" + esc(tip) + "' aria-label='" + esc(tip + ": " + v.name) + "' data-ic='" + icon + "'></button>";
+}
+
+function renderEnv() {
+  const host = $("cfgEnvTable");
+  if (!host) return;
+
+  $("envBanner").innerHTML = env.vars.some((v) => v && v.live === false)
+    ? ICONS.warn + "<div><b>Some values are not active in the running process yet.</b>" +
+      "<ul>" + env.vars.filter((v) => v && v.live === false).map((v) =>
+        "<li><code>" + esc(v.name) + "</code> - " + (v.reloadable === false
+          ? "startup-only, so it takes effect on the next process start"
+          : "the router could not apply it, so the file and the process disagree (a shell variable of the same name may shadow it)") + "</li>"
+      ).join("") + "</ul></div>"
+    : "";
+  $("envNote").textContent = env.issue ? env.issue.text : "";
+
+  const rows = env.vars.map((v) => {
+    const revealed = !!env.revealed[v.name];
+    const valCell = revealed && v.set
+      ? "<div class='env-value'>" + esc(env.revealed[v.name]) + "</div>" +
+        "<div class='env-mask'>shown until you hide it - use Copy rather than reading it off the screen</div>"
+      : "<div class='env-mask'>" + (v.set ? "........... (hidden - reveal to read)" : "not set") + "</div>";
+
+    let actions = "";
+    if (v.set) actions += envAct(v, "reveal", revealed ? "eye-off" : "eye", revealed ? "Hide " + v.name : "Reveal " + v.name);
+    if (v.set && revealed) actions += envAct(v, "copy", "clipboard", "Copy " + v.name);
+    if (v.editable) actions += envAct(v, "edit", "pencil", "Set a new value for " + v.name);
+    else actions += "<span class='env-lock' title='This is an authentication credential: it unlocks this editor, so the UI never writes it. Change it in the platform environment.'>" + ICONS.lock + "locked</span>";
+    if (v.source === "secrets") actions += envAct(v, "remove", "trash", "Remove " + v.name);
+    else actions += "<span class='env-lock' title='This value comes from the platform environment or the .env fallback file and is not managed here. Change it there.'>" + ICONS.info + "external</span>";
+
+  // A value being typed is the one secret this card accepts, so it lives only
+  // in this state object: a re-render (a 409 refresh, a failed save, a poll)
+  // rebuilds the input from it instead of dropping what the user typed.
+  const draft = env.editing === v.name
+    ? "<span class='cfg-td-sub'>new value: <input type='text' class='cfg-inline-input' data-env-input='" + esc(v.name) + "' value='" + esc(env.draftValue) + "' placeholder='empty = reject' spellcheck='false' autocomplete='off' aria-label='New value for " + esc(v.name) + "'>" +
+      " <button class='primary' data-env-act='save' data-env-name='" + esc(v.name) + "'" + (env.busy[v.name] ? " disabled" : "") + ">" + (env.busy[v.name] ? "Saving..." : "Save") + "</button>" +
+      " <button data-env-act='cancel' data-env-name='" + esc(v.name) + "' title='Discard this value' aria-label='Cancel editing " + esc(v.name) + "'>Cancel</button>" +
+      (v.set ? "" : " <span class='env-mask'>was unset</span>") + "</span>"
+    : env.status[v.name]
+      ? "<span class='cfg-td-sub env-note' role='status'>" + esc(env.status[v.name]) + "</span>"
+      : "";
+
+  const setCell = "<span class='cfg-badge " + (v.set ? "ok" : "neutral") + "'>" + (v.set ? "set" : "unset") + "</span>" +
+    (env.editing === v.name ? "<div class='cfg-td-sub' style='color:var(--amber)'>a new value replaces the stored one</div>" : "");
+
+  return "<tr>" +
+    "<td><div class='cfg-td-name'>" + esc(v.name) + "</div></td>" +
+    "<td>" + envSourceBadge(v) + "</td>" +
+    "<td>" + setCell + "</td>" +
+    "<td class='env-cell'>" + valCell + "</td>" +
+    "<td>" + envStateBadge(v) + "</td>" +
+    "<td class='actions'>" + actions + "</td>" +
+    "<td class='env-note-cell'>" + draft + "</td>" +
+    "</tr>";
+});
+
+  const body = !env.loaded
+    ? "<tr><td colspan='7' class='cfg-empty'>Loading variables...</td></tr>"
+    : env.vars.length
+      ? rows.join("")
+      : "<tr><td colspan='7' class='cfg-empty'>No environment variables are referenced by this config or present in the environment. " +
+        "<span class='hint'>Use the form above to add one; it lands in the managed secrets store.</span></td></tr>";
+
+  host.innerHTML = cfgTableHead(["Name", "Source", "Set", "Value", "State", "Actions", "Notes"]) + "<tbody>" + body + "</tbody>";
+  const count = $("cfgCountEnv");
+  if (count) count.textContent = env.vars.length === 1 ? "1 variable" : env.vars.length + " variables";
+  cfgInjectIcons(host);
+}
+
+// Names and values are validated here for the error message only; the server
+// runs the same rules and stays the single source of truth.
+function envAddProblem(name, value) {
+  if (!name) return "Enter a name for the variable.";
+  if (!/^[A-Z_][A-Z0-9_]*$/.test(name)) return "A name must be uppercase letters, digits and underscores, and start with a letter or underscore (for example OPENCODE_GO_KEY).";
+  if (name.length > 128) return "That name is too long (128 characters max).";
+  if (!value) return "Enter a value. A variable cannot be stored empty.";
+  if (value.length > 8192) return "That value is too long (max 8 KiB).";
+  return null;
+}
+
+async function envAdd() {
+  const name = $("envAddName").value.trim();
+  const value = $("envAddValue").value;
+  const problem = envAddProblem(name, value);
+  if (problem) {
+    env.issue = { kind: "error", text: problem };
+    renderEnv();
+    return;
+  }
+  env.issue = null;
+  const { status, payload } = await envPost("/api/env", { name, value, baseRevision: env.revision });
+  if (status === 409) {
+    await loadEnvVars({ keepIssue: true });
+    env.issue = { kind: "error", text: "The secrets file changed on disk since this page loaded it, so the add was refused. The list and revision are refreshed; press Add again." };
+    renderEnv();
+    return;
+  }
+  if (status !== 200) {
+    env.issue = { kind: "error", text: envErrText(status, payload) };
+    envFlagsAuth(status);
+    renderEnv();
+    return;
+  }
+  $("envAddName").value = "";
+  $("envAddValue").value = "";
+  await loadEnvVars({ keepIssue: true });
+  const applied = payload && payload.applied;
+  const live = payload && payload.live;
+  env.issue = {
+    kind: live ? "ok" : "warn",
+    text: name + " saved (" + ((payload && payload.action) || "written") + "). " + (live
+      ? "It is live in the running process."
+      : applied === false
+        ? "The file is written but the running process has not picked it up (a shell variable of the same name may shadow it)."
+        : "It takes effect on the next process start."),
+  };
+  renderEnv();
+}
+
+async function envToggleReveal(name) {
+  if (env.revealed[name]) {
+    delete env.revealed[name];
+    renderEnv();
+    return;
+  }
+  env.busy[name] = "reveal";
+  renderEnv();
+  const { status, payload } = await envPost("/api/env/reveal", { name });
+  delete env.busy[name];
+  if (status !== 200) {
+    envFlagsAuth(status);
+    env.issue = { kind: "error", text: envErrText(status, payload) };
+    renderEnv();
+    return;
+  }
+  const value = payload ? payload.value : null;
+  if (value == null) {
+    env.issue = { kind: "warn", text: name + " has no value in the running process." };
+    renderEnv();
+    return;
+  }
+  env.revealed[name] = value;
+  renderEnv();
+  const eye = document.querySelector("[data-env-act='reveal'][data-env-name='" + name + "']");
+  if (eye) eye.focus();
+}
+
+async function envCopy(name) {
+  const value = env.revealed[name];
+  if (value == null) return;
+  const ok = await copyToClipboard(value);
+  env.copied = ok ? name : null;
+  env.status[name] = ok ? "copied to the clipboard" : "could not copy; select the value and copy it manually";
+  renderEnv();
+  envCopySeq += 1;
+  const seq = envCopySeq;
+  setTimeout(() => {
+    if (envCopySeq !== seq) return;
+    env.status[name] = null;
+    env.copied = null;
+    renderEnv();
+  }, 1600);
+}
+
+function envStartEdit(name) {
+  const v = env.vars.find((x) => x.name === name);
+  env.editing = name;
+  env.draftValue = "";
+  env.status[name] = null;
+  renderEnv();
+  if (v) {
+    const input = document.querySelector("input[data-env-input='" + name + "']");
+    if (input) input.focus();
+  }
+}
+
+function envCancelEdit() {
+  env.editing = null;
+  env.draftValue = "";
+  renderEnv();
+}
+
+async function envSaveEdit(name) {
+  const value = env.draftValue;
+  if (!value) {
+    env.status[name] = "Enter a value before saving.";
+    renderEnv();
+    return;
+  }
+  env.busy[name] = "save";
+  renderEnv();
+  const { status, payload } = await envPost("/api/env", { name, value, baseRevision: env.revision });
+  delete env.busy[name];
+  if (status === 409) {
+    // Refresh the list and revision so the retry carries the right base, but
+    // keep the row open with the typed value intact.
+    await loadEnvVars({ keepIssue: true });
+    env.editing = name;
+    env.status[name] = "The secrets file changed on disk since this page loaded it, so the save was refused. The list and revision are refreshed - review the value and press Save again.";
+    renderEnv();
+    return;
+  }
+  if (status !== 200) {
+    env.status[name] = envErrText(status, payload);
+    envFlagsAuth(status);
+    renderEnv();
+    return;
+  }
+  const live = payload && payload.live;
+  env.editing = null;
+  env.draftValue = "";
+  await loadEnvVars({ keepIssue: true });
+  env.status[name] = live ? "Value updated and live in the running process." : "Value updated; it takes effect on the next process start.";
+  renderEnv();
+}
+
+async function envRemove(name) {
+  if (!confirm("Remove '" + name + "' from the managed secrets store?\n\nIt stops being applied on the next reload. Authentication credentials and .env-sourced names cannot be removed here.")) return;
+  env.busy[name] = "remove";
+  renderEnv();
+  let r;
+  try {
+    r = await fetch("/api/env?name=" + encodeURIComponent(name), { method: "DELETE", headers: keysApiAuth() || {}, cache: "no-store" });
+  } catch {
+    delete env.busy[name];
+    env.issue = { kind: "error", text: "Could not reach the router." };
+    renderEnv();
+    return;
+  }
+  let payload = null;
+  try { payload = await r.json(); } catch { /* non-JSON error body */ }
+  delete env.busy[name];
+  if (r.status !== 200) {
+    envFlagsAuth(r.status);
+    env.issue = { kind: "error", text: envErrText(r.status, payload) };
+    renderEnv();
+    return;
+  }
+  await loadEnvVars({ keepIssue: true });
+  env.issue = { kind: "ok", text: name + " removed from the managed secrets store." };
+  renderEnv();
+}
+
+$("cfgEnvTable").addEventListener("click", (ev) => {
+  const btn = ev.target.closest("[data-env-act]");
+  if (!btn) return;
+  const name = btn.dataset.envName;
+  switch (btn.dataset.envAct) {
+    case "reveal": return void envToggleReveal(name);
+    case "copy": return void envCopy(name);
+    case "edit": return envStartEdit(name);
+    case "cancel": return envCancelEdit();
+    case "save": return void envSaveEdit(name);
+    case "remove": return void envRemove(name);
+  }
+});
+
+// The typed value lives in JS state, never in the DOM, so a re-render (a 409
+// refresh, a failed save) cannot drop it.
+$("cfgEnvTable").addEventListener("input", (ev) => {
+  const input = ev.target.closest("[data-env-input]");
+  if (input) env.draftValue = input.value;
+});
+
+$("cfgEnvTable").addEventListener("keydown", (ev) => {
+  const input = ev.target.closest("[data-env-input]");
+  if (!input) return;
+  if (ev.key === "Enter") { ev.preventDefault(); envSaveEdit(input.dataset.envInput); }
+  else if (ev.key === "Escape") { ev.preventDefault(); envCancelEdit(); }
+});
+
+$("envAdd").addEventListener("click", (ev) => { ev.preventDefault(); envAdd(); });
+// The value field is a textarea, so Shift+Enter must stay free to insert the
+// newline a multi-line value needs; plain Enter keeps its quick-add shortcut.
+$("envAddValue").addEventListener("keydown", (ev) => { if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); envAdd(); } });
+$("envAddName").addEventListener("input", () => {
+  // Clear a stale validation message as soon as the field is touched, so the
+  // inline error never describes a value the user has already replaced.
+  if (env.issue) { env.issue = null; renderEnv(); }
+});
+
+function renderCfgSnapshots() {
+  const host = $("cfgSnapshots");
+  if (!cfg.snapshots.length) {
+    host.innerHTML = "<div class='cfg-footnote'>No snapshots yet. One is written before every save.</div>";
+    return;
+  }
+  host.innerHTML = cfg.snapshots
+    .map((s, i) => {
+      const d = new Date(s.replace(/\.json$/, "").replace(/T(\d\d)-(\d\d)-(\d\d)/, "T$1:$2:$3").replace(/-(\d\d\d)Z?$/, ".$1Z"));
+      const when = isNaN(d.getTime()) ? s : d.toLocaleString();
+      return (
+        "<div class='cfg-snap" + (i === 0 ? " is-latest" : "") + "'>" +
+        "<span class='ico' data-ic='" + (i === 0 ? "check" : "history") + "'></span>" +
+        "<div class='grow'><div class='when'>" + esc(when) + (i === 0 ? " <span class='cfg-badge ok'>latest</span>" : "") + "</div>" +
+        "<div class='file'>" + esc(s) + "</div></div>" +
+        "<button data-cfg-restore='" + esc(s) + "' data-icon='undo' title='Restore this version'>Restore</button>" +
+        "</div>"
+      );
+    })
+    .join("");
+  cfgInjectIcons(host);
+}
+
+// ---- config editor: modal forms ------------------------------------------------
+//
+// The modal holds a working copy (cfg.modal.data) so Cancel is always safe.
+// Field rules are deliberately light here: the server is the single source of
+// validation truth (one function used by Save and by Validate), so the UI never
+// diverges from what the router actually accepts.
+
+function cfgOpenModal(kind, key, data, index) {
+  cfg.modal = { kind, key, data: cfgDeepCopy(data), index: index == null ? null : index, provs: [], models: [] };
+  $("cfgModalIssues").innerHTML = "";
+  $("cfgModalBg").style.display = "flex";
+  renderCfgModal();
+  const first = $("cfgModalBody").querySelector("input, select, textarea");
+  if (first) first.focus();
+}
+
+function cfgCloseModal() {
+  cfg.modal = null;
+  $("cfgModalBg").style.display = "none";
+}
+
+function cfgField(label, id, opts) {
+  const o = opts || {};
+  const type = o.type || "text";
+  const value = o.value == null ? "" : o.value;
+  const sub = o.sub ? "<span class='sub'>" + esc(o.sub) + "</span>" : "";
+  if (type === "textarea") {
+    return (
+      "<div class='cfg-field'><label for='" + id + "'><b>" + esc(label) + "</b></label>" +
+      "<textarea id='" + id + "' spellcheck='false' placeholder='" + esc(o.placeholder || "") + "'>" + esc(o.textValue == null ? cfgJsonText(value) : o.textValue) + "</textarea>" +
+      sub + "</div>"
+    );
+  }
+  if (type === "select") {
+    return (
+      "<div class='cfg-field'><label for='" + id + "'><b>" + esc(label) + "</b></label>" +
+      "<select id='" + id + "'>" +
+      (o.options || []).map((op) => "<option value='" + esc(op.value) + "'" + (String(op.value) === String(value) ? " selected" : "") + ">" + esc(op.label) + "</option>").join("") +
+      "</select>" + sub + "</div>"
+    );
+  }
+  if (type === "checkbox") {
+    return (
+      "<div class='cfg-field'><label for='" + id + "' style='display:flex;align-items:center;gap:8px;color:var(--text)'>" +
+      "<input type='checkbox' id='" + id + "' style='width:auto' " + (value ? "checked" : "") + "> <b>" + esc(label) + "</b></label>" + sub + "</div>"
+    );
+  }
+  return (
+    "<div class='cfg-field'><label for='" + id + "'><b>" + esc(label) + "</b></label>" +
+    "<input type='" + type + "' id='" + id + "' value='" + esc(value) + "' placeholder='" + esc(o.placeholder || "") + "' spellcheck='false' autocomplete='off'>" +
+    sub + "</div>"
+  );
+}
+
+function renderCfgModal() {
+  if (!cfg.modal) return;
+  const { kind, key, data } = cfg.modal;
+  const body = $("cfgModalBody");
+  const isNew = key === null;
+
+  if (kind === "backends") {
+    $("cfgModalTitle").textContent = isNew ? "Add backend" : "Edit backend: " + key;
+    body.innerHTML =
+      cfgField("ID", "f_id", { value: data.id, sub: "The id models reference. Renaming offers to update those references." }) +
+      cfgField("Base URL", "f_baseURL", { value: data.baseURL, placeholder: "https://api.example.com", sub: "Requests go to <baseURL>/chat/completions (a trailing slash is stripped)." }) +
+      cfgField("Key env (NAME, not the key)", "f_apiKeyEnv", {
+        type: "select",
+        value: data.apiKeyEnv,
+        options: [{ value: "", label: "(choose an environment variable)" }].concat(cfgEnvNames().map((n) => ({ value: n, label: n }))),
+        sub: "Only variables already set in this process are listed; new ones go in .env and need a restart.",
+      }) +
+      cfgField("Timeout (ms, optional)", "f_timeoutMs", { type: "number", value: data.timeoutMs == null ? "" : data.timeoutMs }) +
+      cfgField("Translate developer role", "f_translateDeveloperRole", { type: "checkbox", value: !!data.translateDeveloperRole, sub: "Rewrites OpenAI developer-role messages to system for upstreams that reject them." }) +
+      cfgField("Default model (legacy, optional)", "f_model", { value: data.model, sub: "Used as the upstream when a provider does not name one." }) +
+      cfgField("Extra params (JSON, optional)", "f_params", { type: "textarea", value: data.params, sub: "Merged into every request to this backend; lowest priority layer." });
+  } else if (kind === "models") {
+    $("cfgModalTitle").textContent = isNew ? "Add model" : "Edit model: " + key;
+    body.innerHTML =
+      cfgField("Model ID", "f_id", { value: data.id, sub: "The logical id clients request (unless a preset shadows it)." }) +
+      "<div class='cfg-field'><label><b>Providers</b></label><div id='f_provlist'></div>" +
+      "<button type='button' id='f_addprov' data-icon='plus' style='align-self:flex-start'>Add provider</button>" +
+      "<span class='sub'>Tried in this order, with session affinity inside the pool.</span></div>" +
+      cfgField("Affinity pool", "f_affinityPool", { type: "number", value: data.affinityPool == null ? 1 : data.affinityPool, sub: "How many providers session-affinity hashes over; 1 = declared order. Clamps to the provider count." }) +
+      "<div class='cfg-grid2'>" +
+      cfgField("Label", "f_metaLabel", { value: data.meta && data.meta.label }) +
+      cfgField("Context window (tokens)", "f_metaCtx", { type: "number", value: data.meta && data.meta.contextWindow }) +
+      "</div>" +
+      "<div class='cfg-grid3'>" +
+      cfgField("Input $/M", "f_priceIn", { type: "number", value: data.meta && data.meta.pricing && data.meta.pricing.inputPerM }) +
+      cfgField("Output $/M", "f_priceOut", { type: "number", value: data.meta && data.meta.pricing && data.meta.pricing.outputPerM }) +
+      cfgField("Cache-hit input $/M", "f_priceCache", { type: "number", value: data.meta && data.meta.pricing && data.meta.pricing.cacheHitInputPerM }) +
+      "</div>" +
+      cfgField("Off-peak pricing (JSON, optional)", "f_offPeak", { type: "textarea", value: data.meta && data.meta.pricing && data.meta.pricing.offPeak, sub: "For models with discounted off-peak rates, e.g. {\"inputPerM\":0.14,\"outputPerM\":0.28}." }) +
+      cfgField("Extra params (JSON, optional)", "f_params", { type: "textarea", value: data.params }) +
+      cfgField("Retry (JSON, optional)", "f_retry", { type: "textarea", value: data.retry, sub: "Per-provider transient retry: maxRetries, baseMs, maxMs, multiplier, totalMs." });
+    cfg.modal.provs = (Array.isArray(data.providers) ? data.providers : []).map((p) => ({ backend: p.backend || "", upstream: p.upstream || "" }));
+    renderProvList();
+  } else if (kind === "presets") {
+    $("cfgModalTitle").textContent = isNew ? "Add preset" : "Edit preset: " + key;
+    body.innerHTML =
+      cfgField("Preset ID", "f_id", { value: data.id, sub: "This is the id clients pass as `model`." }) +
+      cfgField("Strategy", "f_strategy", {
+        type: "select",
+        value: data.strategy || "affinity",
+        options: [
+          { value: "affinity", label: "affinity - session-sticky spreading (default)" },
+          { value: "failover", label: "failover - strict declared order" },
+          { value: "weighted", label: "weighted - weighted-random primary" },
+        ],
+      }) +
+      "<div class='cfg-field'><label><b>Models</b></label><div id='f_modellist'></div>" +
+      "<div class='cfg-rowline'><div class='cfg-field'><select id='f_pickmodel' aria-label='Model or preset to add'></select></div>" +
+      "<button type='button' id='f_addmodel' data-icon='plus'>Add</button></div>" +
+      "<span class='sub'>May list models or other presets (tier nesting); the top-level strategy governs.</span></div>" +
+      cfgField("Affinity pool (optional)", "f_affinityPool", { type: "number", value: data.affinityPool == null ? "" : data.affinityPool }) +
+      cfgField("Label", "f_metaLabel", { value: data.meta && data.meta.label }) +
+      cfgField("Tier", "f_metaTier", { value: data.meta && data.meta.tier, sub: "UI grouping only, e.g. fast / balanced / strong." }) +
+      cfgField("When to use", "f_metaWhen", { type: "textarea", value: data.meta && data.meta.whenToUse }) +
+      cfgField("Extra params (JSON, optional)", "f_params", { type: "textarea", value: data.params });
+    cfg.modal.models = (Array.isArray(data.models) ? data.models : []).map((e) =>
+      typeof e === "string" ? { model: e, weight: null } : { model: (e && e.model) || "", weight: (e && e.weight) == null ? null : e.weight }
+    );
+    renderPresetModelList();
+  } else if (kind === "settings") {
+    $("cfgModalTitle").textContent = "Edit " + key;
+    const hint = {
+      pricing: "{\n  \"offPeakMultiplier\": 0.5,\n  \"peakWindows\": [{ \"days\": [1,2,3,4,5], \"startHour\": 0, \"endHour\": 8 }]\n}",
+      missCapture: "{\n  \"enabled\": true,\n  \"maxMissPct\": 50,\n  \"minMissTokens\": 1000,\n  \"file\": \"router-misses.jsonl\",\n  \"maxFileBytes\": 25000000\n}",
+      alerts: "{\n  \"ntfy\": { \"baseUrl\": \"https://ntfy.sh\", \"topic\": \"...\", \"minMissPct\": 50, \"minMissTokens\": 20000, \"cooldownMs\": 600000 }\n}",
+      backoff: "{\n  \"rateLimitBaseMs\": 30000,\n  \"rateLimitMaxMs\": 600000,\n  \"serverBaseMs\": 30000,\n  \"serverMaxMs\": 300000,\n  \"authBaseMs\": 60000,\n  \"authMaxMs\": 1800000,\n  \"weeklyDefaultMs\": 604800000\n}",
+    };
+    body.innerHTML = cfgField("JSON", "f_block", {
+      type: "textarea",
+      textValue: data.text,
+      placeholder: hint[key] || "{}",
+      sub: "Validated by the server on save. Leave empty to remove the block.",
+    });
+  }
+}
+
+function renderProvList() {
+  const host = $("f_provlist");
+  if (!host) return;
+  const backendIds = (cfg.draft.backends || []).map((b) => b && b.id).filter(Boolean);
+  host.innerHTML = cfg.modal.provs.length
+    ? cfg.modal.provs
+        .map(
+          (p, i) =>
+            "<div class='cfg-rowline'>" +
+            "<div class='cfg-field'><select data-prov-backend='" + i + "' aria-label='Backend'>" +
+            backendIds.map((b) => "<option value='" + esc(b) + "'" + (b === p.backend ? " selected" : "") + ">" + esc(b) + "</option>").join("") +
+            (backendIds.includes(p.backend) ? "" : "<option value='" + esc(p.backend) + "' selected>" + esc(p.backend || "(none)") + " (missing)</option>") +
+            "</select></div>" +
+            "<div class='cfg-field'><input data-prov-upstream='" + i + "' value='" + esc(p.upstream) + "' placeholder='upstream model id' spellcheck='false' aria-label='Upstream'></div>" +
+            "<button type='button' class='danger' data-prov-del='" + i + "'>Remove</button>" +
+            "</div>"
+        )
+        .join("")
+    : "<p class='cfg-sub'>No providers. A model with no providers routes nowhere.</p>";
+}
+
+function renderPresetModelList() {
+  const host = $("f_modellist");
+  if (!host) return;
+  host.innerHTML = cfg.modal.models.length
+    ? cfg.modal.models
+        .map(
+          (e, i) =>
+            "<div class='cfg-rowline'>" +
+            "<div class='cfg-field'><span class='cfg-mono'>" + esc(e.model) + "</span></div>" +
+            "<div class='cfg-field' style='max-width:120px'><input type='number' step='0.1' data-pm-weight='" + i + "' value='" + (e.weight == null ? "" : esc(e.weight)) + "' placeholder='weight' aria-label='Weight'></div>" +
+            "<button type='button' class='danger' data-pm-del='" + i + "'>Remove</button>" +
+            "</div>"
+        )
+        .join("")
+    : "<p class='cfg-sub'>Nothing yet. Pick a model or preset below.</p>";
+  const pick = $("f_pickmodel");
+  if (pick) {
+    const models = Object.keys(cfg.draft.models || {});
+    const presets = Object.keys(cfg.draft.presets || {}).filter((p) => p !== cfg.modal.key);
+    pick.innerHTML =
+      "<option value=''>(choose)</option>" +
+      models.map((m) => "<option value='" + esc(m) + "'>model: " + esc(m) + "</option>").join("") +
+      presets.map((p) => "<option value='" + esc(p) + "'>preset: " + esc(p) + "</option>").join("");
+  }
+}
+
+function cfgModalCollect() {
+  const { kind } = cfg.modal;
+  const val = (id) => { const el = $(id); return el ? el.value : ""; };
+  const num = (id) => { const s = String(val(id)).trim(); return s === "" ? undefined : Number(s); };
+  const bool = (id) => { const el = $(id); return el ? el.checked : false; };
+
+  if (kind === "backends") {
+    const b = {};
+    if (val("f_id").trim()) b.id = val("f_id").trim();
+    if (val("f_baseURL").trim()) b.baseURL = val("f_baseURL").trim();
+    if (val("f_apiKeyEnv").trim()) b.apiKeyEnv = val("f_apiKeyEnv").trim();
+    const t = num("f_timeoutMs");
+    if (t !== undefined && !Number.isNaN(t)) b.timeoutMs = t;
+    if (bool("f_translateDeveloperRole")) b.translateDeveloperRole = true;
+    if (val("f_model").trim()) b.model = val("f_model").trim();
+    const params = cfgParseMaybeJson(val("f_params"));
+    if (params !== undefined) b.params = params;
+    return b;
+  }
+  if (kind === "models") {
+    const m = {};
+    if (val("f_id").trim()) m.id = val("f_id").trim();
+    m.providers = (cfg.modal.provs || [])
+      .filter((p) => p.backend)
+      .map((p) => (p.upstream ? { backend: p.backend, upstream: p.upstream } : { backend: p.backend }));
+    const ap = num("f_affinityPool");
+    if (ap !== undefined && !Number.isNaN(ap)) m.affinityPool = ap;
+    const meta = {};
+    if (val("f_metaLabel").trim()) meta.label = val("f_metaLabel").trim();
+    const ctx = num("f_metaCtx");
+    if (ctx !== undefined && !Number.isNaN(ctx)) meta.contextWindow = ctx;
+    const pricing = {};
+    const pin = num("f_priceIn"), pout = num("f_priceOut"), pcache = num("f_priceCache");
+    if (pin !== undefined && !Number.isNaN(pin)) pricing.inputPerM = pin;
+    if (pout !== undefined && !Number.isNaN(pout)) pricing.outputPerM = pout;
+    if (pcache !== undefined && !Number.isNaN(pcache)) pricing.cacheHitInputPerM = pcache;
+    const off = cfgParseMaybeJson(val("f_offPeak"));
+    if (off !== undefined) pricing.offPeak = off;
+    if (Object.keys(pricing).length) meta.pricing = pricing;
+    if (Object.keys(meta).length) m.meta = meta;
+    const params = cfgParseMaybeJson(val("f_params"));
+    if (params !== undefined) m.params = params;
+    const retry = cfgParseMaybeJson(val("f_retry"));
+    if (retry !== undefined) m.retry = retry;
+    return m;
+  }
+  if (kind === "presets") {
+    const p = {};
+    if (val("f_id").trim()) p.id = val("f_id").trim();
+    p.strategy = val("f_strategy") || "affinity";
+    p.models = (cfg.modal.models || [])
+      .filter((e) => e.model)
+      .map((e) => (e.weight == null || e.weight === "" ? e.model : { model: e.model, weight: Number(e.weight) }));
+    const ap = num("f_affinityPool");
+    if (ap !== undefined && !Number.isNaN(ap)) p.affinityPool = ap;
+    const meta = {};
+    if (val("f_metaLabel").trim()) meta.label = val("f_metaLabel").trim();
+    if (val("f_metaTier").trim()) meta.tier = val("f_metaTier").trim();
+    if (val("f_metaWhen").trim()) meta.whenToUse = val("f_metaWhen").trim();
+    if (Object.keys(meta).length) p.meta = meta;
+    const params = cfgParseMaybeJson(val("f_params"));
+    if (params !== undefined) p.params = params;
+    return p;
+  }
+  return null;
+}
+
+function cfgApplyModal() {
+  const { kind, key } = cfg.modal;
+  if (kind === "settings") {
+    const raw = $("f_block").value.trim();
+    const blockKey = key;
+    cfgMutate((d) => {
+      if (!raw) { delete d[blockKey]; return; }
+      try { d[blockKey] = JSON.parse(raw); } catch { d[blockKey] = raw; }
+    });
+    cfgCloseModal();
+    return;
+  }
+  const obj = cfgModalCollect();
+  const isNew = key === null;
+  const newId = obj.id;
+  let rewrite = true;
+  if (!isNew && newId !== key) {
+    const refs = countRefsTo(kind, key);
+    const msg = refs > 0
+      ? "Rename '" + key + "' to '" + newId + "'?\n\nOK = update the " + refs + " reference(s) too.\nCancel = rename and leave them (validation will flag them)."
+      : "Rename '" + key + "' to '" + newId + "'?";
+    rewrite = confirm(msg);
+  }
+  const index = cfg.modal.index;
+  cfgMutate((d) => {
+    if (kind === "backends") {
+      const idx = isNew ? d.backends.length : index;
+      delete obj.id;
+      if (isNew) d.backends.push(obj);
+      else d.backends[idx] = obj;
+      if (!isNew && rewrite && key !== newId) {
+        for (const m of Object.values(d.models || {})) {
+          for (const pr of (m && m.providers) || []) if (pr.backend === key) pr.backend = newId;
+        }
+      }
+    } else {
+      delete obj.id;
+      if (isNew) d[kind][newId] = obj;
+      else if (key === newId) d[kind][key] = obj;
+      else {
+        const ordered = {};
+        for (const [k, v] of Object.entries(d[kind])) ordered[k === key ? newId : k] = k === key ? obj : v;
+        d[kind] = ordered;
+      }
+      if (rewrite && (kind === "models" || kind === "presets") && key !== newId) {
+        for (const p of Object.values(d.presets || {})) {
+          p.models = (p.models || []).map((e) => {
+            const ref = typeof e === "string" ? e : e && e.model;
+            if (ref !== key) return e;
+            return typeof e === "string" ? newId : Object.assign({}, e, { model: newId });
+          });
+        }
+      }
+    }
+  });
+  cfgCloseModal();
+}
+
+function countRefsTo(kind, id) {
+  const d = cfg.draft || {};
+  let n = 0;
+  if (kind === "backends") {
+    for (const m of Object.values(d.models || {})) for (const p of (m && m.providers) || []) if (p.backend === id) n++;
+  } else {
+    for (const p of Object.values(d.presets || {})) {
+      for (const e of (p && p.models) || []) if ((typeof e === "string" ? e : e && e.model) === id) n++;
+    }
+  }
+  return n;
+}
+
+function cfgDeleteEntry(kind, keyOrIndex) {
+  if (kind === "backends") {
+    const b = (cfg.draft.backends || [])[keyOrIndex];
+    if (!b) return;
+    const refs = countRefsTo("backends", b.id);
+    if (!confirm("Delete backend '" + b.id + "'?" + (refs ? "\n\n" + refs + " provider reference(s) will be left dangling and will fail validation." : ""))) return;
+    cfgMutate((d) => { d.backends.splice(keyOrIndex, 1); });
+    return;
+  }
+  const refs = countRefsTo(kind, keyOrIndex);
+  if (!confirm("Delete '" + keyOrIndex + "'?" + (refs ? "\n\n" + refs + " reference(s) point at it and will fail validation." : ""))) return;
+  cfgMutate((d) => { delete d[kind][keyOrIndex]; });
+}
+
+function cfgDuplicateEntry(kind, keyOrIndex) {
+  cfgMutate((d) => {
+    if (kind === "backends") {
+      const b = cfgDeepCopy(d.backends[keyOrIndex]);
+      let n = 2;
+      while (d.backends.some((x) => x.id === b.id + "-" + n)) n++;
+      b.id = b.id + "-" + n;
+      d.backends.splice(keyOrIndex + 1, 0, b);
+      return;
+    }
+    const src = cfgDeepCopy(d[kind][keyOrIndex]);
+    let n = 2;
+    while (d[kind][keyOrIndex + "-" + n]) n++;
+    const nid = keyOrIndex + "-" + n;
+    const ordered = {};
+    for (const [k, v] of Object.entries(d[kind])) {
+      ordered[k] = v;
+      if (k === keyOrIndex) ordered[nid] = src;
+    }
+    d[kind] = ordered;
+  });
+}
+
+// ---- config editor: wiring -----------------------------------------------------
+
+async function openConfigView() {
+  if (cfg.loaded) { renderConfig(); loadEnvVars(); return; }
+  await refreshConfigFromDisk();
+  loadEnvVars();
+}
+
+$("cfgSave").addEventListener("click", cfgSave);
+$("cfgValidate").addEventListener("click", cfgValidate);
+$("cfgReload").addEventListener("click", () => {
+  if (cfg.dirty && !confirm("Discard unsaved changes and reload the file from disk?")) return;
+  refreshConfigFromDisk();
+});
+$("cfgModeToggle").addEventListener("click", () => toggleCfgMode());
+$("cfgFormat").addEventListener("click", () => {
+  try {
+    cfg.text = JSON.stringify(JSON.parse($("cfgRawText").value), null, 2);
+    $("cfgRawText").value = cfg.text;
+    cfg.errors = [];
+  } catch (e) {
+    cfg.errors = [{ path: "", message: "JSON syntax error: " + e.message }];
+  }
+  renderConfig();
+});
+$("cfgRawFromForms").addEventListener("click", () => {
+  cfg.text = JSON.stringify(cfg.draft, null, 2);
+  $("cfgRawText").value = cfg.text;
+  renderConfig();
+});
+$("cfgRawText").addEventListener("input", () => {
+  cfg.text = $("cfgRawText").value;
+  cfg.dirty = true;
+  // Cheap live syntax feedback; the authoritative check is the server's.
+  const syn = cfgRawParseError();
+  cfg.errors = syn || [];
+  const st = $("cfgState");
+  $("cfgSave").disabled = !cfg.dirty;
+  if (syn) { st.className = "cfg-state err"; st.textContent = "JSON syntax error - fix before saving"; }
+  else if (cfg.dirty) { st.className = "cfg-state warn"; st.textContent = "Unsaved changes"; }
+});
+$("cfgAddBackend").addEventListener("click", () => cfgOpenModal("backends", null, {}, null));
+$("cfgAddModel").addEventListener("click", () => cfgOpenModal("models", null, {}, null));
+$("cfgAddPreset").addEventListener("click", () => cfgOpenModal("presets", null, {}, null));
+$("cfgModalCancel").addEventListener("click", cfgCloseModal);
+$("cfgModalApply").addEventListener("click", cfgApplyModal);
+$("cfgModalBg").addEventListener("click", (ev) => { if (ev.target === $("cfgModalBg")) cfgCloseModal(); });
+document.addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape" && cfg.modal) cfgCloseModal();
+});
+// Settings inputs are plain inline fields rather than modal entries.
+$("cfgSettingsTable").addEventListener("input", (ev) => {
+  const input = ev.target.closest("[data-cfg-set]");
+  if (!input) return;
+  const key = input.dataset.cfgSet;
+  const v = input.value.trim();
+  cfgMutate((d) => { if (v === "") delete d[key]; else d[key] = v; });
+});
+// One delegated handler for every editor affordance (rows are re-rendered
+// constantly, so per-element listeners would leak).
+$("view-config").addEventListener("click", (ev) => {
+  const t = ev.target.closest("button");
+  if (!t) return;
+  const del = t.dataset.cfgDel, dup = t.dataset.cfgDup, edit = t.dataset.cfgEdit, restore = t.dataset.cfgRestore;
+  if (restore) { cfgRestore(restore); return; }
+  if (del) {
+    const [kind, key] = del.split(":");
+    cfgDeleteEntry(kind, kind === "backends" ? Number(key) : key);
+    return;
+  }
+  if (dup) {
+    const [kind, key] = dup.split(":");
+    cfgDuplicateEntry(kind, kind === "backends" ? Number(key) : key);
+    return;
+  }
+  if (edit) {
+    const idx = edit.indexOf(":");
+    const kind = edit.slice(0, idx);
+    const key = edit.slice(idx + 1);
+    if (kind === "settings") {
+      const block = (cfg.draft || {})[key];
+      cfgOpenModal("settings", key, { text: block === undefined ? "" : JSON.stringify(block, null, 2) });
+    } else if (kind === "backends") {
+      const i = Number(key);
+      const b = cfg.draft.backends[i];
+      cfgOpenModal("backends", b.id, Object.assign({}, b), i);
+    } else {
+      cfgOpenModal(kind, key, Object.assign({ id: key }, cfg.draft[kind][key]));
+    }
+  }
+});
+// Provider / preset-model row interactions inside the modal.
+$("cfgModalBody").addEventListener("click", (ev) => {
+  const addProv = ev.target.closest("#f_addprov");
+  if (addProv) {
+    const ids = (cfg.draft.backends || []).map((b) => b && b.id).filter(Boolean);
+    cfg.modal.provs.push({ backend: ids[0] || "", upstream: "" });
+    renderProvList();
+    return;
+  }
+  const delProv = ev.target.closest("[data-prov-del]");
+  if (delProv) {
+    cfg.modal.provs.splice(Number(delProv.dataset.provDel), 1);
+    renderProvList();
+    return;
+  }
+  const addModel = ev.target.closest("#f_addmodel");
+  if (addModel) {
+    const v = $("f_pickmodel").value;
+    if (v) {
+      cfg.modal.models.push({ model: v, weight: null });
+      renderPresetModelList();
+    }
+    return;
+  }
+  const delModel = ev.target.closest("[data-pm-del]");
+  if (delModel) {
+    cfg.modal.models.splice(Number(delModel.dataset.pmDel), 1);
+    renderPresetModelList();
+  }
+});
+$("cfgModalBody").addEventListener("input", (ev) => {
+  const pb = ev.target.closest("[data-prov-backend]");
+  if (pb) { cfg.modal.provs[Number(pb.dataset.provBackend)].backend = pb.value; return; }
+  const pu = ev.target.closest("[data-prov-upstream]");
+  if (pu) { cfg.modal.provs[Number(pu.dataset.provUpstream)].upstream = pu.value; return; }
+  const pm = ev.target.closest("[data-pm-weight]");
+  if (pm) {
+    const v = pm.value.trim();
+    cfg.modal.models[Number(pm.dataset.pmWeight)].weight = v === "" ? null : Number(v);
+  }
+});
+$("cfgModalBody").addEventListener("change", (ev) => {
+  const pb = ev.target.closest("[data-prov-backend]");
+  if (pb) cfg.modal.provs[Number(pb.dataset.provBackend)].backend = pb.value;
+});
+
+// Guard against a lost draft on navigation away from a dirty editor.
+window.addEventListener("beforeunload", (ev) => {
+  if (cfg.dirty) {
+    ev.preventDefault();
+    ev.returnValue = "";
+  }
+});
 
 // Known views. Tab switches set location.hash so a reload/back/forward restores
 // the same tab; the hashchange listener keeps the UI in sync with the URL.
-const VIEWS = ["dashboard", "history", "playground", "keys"];
+const VIEWS = ["dashboard", "history", "playground", "keys", "config"];
 
 function activateView(name) {
   document.querySelectorAll(".tab").forEach((t) => {
@@ -3307,6 +5234,8 @@ function activateView(name) {
   // reload straight into #keys). loadKeys() is idempotent and needs a valid
   // session/master key; if not authed it will show the 401 prompt instead.
   if (name === "keys") loadKeys();
+  if (name === "config") openConfigView();
+  else if (cfg.loaded) cfgUnload();
 }
 
 document.querySelectorAll(".tab").forEach((tab) => {

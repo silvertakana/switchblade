@@ -3,7 +3,7 @@
 
 import http from "node:http";
 import { once } from "node:events";
-import { writeFile, mkdtemp, rm, readFile } from "node:fs/promises";
+import { writeFile, mkdtemp, rm, readFile, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
@@ -2556,15 +2556,23 @@ async function main() {
       rr = await api(h.base, "/v1/chat/completions", { body: chatBody, headers: { authorization: "bearer master-secret-123" } });
       assert(rr.status === 200, "zA4) case-insensitive 'bearer' scheme -> 200 (status=" + rr.status + ")");
 
-      // Read-only endpoints stay open even without a valid token.
+      // Read-only endpoints stay open even without a valid token. /api/config
+      // is deliberately NOT in this list: the config-editing routes live under
+      // the same `/api/config` prefix and the gate matches on the prefix, so
+      // the plain viewer is gated too. That is covered by zCE12b, and the
+      // dashboard config viewer sends credentials once a master key is set.
       const openChecks = [
         ["/health", 200], ["/v1/models", 200], ["/api/stats", 200],
-        ["/api/history", 200], ["/api/config", 200],
+        ["/api/history", 200],
       ];
       for (const [path, want] of openChecks) {
         const rrr = await api(h.base, path, { method: "GET" });
         assert(rrr.status === want, "zA5) read-only " + path + " open without valid token (status=" + rrr.status + ")");
       }
+      const rCfgNoAuth = await fetch(h.base + "/api/config");
+      assert(rCfgNoAuth.status === 401, "zA5b) /api/config follows the config-editor gate (401 without a token, got " + rCfgNoAuth.status + ")");
+      const rCfgAuth = await api(h.base, "/api/config", { method: "GET", headers: { authorization: "Bearer master-secret-123" } });
+      assert(rCfgAuth.status === 200, "zA5c) /api/config with a token -> 200 (got " + rCfgAuth.status + ")");
       const rrDetail = await api(h.base, "/api/history/detail", { method: "GET" });
       assert(rrDetail.status !== 401, "zA6) /api/history/detail open (not 401, status=" + rrDetail.status + ")");
 
@@ -3247,6 +3255,511 @@ async function main() {
         srvM7.srv.close();
         await rm(dirM7, { recursive: true, force: true });
       }
+    }
+  }
+
+  // ---- config editor (web UI write path) ------------------------------------
+  // Exercises /api/config/raw, POST /api/config and POST /api/config/reset
+  // against a real child server on a temp config. The invariant under test is
+  // that a REJECTED save leaves the file byte-identical.
+  {
+    const dirCE = await mkdtemp(join(tmpdir(), "lmr-cfg-"));
+    const cfgPathCE = join(dirCE, "config.json");
+    const cfgCE = {
+      port: 0,
+      prefix: "/v1",
+      masterKeyEnv: null,
+      uiPasswordEnv: null,
+      backends: [
+        { id: "ce-a", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_CE_A" },
+        { id: "ce-b", baseURL: "http://127.0.0.1:2", apiKeyEnv: "KEY_CE_B" },
+      ],
+      models: {
+        "ce-model": { providers: [{ backend: "ce-a", upstream: "u1" }], affinityPool: 1 },
+      },
+      presets: {
+        "ce-preset": { strategy: "affinity", models: ["ce-model"] },
+      },
+      // Blocks that the NORMALIZED /api/config does not model. Their survival
+      // through a save is the regression guard for the raw-load rule.
+      pricing: { offPeakMultiplier: 0.5, peakWindows: [{ days: [1, 2, 3, 4, 5], startHour: 0, endHour: 8 }] },
+      missCapture: { enabled: true, maxMissPct: 50, minMissTokens: 1000, file: "router-misses.jsonl", maxFileBytes: 25000000 },
+      alerts: { ntfy: { baseUrl: "https://ntfy.sh", topic: "ce-topic", minMissPct: 50, minMissTokens: 20000, cooldownMs: 600000 } },
+      backoff: { rateLimitBaseMs: 50, rateLimitMaxMs: 200, serverBaseMs: 50, serverMaxMs: 200, authBaseMs: 50, authMaxMs: 200, weeklyDefaultMs: 1000 },
+    };
+    await writeFile(cfgPathCE, JSON.stringify(cfgCE, null, 2) + "\n");
+    await writeFile(join(dirCE, ".env"), "KEY_CE_A=secret-value-a\nKEY_CE_B=secret-value-b\n");
+    const childCE = spawn(process.execPath, ["server.mjs"], {
+      cwd: join(import.meta.dirname),
+      env: { ...process.env, ROUTER_CONFIG: cfgPathCE, ROUTER_ENV: join(dirCE, ".env") },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let baseCE = null;
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("config-editor server did not start")), 8000);
+      childCE.stderr.on("data", (d) => {
+        const m = /listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(d.toString());
+        if (m) { baseCE = `http://${HOST}:${parseInt(m[1], 10)}`; clearTimeout(timer); resolve(); }
+      });
+    });
+
+    const readCfg = async () => JSON.parse(await readFile(cfgPathCE, "utf8"));
+    const post = (path, body) => api(baseCE, path, { body });
+    const rawOnDisk = async () => await readFile(cfgPathCE, "utf8");
+
+    try {
+      // CE1) raw read is byte-faithful for the blocks /api/config drops
+      let r1 = await fetch(baseCE + "/api/config/raw");
+      const raw1 = await r1.json();
+      assert(r1.status === 200 && raw1.config, "zCE1a) GET /api/config/raw returns the config");
+      assert(
+        JSON.stringify(raw1.config.pricing) === JSON.stringify(cfgCE.pricing) &&
+          JSON.stringify(raw1.config.missCapture) === JSON.stringify(cfgCE.missCapture) &&
+          JSON.stringify(raw1.config.alerts) === JSON.stringify(cfgCE.alerts),
+        "zCE1b) raw read preserves pricing/missCapture/alerts that /api/config drops"
+      );
+      assert(typeof raw1.revision === "number" && raw1.revision > 0, "zCE1c) raw read returns a revision (mtime)");
+      assert(Array.isArray(raw1.envNames) && raw1.envNames.includes("KEY_CE_A"), "zCE1d) raw read lists env var names for the key picker");
+
+      // CE2) a valid save lands on disk and keeps the unmodeled blocks
+      const draft = JSON.parse(JSON.stringify(raw1.config));
+      draft.backends.push({ id: "ce-c", baseURL: "http://127.0.0.1:3", apiKeyEnv: "KEY_CE_A" });
+      draft.models["ce-model2"] = { providers: [{ backend: "ce-c", upstream: "u3" }] };
+      let r2 = await post("/api/config", { config: draft, baseRevision: raw1.revision });
+      const b2 = await r2.json();
+      assert(r2.status === 200 && b2.ok, "zCE2a) valid save returns 200 ok (" + r2.status + ")");
+      const onDisk2 = await readCfg();
+      assert(onDisk2.backends.some((b) => b.id === "ce-c"), "zCE2b) new backend is on disk after save");
+      assert(!!onDisk2.models["ce-model2"], "zCE2c) new model is on disk after save");
+      assert(JSON.stringify(onDisk2.pricing) === JSON.stringify(cfgCE.pricing), "zCE2d) pricing survives the save");
+      assert(JSON.stringify(onDisk2.missCapture) === JSON.stringify(cfgCE.missCapture), "zCE2e) missCapture survives the save");
+      assert(!!b2.snapshot, "zCE2f) a snapshot is taken on save");
+
+      // CE3) the saved config is picked up by hot-reload (/api/config reflects it)
+      await new Promise((r) => setTimeout(r, 700));
+      const live = await (await fetch(baseCE + "/api/config")).json();
+      assert(live.backends.some((b) => b.id === "ce-c"), "zCE3a) hot-reload picks up the saved backend");
+
+      // CE4) unset apiKeyEnv -> 400 AND the file is byte-identical
+      const before4 = await rawOnDisk();
+      const draft4 = JSON.parse(JSON.stringify(onDisk2));
+      draft4.backends.push({ id: "ce-nokey", baseURL: "http://127.0.0.1:9", apiKeyEnv: "KEY_DOES_NOT_EXIST" });
+      const r4 = await post("/api/config", { config: draft4, force: true });
+      const b4 = await r4.json();
+      assert(r4.status === 400 && b4.ok === false, "zCE4a) backend with an unset apiKeyEnv is rejected (400)");
+      assert((b4.errors || []).some((e) => /apiKeyEnv/.test(e.path)), "zCE4b) the error points at apiKeyEnv");
+      assert((await rawOnDisk()) === before4, "zCE4c) rejected save left the file byte-identical");
+
+      // CE5) dangling references are rejected
+      const mkBad = async (mutate, label) => {
+        const b4raw = await rawOnDisk();
+        const dd = JSON.parse(b4raw);
+        mutate(dd);
+        const rr = await post("/api/config", { config: dd, force: true });
+        assert(rr.status === 400, "zCE5 " + label + " rejected (400, got " + rr.status + ")");
+        assert((await rawOnDisk()) === b4raw, "zCE5 " + label + " left the file unchanged");
+      };
+      await mkBad((d) => { d.models["ce-model"].providers = [{ backend: "ghost", upstream: "u" }]; }, "a) unknown provider backend");
+      await mkBad((d) => { d.presets["ce-preset"].models = ["does-not-exist"]; }, "b) preset with an unknown model");
+      await mkBad((d) => { d.missCapture.file = "../escape.jsonl"; }, "c) missCapture.file traversal");
+      await mkBad((d) => { d.port = 9999; }, "d) restart-only port change");
+      await mkBad((d) => { d.backends.push({ id: "ce-c", baseURL: "http://x", apiKeyEnv: "KEY_CE_A" }); }, "e) duplicate backend id");
+
+      // CE6) stale revision -> 409 with the current config, no write
+      const before6 = await rawOnDisk();
+      const draft6 = JSON.parse(before6);
+      draft6.prefix = "/v9";
+      const r6 = await post("/api/config", { config: draft6, baseRevision: 1 });
+      const b6 = await r6.json();
+      assert(r6.status === 409 && b6.error && b6.error.type === "conflict", "zCE6a) stale baseRevision -> 409 conflict");
+      assert(b6.current && typeof b6.current === "object", "zCE6b) conflict response carries the current config");
+      assert((await rawOnDisk()) === before6, "zCE6c) conflicted save left the file unchanged");
+      const r6b = await post("/api/config", { config: draft6, baseRevision: 1, force: true });
+      assert(r6b.status === 200, "zCE6d) the same save with force:true succeeds");
+
+      // CE7) dryRun validates without writing
+      const before7 = await rawOnDisk();
+      const draft7 = JSON.parse(before7);
+      draft7.presets["ce-preset"].models = ["nope"];
+      const r7 = await post("/api/config", { config: draft7, dryRun: true });
+      const b7 = await r7.json();
+      assert(r7.status === 400 && b7.ok === false, "zCE7a) dryRun reports validation errors");
+      const draft7b = JSON.parse(before7);
+      const r7b = await post("/api/config", { config: draft7b, dryRun: true });
+      assert(r7b.status === 200, "zCE7b) dryRun on a valid config returns 200");
+      assert((await rawOnDisk()) === before7, "zCE7c) dryRun never writes");
+
+      // CE8) warnings are advisory, not fatal (empty preset models + unknown key)
+      const draft8 = JSON.parse(await rawOnDisk());
+      draft8.presets["ce-empty"] = { strategy: "affinity", models: [] };
+      draft8.someUnknownKey = 1;
+      const r8 = await post("/api/config", { config: draft8, force: true });
+      const b8 = await r8.json();
+      assert(r8.status === 200, "zCE8a) warnings do not block a save");
+      assert((b8.warnings || []).length >= 2, "zCE8b) warnings are reported back to the UI");
+      assert((await readCfg()).someUnknownKey === 1, "zCE8c) the warned-about key was still saved (it is advisory)");
+
+      // CE9) snapshot restore returns the previous bytes
+      const snaps = await (await fetch(baseCE + "/api/config/raw")).json();
+      assert(Array.isArray(snaps.snapshots) && snaps.snapshots.length > 0, "zCE9a) snapshots are listed, newest first");
+      const targetSnap = snaps.snapshots[snaps.snapshots.length - 1];
+      const r9 = await post("/api/config/reset", { snapshot: targetSnap });
+      const b9 = await r9.json();
+      assert(r9.status === 200 && b9.ok, "zCE9b) restore returns 200 (" + r9.status + ")");
+      const after9 = await readCfg();
+      assert(!after9.someUnknownKey, "zCE9c) restore reverted the later save (unknown key gone)");
+      assert(Array.isArray(after9.backends) && after9.backends.some((b) => b.id === "ce-a"), "zCE9d) restored config still has the base backends");
+
+      // CE10) path traversal in the snapshot name is refused
+      const r10 = await post("/api/config/reset", { snapshot: "../../config.json" });
+      assert(r10.status === 400, "zCE10a) snapshot path traversal -> 400 (got " + r10.status + ")");
+      const r10b = await post("/api/config/reset", { snapshot: "nope.json" });
+      assert(r10b.status === 404, "zCE10b) unknown snapshot -> 404 (got " + r10b.status + ")");
+
+      // CE11) secret hygiene: no apiKeyEnv VALUE appears in any response body
+      const bodies = [
+        JSON.stringify(raw1), JSON.stringify(b2), JSON.stringify(b4),
+        JSON.stringify(b6), JSON.stringify(b8), JSON.stringify(b9), JSON.stringify(snaps),
+      ].join("\n");
+      assert(!bodies.includes("secret-value-a") && !bodies.includes("secret-value-b"), "zCE11a) no apiKeyEnv value leaks into any config response");
+      assert(bodies.includes("KEY_CE_A"), "zCE11b) the env var NAME is still served (the UI needs it)");
+    } finally {
+      childCE.kill();
+      await rm(dirCE, { recursive: true, force: true });
+    }
+  }
+
+  // ---- config editor: auth gate ---------------------------------------------
+  // With masterKeyEnv set and no credential, every config-write route must be
+  // refused and the file must stay untouched.
+  {
+    const dirCE2 = await mkdtemp(join(tmpdir(), "lmr-cfg-auth-"));
+    const cfgPathCE2 = join(dirCE2, "config.json");
+    const cfgCE2 = {
+      port: 0, prefix: "/v1", masterKeyEnv: "CE_MASTER", uiPasswordEnv: null,
+      backends: [{ id: "ce-a", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_CE_A" }],
+      models: { "ce-model": { providers: [{ backend: "ce-a", upstream: "u" }] } },
+      presets: { "ce-preset": { strategy: "affinity", models: ["ce-model"] } },
+    };
+    await writeFile(cfgPathCE2, JSON.stringify(cfgCE2, null, 2) + "\n");
+    await writeFile(join(dirCE2, ".env"), "KEY_CE_A=secret-value-a\nCE_MASTER=master-secret\n");
+    const childCE2 = spawn(process.execPath, ["server.mjs"], {
+      cwd: join(import.meta.dirname),
+      env: { ...process.env, ROUTER_CONFIG: cfgPathCE2, ROUTER_ENV: join(dirCE2, ".env") },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let baseCE2 = null;
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("config-editor auth server did not start")), 8000);
+      childCE2.stderr.on("data", (d) => {
+        const m = /listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(d.toString());
+        if (m) { baseCE2 = `http://${HOST}:${parseInt(m[1], 10)}`; clearTimeout(timer); resolve(); }
+      });
+    });
+    try {
+      const before = await readFile(cfgPathCE2, "utf8");
+      const noAuth = { "content-type": "application/json" };
+      const ra = await fetch(baseCE2 + "/api/config", {
+        method: "POST",
+        headers: noAuth,
+        body: JSON.stringify({ config: JSON.parse(before), force: true }),
+      });
+      assert(ra.status === 401, "zCE12a) unauthenticated save -> 401 (got " + ra.status + ")");
+      const rb = await fetch(baseCE2 + "/api/config/raw");
+      assert(rb.status === 401, "zCE12b) unauthenticated raw read -> 401 (got " + rb.status + ")");
+      const rc = await fetch(baseCE2 + "/api/config/reset", {
+        method: "POST",
+        headers: noAuth,
+        body: JSON.stringify({ snapshot: "x.json" }),
+      });
+      assert(rc.status === 401, "zCE12c) unauthenticated restore -> 401 (got " + rc.status + ")");
+      assert((await readFile(cfgPathCE2, "utf8")) === before, "zCE12d) unauthenticated attempts left the file unchanged");
+
+      // With the master key the same save is accepted.
+      const rd = await fetch(baseCE2 + "/api/config", {
+        method: "POST",
+        headers: { ...noAuth, authorization: "Bearer master-secret" },
+        body: JSON.stringify({ config: JSON.parse(before), force: true }),
+      });
+      assert(rd.status === 200, "zCE12e) the master key authorizes a save (" + rd.status + ")");
+    } finally {
+      childCE2.kill();
+      await rm(dirCE2, { recursive: true, force: true });
+    }
+  }
+
+  // ---- env editor (UI-managed secrets store) --------------------------------
+  // Exercises the /api/env* routes against a real child server whose
+  // ROUTER_SECRETS points into a temp dir, so the repo's real secrets.json is
+  // never touched. The load-bearing invariant is that the LIST endpoint never
+  // carries a value: values exist only in the deliberate per-name reveal.
+  {
+    const dirSE = await mkdtemp(join(tmpdir(), "lmr-se-env-"));
+    const cfgPathSE = join(dirSE, "config.json");
+    const secretsPathSE = join(dirSE, "secrets.json");
+    const cfgSE = {
+      port: 0, prefix: "/v1", masterKeyEnv: "CE_MASTER", uiPasswordEnv: "CE_UIPASS",
+      backends: [{ id: "se-a", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_SE_A" }],
+      models: { "se-model": { providers: [{ backend: "se-a", upstream: "u" }] } },
+      presets: { "se-preset": { strategy: "affinity", models: ["se-model"] } },
+    };
+    await writeFile(cfgPathSE, JSON.stringify(cfgSE, null, 2) + "\n");
+    await writeFile(join(dirSE, ".env"), "KEY_SE_A=env-file-value-a\nCE_MASTER=master-secret\nCE_UIPASS=ui-pass-value\nROUTER_HISTORY=env-history.jsonl\n");
+    // Pre-seeded so `updated` (vs `added`) and the merge behavior have a base.
+    await writeFile(secretsPathSE, JSON.stringify({ KEY_SE_A: "secrets-value-a", SE_KEEP: "keep-me" }, null, 2) + "\n");
+    const childSE = spawn(process.execPath, ["server.mjs"], {
+      cwd: join(import.meta.dirname),
+      env: { ...process.env, ROUTER_CONFIG: cfgPathSE, ROUTER_ENV: join(dirSE, ".env"), ROUTER_SECRETS: secretsPathSE },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let baseSE = null;
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("secrets-editor server did not start")), 8000);
+      childSE.stderr.on("data", (d) => {
+        const m = /listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(d.toString());
+        if (m) { baseSE = `http://${HOST}:${parseInt(m[1], 10)}`; clearTimeout(timer); resolve(); }
+      });
+    });
+
+    // api() defaults to the suite's local-master header; this fixture's master
+    // key is CE_MASTER, so route every call through the real credential.
+    const apiSE = (base, path, opts) => api(base, path, { ...opts, headers: { authorization: "Bearer master-secret", ...(opts && opts.headers) } });
+    const listEnv = async () => await (await apiSE(baseSE, "/api/env", { method: "GET" })).json();
+    const findVar = (body, name) => (body.vars || []).find((v) => v.name === name);
+    const postEnv = (body) => apiSE(baseSE, "/api/env", { body });
+    const reveal = async (name) => await (await apiSE(baseSE, "/api/env/reveal", { body: { name } })).json();
+    const secretsOnDisk = async () => JSON.parse(await readFile(secretsPathSE, "utf8"));
+    const sendEnv = (method, name) => apiSE(baseSE, `/api/env?name=${name}`, { method, body: method === "DELETE" ? undefined : {} });
+    const snapshots = async () => {
+      try { return (await readdir(join(dirSE, "secrets.history"))).filter((f) => f.endsWith(".json")); } catch { return []; }
+    };
+
+    try {
+      // SE1) the route is auth-gated exactly like /api/config
+      const rSE1 = await fetch(baseSE + "/api/env");
+      assert(rSE1.status === 401, "zSE1a) unauthenticated GET /api/env -> 401 (got " + rSE1.status + ")");
+      const rSE1b = await fetch(baseSE + "/api/env/reveal", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "KEY_SE_A" }),
+      });
+      assert(rSE1b.status === 401, "zSE1b) unauthenticated POST /api/env/reveal -> 401 (got " + rSE1b.status + ")");
+      const rSE1c = await apiSE(baseSE, "/api/env", { method: "GET" });
+      const bSE1c = await rSE1c.json();
+      assert(rSE1c.status === 200 && Array.isArray(bSE1c.vars), "zSE1c) the master key authorizes GET /api/env (200 + vars)");
+
+      // SE2) a name referenced by a backend apiKeyEnv is listed, and NO value
+      //      (from .env or from the secrets store) appears in the response text
+      const rSE2 = await apiSE(baseSE, "/api/env", { method: "GET" });
+      const textSE2 = await rSE2.text();
+      const bSE2 = JSON.parse(textSE2);
+      const varSE2 = findVar(bSE2, "KEY_SE_A");
+      assert(!!varSE2 && varSE2.set === true && typeof varSE2.source === "string", "zSE2a) a backend apiKeyEnv name is listed with set/source");
+      assert(varSE2.source === "secrets", "zSE2b) a name present in both files reports source 'secrets' (" + (varSE2 && varSE2.source) + ")");
+      assert(!textSE2.includes("env-file-value-a") && !textSE2.includes("secrets-value-a") && !textSE2.includes("keep-me"), "zSE2c) no secret value leaks into the list response");
+      assert(textSE2.includes("KEY_SE_A") && textSE2.includes("SE_KEEP"), "zSE2d) names are still served (the UI needs them)");
+
+      // SE3) add a new var through POST, then confirm it is live and revealable
+      const rSE3 = await postEnv({ name: "SE_NEW", value: "new-value-1", baseRevision: bSE2.revision });
+      const bSE3 = await rSE3.json();
+      assert(rSE3.status === 200 && bSE3.ok === true && bSE3.action === "added" && bSE3.applied === true, "zSE3a) POST /api/env adds a var (ok/added/applied)");
+      const afterSE3 = await listEnv();
+      const varSE3 = findVar(afterSE3, "SE_NEW");
+      assert(!!varSE3 && varSE3.live === true && varSE3.source === "secrets", "zSE3b) the new var reports live:true + source 'secrets'");
+      assert(afterSE3.restartRequired === false, "zSE3c) no restart is required after an applied write");
+      assert((await reveal("SE_NEW")).value === "new-value-1", "zSE3d) reveal returns the exact written value");
+
+      // SE4) the auth credential itself is not editable from the UI
+      const beforeSE4 = await readFile(secretsPathSE, "utf8");
+      const rSE4 = await postEnv({ name: "CE_MASTER", value: "hijack", force: true });
+      const bSE4 = await rSE4.json();
+      assert(rSE4.status === 400 && /authentication credential/.test(JSON.stringify(bSE4)), "zSE4a) writing the masterKeyEnv name -> 400 naming the credential");
+      assert((await readFile(secretsPathSE, "utf8")) === beforeSE4, "zSE4b) the rejected protected write left the secrets file unchanged");
+      // Reveal must refuse the same names: the list reports editable:false for
+      // them, and the master key is a wider-scope credential than the dashboard
+      // session that would be asking for it.
+      const revSE4 = await fetch(baseSE + "/api/env/reveal", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer master-secret" },
+        body: JSON.stringify({ name: "CE_MASTER" }),
+      });
+      const bRevSE4 = await revSE4.json();
+      assert(revSE4.status === 400, "zSE4c) revealing the masterKeyEnv name -> 400 (got " + revSE4.status + ")");
+      assert(!JSON.stringify(bRevSE4).includes("master-secret"), "zSE4d) the refused reveal leaks no value");
+      const revSE4b = await fetch(baseSE + "/api/env/reveal", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer master-secret" },
+        body: JSON.stringify({ name: "CE_UIPASS" }),
+      });
+      assert(revSE4b.status === 400, "zSE4e) revealing the uiPasswordEnv name -> 400 (got " + revSE4b.status + ")");
+      // A non-protected name still reveals, so the refusal is targeted.
+      assert((await reveal("SE_NEW")).value === "new-value-1", "zSE4f) an ordinary name still reveals after the protected refusal");
+
+      // SE5) a second write merges rather than replaces
+      const rSE5 = await postEnv({ name: "SE_SECOND", value: "new-value-2", force: true });
+      const bSE5 = await rSE5.json();
+      const onDiskSE5 = await secretsOnDisk();
+      assert(rSE5.status === 200 && bSE5.action === "added", "zSE5a) a second write is accepted (added)");
+      assert(onDiskSE5.SE_NEW === "new-value-1" && onDiskSE5.SE_SECOND === "new-value-2", "zSE5b) the second write merged: both vars are on disk");
+      assert(onDiskSE5.SE_KEEP === "keep-me" && onDiskSE5.KEY_SE_A === "secrets-value-a", "zSE5c) unrelated entries survived the merge");
+
+      // SE6) stale baseRevision -> 409 with the live revision, file untouched
+      const beforeSE6 = await readFile(secretsPathSE, "utf8");
+      const rSE6 = await postEnv({ name: "SE_CONFLICT", value: "nope", baseRevision: 1 });
+      const bSE6 = await rSE6.json();
+      assert(rSE6.status === 409 && typeof bSE6.revision === "number" && bSE6.revision > 0, "zSE6a) stale baseRevision -> 409 carrying the current revision");
+      assert((await readFile(secretsPathSE, "utf8")) === beforeSE6, "zSE6b) the conflicted write left the secrets file unchanged");
+      assert(JSON.parse(beforeSE6).SE_CONFLICT === undefined, "zSE6c) the conflicted name never reached disk");
+      const rSE6b = await postEnv({ name: "SE_CONFLICT", value: "forced", baseRevision: 1, force: true });
+      assert(rSE6b.status === 200, "zSE6d) the same save with force:true succeeds (" + rSE6b.status + ")");
+
+      // SE7) every write leaves a snapshot beside the store
+      assert((await snapshots()).length > 0, "zSE7a) a snapshot file appears in secrets.history/ after a write");
+      assert((await snapshots()).every((f) => f.endsWith(".json")), "zSE7b) snapshots are JSON files");
+
+      // SE8) validation: bad names, an empty name, and an empty value
+      const badSE8 = [
+        ["se_lower", "a lowercase name"],
+        ["SE-DASH", "a dashed name"],
+        ["", "an empty name"],
+      ];
+      for (const [badName, label] of badSE8) {
+        const rr = await postEnv({ name: badName, value: "x", force: true });
+        assert(rr.status === 400, "zSE8 " + label + " -> 400 (got " + rr.status + ")");
+      }
+      const rrSE8 = await postEnv({ name: "SE_EMPTY", value: "", force: true });
+      const bbSE8 = await rrSE8.json();
+      assert(rrSE8.status === 400 && /empty/.test(JSON.stringify(bbSE8)), "zSE8d) an empty value -> 400 pointing at the remove action");
+      assert((await secretsOnDisk()).SE_EMPTY === undefined && (await secretsOnDisk()).se_lower === undefined, "zSE8e) no invalid write reached the file");
+
+      // SE9) delete removes exactly the named entry, and only once
+      const rSE9 = await sendEnv("DELETE", "SE_SECOND");
+      const bSE9 = await rSE9.json();
+      const after9 = await secretsOnDisk();
+      assert(rSE9.status === 200 && bSE9.ok === true && bSE9.action === "removed", "zSE9a) DELETE /api/env?name=X removes the entry");
+      assert(after9.SE_SECOND === undefined && after9.SE_NEW === "new-value-1", "zSE9b) only the named var was removed; the other survived");
+      const rSE9b = await sendEnv("DELETE", "SE_SECOND");
+      assert(rSE9b.status === 409, "zSE9c) deleting a name that is not secrets-managed -> 409 (got " + rSE9b.status + ")");
+      const rSE9c = await sendEnv("DELETE", "CE_MASTER");
+      assert(rSE9c.status === 400, "zSE9d) deleting a protected name -> 400 (got " + rSE9c.status + ")");
+
+      // SE10) reloadable reflects what is read once at startup
+      const bSE10 = await listEnv();
+      // ROUTER_HISTORY is declared in .env, so the (now config-scoped) list
+      // carries it; it is read once at module load, hence not reloadable.
+      const histSE10 = findVar(bSE10, "ROUTER_HISTORY");
+      assert(!!histSE10 && histSE10.reloadable === false, "zSE10a) ROUTER_HISTORY reports reloadable:false");
+      const masterSE10 = findVar(bSE10, "CE_MASTER");
+      assert(!!masterSE10 && masterSE10.editable === false, "zSE10b) the masterKeyEnv name reports editable:false");
+      assert(findVar(bSE10, "SE_NEW").reloadable === true, "zSE10c) an ordinary var reports reloadable:true");
+      // The list is scoped to config-referenced + secrets + .env names, so
+      // ambient shell noise must NOT appear.
+      assert(!findVar(bSE10, "PATH") && !findVar(bSE10, "COMPUTERNAME"), "zSE10d) unrelated ambient shell vars are not listed");
+    } finally {
+      childSE.kill();
+      await rm(dirSE, { recursive: true, force: true });
+    }
+  }
+
+  // ---- env editor: boot precedence (shell > secrets.json > .env) -------------
+  // SHELL_ENV_NAMES is snapshotted in main() BEFORE loadEnv()/loadSecrets(), so
+  // a var passed in the child's env: wins over both files and must be reported
+  // as platform-owned rather than silently overwritten.
+  {
+    const dirP = await mkdtemp(join(tmpdir(), "lmr-se-prec-"));
+    const cfgPathP = join(dirP, "config.json");
+    const secretsPathP = join(dirP, "secrets.json");
+    const cfgP = {
+      port: 0, prefix: "/v1", masterKeyEnv: "CE_MASTER", uiPasswordEnv: null,
+      backends: [{ id: "se-p", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_SE_P" }],
+      models: { "se-model": { providers: [{ backend: "se-p", upstream: "u" }] } },
+      presets: { "se-preset": { strategy: "affinity", models: ["se-model"] } },
+    };
+    await writeFile(cfgPathP, JSON.stringify(cfgP, null, 2) + "\n");
+    await writeFile(join(dirP, ".env"), "KEY_SE_P=env-file-value-p\nCE_MASTER=master-secret\n");
+    await writeFile(secretsPathP, JSON.stringify({ KEY_SE_P: "secrets-value-p", SE_OTHER: "other-secret-p" }, null, 2) + "\n");
+    const childP = spawn(process.execPath, ["server.mjs"], {
+      cwd: join(import.meta.dirname),
+      env: { ...process.env, ROUTER_CONFIG: cfgPathP, ROUTER_ENV: join(dirP, ".env"), ROUTER_SECRETS: secretsPathP, KEY_SE_P: "shell-value-p" },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let baseP = null;
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("secrets precedence server did not start")), 8000);
+      childP.stderr.on("data", (d) => {
+        const m = /listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(d.toString());
+        if (m) { baseP = `http://${HOST}:${parseInt(m[1], 10)}`; clearTimeout(timer); resolve(); }
+      });
+    });
+    try {
+      const apiSE = (base, path, opts) => api(base, path, { ...opts, headers: { authorization: "Bearer master-secret", ...(opts && opts.headers) } });
+      const bP = await (await apiSE(baseP, "/api/env", { method: "GET" })).json();
+      const varP = (bP.vars || []).find((v) => v.name === "KEY_SE_P");
+      assert(!!varP && varP.source === "shell", "zSE11a) a var the shell already owned reports source 'shell'");
+      const revP = await (await apiSE(baseP, "/api/env/reveal", { body: { name: "KEY_SE_P" } })).json();
+      assert(revP.value === "shell-value-p", "zSE11b) reveal returns the shell value, not the secrets/.env value");
+      const otherP = (bP.vars || []).find((v) => v.name === "SE_OTHER");
+      assert(!!otherP && otherP.source === "secrets" && otherP.live === true, "zSE11c) a secrets-only name still applies when the shell does not own it");
+      assert((await (await apiSE(baseP, "/api/env/reveal", { body: { name: "SE_OTHER" } })).json()).value === "other-secret-p", "zSE11d) the secrets-only value reached process.env");
+    } finally {
+      childP.kill();
+      await rm(dirP, { recursive: true, force: true });
+    }
+  }
+
+  // ---- env editor: watcher hot-reload ---------------------------------------
+  // A hand edit of secrets.json (not a UI write, which applies directly) must
+  // reach process.env through the fs.watch path with no restart.
+  {
+    const dirW = await mkdtemp(join(tmpdir(), "lmr-se-watch-"));
+    const cfgPathW = join(dirW, "config.json");
+    const secretsPathW = join(dirW, "secrets.json");
+    const cfgW = {
+      port: 0, prefix: "/v1", masterKeyEnv: "CE_MASTER", uiPasswordEnv: null,
+      backends: [{ id: "se-w", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_SE_W" }],
+      models: { "se-model": { providers: [{ backend: "se-w", upstream: "u" }] } },
+      presets: { "se-preset": { strategy: "affinity", models: ["se-model"] } },
+    };
+    await writeFile(cfgPathW, JSON.stringify(cfgW, null, 2) + "\n");
+    await writeFile(join(dirW, ".env"), "KEY_SE_W=env-file-value-w\nCE_MASTER=master-secret\n");
+    await writeFile(secretsPathW, JSON.stringify({}, null, 2) + "\n");
+    const childW = spawn(process.execPath, ["server.mjs"], {
+      cwd: join(import.meta.dirname),
+      env: { ...process.env, ROUTER_CONFIG: cfgPathW, ROUTER_ENV: join(dirW, ".env"), ROUTER_SECRETS: secretsPathW },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let baseW = null;
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("secrets watcher server did not start")), 8000);
+      childW.stderr.on("data", (d) => {
+        const m = /listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(d.toString());
+        if (m) { baseW = `http://${HOST}:${parseInt(m[1], 10)}`; clearTimeout(timer); resolve(); }
+      });
+    });
+    try {
+      const apiSE = (base, path, opts) => api(base, path, { ...opts, headers: { authorization: "Bearer master-secret", ...(opts && opts.headers) } });
+      await new Promise((r) => setTimeout(r, 400)); // let the watcher attach
+      // Written directly (not via the API) so only the fs.watch path can make
+      // it visible; the API write applies to process.env synchronously.
+      await writeFile(secretsPathW, JSON.stringify({ SE_WATCHED: "watched-value" }, null, 2) + "\n");
+      let liveW = false;
+      const deadlineW = Date.now() + 2000;
+      while (!liveW && Date.now() < deadlineW) {
+        try {
+          const bb = await (await apiSE(baseW, "/api/env", { method: "GET" })).json();
+          const vv = (bb.vars || []).find((v) => v.name === "SE_WATCHED");
+          liveW = !!(vv && vv.live === true && vv.source === "secrets");
+        } catch {
+          /* a transient fetch failure during reload is "not ready yet" */
+        }
+        if (!liveW) await new Promise((r) => setTimeout(r, 50));
+      }
+      assert(liveW === true, "zSE12a) an edit to secrets.json hot-reloads (live:true) with no restart");
+      const revW = await (await apiSE(baseW, "/api/env/reveal", { body: { name: "SE_WATCHED" } })).json();
+      assert(revW.value === "watched-value", "zSE12b) the hand-edited value reached process.env via the watcher");
+    } finally {
+      childW.kill();
+      await rm(dirW, { recursive: true, force: true });
     }
   }
 

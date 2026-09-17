@@ -13,7 +13,7 @@
 // participate in the all-cooling fallback and a success never clears them.
 
 import http from "node:http";
-import { readFileSync, statSync, watch as watchF, appendFileSync, renameSync, openSync, readSync, closeSync } from "node:fs";
+import { readFileSync, statSync, watch as watchF, appendFileSync, renameSync, openSync, readSync, closeSync, readdirSync, unlinkSync, mkdirSync, writeFileSync } from "node:fs";
 import { readFile as readFileP, rename as renameP, writeFile as writeFileP } from "node:fs/promises";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -55,6 +55,366 @@ function loadEnv() {
   } catch {
     // no .env file -> rely on real environment
   }
+}
+
+// ---- config editing (web UI write path) --------------------------------------
+//
+// The editor writes CONFIG_PATH directly; the fs.watch below picks it up in
+// ~300ms, so a save needs no restart and no explicit reload call. Two rules
+// make that safe on a file that is live routing state:
+//   1. Never round-trip through /api/config. That endpoint serves the
+//      NORMALIZED config, which drops top-level keys normalization does not
+//      model (pricing, missCapture, alerts) and rewrites derived fields.
+//      Saving it back would silently destroy them. The editor loads raw.
+//   2. Snapshot before every write, validate before every write, write
+//      atomically (tmp + rename) so a partial write can never be observed.
+// port and host are set at startup by srv.listen() and are therefore rejected
+// here: accepting them would look like it worked and do nothing.
+
+const SNAPSHOT_DIR = join(dirname(CONFIG_PATH), "config.history");
+const MAX_SNAPSHOTS = 20;
+const RESTART_ONLY_KEYS = ["port", "host"];
+
+// ---- managed secrets store (web UI env editor) --------------------------------
+//
+// A UI-managed JSON store for credential env vars, separate from the
+// hand-edited .env: it hot-reloads (the .env mechanism cannot, see loadEnv)
+// and, unlike a container-baked .env, survives redeploys when bind-mounted
+// like config.server.json. Precedence: real shell env > secrets.json > .env.
+
+const SECRETS_PATH = process.env.ROUTER_SECRETS || join(dirname(CONFIG_PATH), "secrets.json");
+const SECRETS_HISTORY_DIR = join(dirname(SECRETS_PATH), "secrets.history");
+const MAX_ENV_SNAPSHOTS = 20;
+// Names consumed once at module load; changing them changes which files the
+// process reads, so the UI must say "next start" instead of "live".
+const STARTUP_ONLY_VARS = new Set(["ROUTER_CONFIG", "ROUTER_ENV", "ROUTER_HISTORY", "ROUTER_KEYS_FILE", "ROUTER_SECRETS", "NODE_OPTIONS"]);
+// Real environment at boot: these names are platform-owned and the UI never
+// overrides them. Snapshotted in main() before loadEnv()/loadSecrets() run.
+const SHELL_ENV_NAMES = new Set();
+
+function readSecrets() {
+  try {
+    const parsed = JSON.parse(readFileSync(SECRETS_PATH, "utf8"));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function secretsRevision() {
+  try {
+    return statSync(SECRETS_PATH).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
+function listSecretsSnapshots() {
+  try {
+    return readdirSync(SECRETS_HISTORY_DIR)
+      .filter((f) => f.endsWith(".json"))
+      .sort()
+      .reverse();
+  } catch {
+    return [];
+  }
+}
+
+function snapshotSecrets() {
+  let raw;
+  try {
+    raw = readFileSync(SECRETS_PATH, "utf8");
+  } catch {
+    return null;
+  }
+  mkdirSync(SECRETS_HISTORY_DIR, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const name = `${stamp}.json`;
+  try {
+    writeFileSync(join(SECRETS_HISTORY_DIR, name), raw);
+  } catch {
+    return null;
+  }
+  for (const stale of listSecretsSnapshots().slice(MAX_ENV_SNAPSHOTS)) {
+    try {
+      unlinkSync(join(SECRETS_HISTORY_DIR, stale));
+    } catch {
+      /* best effort prune */
+    }
+  }
+  return name;
+}
+
+function writeSecretsAtomic(obj) {
+  const tmp = SECRETS_PATH + ".tmp";
+  writeFileSync(tmp, JSON.stringify(obj, null, 2) + "\n");
+  renameSync(tmp, SECRETS_PATH);
+}
+
+// Validate an env name/value from the UI. Returns an error message or null.
+function validateEnvEntry(name, value) {
+  if (typeof name !== "string" || !/^[A-Z_][A-Z0-9_]*$/.test(name)) {
+    return "name must be uppercase letters, digits and underscores (e.g. OPENCODE_GO_KEY)";
+  }
+  if (typeof value !== "string") return "value must be a string";
+  if (value.length === 0) return "value is empty; use the remove action instead";
+  if (value.length > 8192) return "value is too long (max 8 KiB)";
+  if (isProtectedEnvName(name)) return `'${name}' is an authentication credential and cannot be changed from the UI`;
+  return null;
+}
+
+// Auth credentials are the identity that UNLOCKS the editor itself, so a wrong
+// write would lock the operator out with no UI path back. Blocked server-side,
+// not just hidden.
+function isProtectedEnvName(name) {
+  const names = [cfg && cfg.masterKeyEnv, cfg && cfg.uiPasswordEnv].filter(Boolean);
+  return names.includes(name);
+}
+
+// ID for the UI: names the live config references by env NAME, whether or not
+// they are currently set, so the operator can wire a key before it exists.
+function referencedEnvNames() {
+  const out = new Set();
+  if (!cfg) return out;
+  if (cfg.masterKeyEnv) out.add(cfg.masterKeyEnv);
+  if (cfg.uiPasswordEnv) out.add(cfg.uiPasswordEnv);
+  for (const b of cfg.backends || []) if (b.apiKeyEnv) out.add(b.apiKeyEnv);
+  return out;
+}
+
+// Names declared in the .env fallback file. Bounded by what the operator
+// actually wrote there, unlike the whole process environment.
+function dotenvNames() {
+  try {
+    return Object.keys(parseEnv(readFileSync(ENV_PATH, "utf8")));
+  } catch {
+    return [];
+  }
+}
+
+function envSource(name) {
+  if (SHELL_ENV_NAMES.has(name)) return "shell";
+  if (name in readSecrets()) return "secrets";
+  return "env";
+}
+
+// Apply the secrets file into process.env. Names the real shell owned at boot
+// are skipped: the platform (or operator shell) is the more specific authority
+// and the UI reports the shadowing via `source`.
+function applyRuntimeEnv() {
+  const secrets = readSecrets();
+  const applied = [];
+  for (const [name, value] of Object.entries(secrets)) {
+    if (typeof value !== "string") continue;
+    if (SHELL_ENV_NAMES.has(name)) continue;
+    if (process.env[name] !== value) {
+      process.env[name] = value;
+      applied.push(name);
+    }
+  }
+  return applied;
+}
+
+function loadSecrets() {
+  try {
+    applyRuntimeEnv();
+  } catch (e) {
+    console.error(`[${new Date().toISOString()}] secrets reload failed: ${e.message}`);
+  }
+}
+
+function readRawConfig() {
+  return JSON.parse(readFileSync(CONFIG_PATH, "utf8"));
+}
+
+function configRevision() {
+  try {
+    return statSync(CONFIG_PATH).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
+function listSnapshots() {
+  try {
+    return readdirSync(SNAPSHOT_DIR)
+      .filter((f) => f.endsWith(".json"))
+      .sort()
+      .reverse();
+  } catch {
+    return [];
+  }
+}
+
+function snapshotConfig() {
+  mkdirSync(SNAPSHOT_DIR, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const name = `${stamp}.json`;
+  try {
+    writeFileSync(join(SNAPSHOT_DIR, name), readFileSync(CONFIG_PATH, "utf8"));
+  } catch {
+    return null;
+  }
+  for (const stale of listSnapshots().slice(MAX_SNAPSHOTS)) {
+    try {
+      unlinkSync(join(SNAPSHOT_DIR, stale));
+    } catch {
+      /* best effort prune */
+    }
+  }
+  return name;
+}
+
+function writeConfigAtomic(obj) {
+  const tmp = CONFIG_PATH + ".tmp";
+  writeFileSync(tmp, JSON.stringify(obj, null, 2) + "\n");
+  renameSync(tmp, CONFIG_PATH);
+}
+
+// Env var NAMES that are currently set, so the editor can offer them in a
+// picker. Values are never returned.
+function envNames() {
+  return Object.keys(process.env).sort();
+}
+
+// Validate a candidate config. Returns { errors, warnings }; a non-empty
+// errors array means the save is refused and the file is left untouched.
+function validateConfig(candidate, current) {
+  const errors = [];
+  const warnings = [];
+  const err = (path, message) => errors.push({ path, message });
+  const warn = (path, message) => warnings.push({ path, message });
+
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+    err("", "config must be a JSON object");
+    return { errors, warnings };
+  }
+  for (const key of RESTART_ONLY_KEYS) {
+    if (key in candidate && current && candidate[key] !== current[key]) {
+      err(key, `'${key}' is set at startup and cannot be changed from the UI; edit the file and restart the router`);
+    }
+  }
+  for (const key of ["backends", "models", "presets"]) {
+    if (!(key in candidate)) err(key, `'${key}' is required at the top level`);
+  }
+  if (errors.length) return { errors, warnings };
+
+  // ---- backends ----
+  const backends = candidate.backends;
+  if (!Array.isArray(backends)) {
+    err("backends", "must be an array");
+  } else {
+    const seen = new Set();
+    backends.forEach((b, i) => {
+      const at = `backends[${i}]`;
+      if (!b || typeof b !== "object") return err(at, "must be an object");
+      if (!b.id) return err(at + ".id", "id is required");
+      if (seen.has(b.id)) err(at + ".id", `duplicate backend id '${b.id}'`);
+      seen.add(b.id);
+      if (!b.baseURL) err(at + ".baseURL", "baseURL is required");
+      if (!b.apiKeyEnv) {
+        err(at + ".apiKeyEnv", "apiKeyEnv is required (the NAME of an environment variable, not the key)");
+      } else if (!process.env[b.apiKeyEnv]) {
+        err(
+          at + ".apiKeyEnv",
+          `environment variable '${b.apiKeyEnv}' is not set in this process; add it to .env (or the container env) before wiring this backend, or the backend will fail closed`
+        );
+      }
+    });
+  }
+
+  // ---- models ----
+  const models = candidate.models;
+  const backendIds = new Set((Array.isArray(backends) ? backends : []).filter((b) => b && b.id).map((b) => b.id));
+  const backendById = new Map((Array.isArray(backends) ? backends : []).filter((b) => b && b.id).map((b) => [b.id, b]));
+  if (!models || typeof models !== "object" || Array.isArray(models)) {
+    err("models", "must be an object keyed by model id");
+  } else {
+    for (const [id, m] of Object.entries(models)) {
+      const at = `models.${id}`;
+      if (!m || typeof m !== "object") {
+        err(at, "must be an object");
+        continue;
+      }
+      const providers = Array.isArray(m.providers) ? m.providers : null;
+      if (!providers) {
+        err(at + ".providers", "must be an array of {backend, upstream}");
+        continue;
+      }
+      if (!providers.length) warn(at + ".providers", "no providers: this model routes nowhere and will 404");
+      providers.forEach((pr, i) => {
+        const pat = `${at}.providers[${i}]`;
+        if (!pr || typeof pr !== "object") return err(pat, "must be an object");
+        if (!pr.backend) return err(pat + ".backend", "backend is required");
+        if (!backendIds.has(pr.backend)) {
+          return err(pat + ".backend", `unknown backend '${pr.backend}'`);
+        }
+        const b = backendById.get(pr.backend);
+        if (!pr.upstream && !(b && b.model)) {
+          err(pat + ".upstream", `no upstream given and backend '${pr.backend}' has no default model`);
+        }
+      });
+      if (typeof m.affinityPool === "number" && m.affinityPool > providers.length) {
+        warn(at + ".affinityPool", `affinityPool ${m.affinityPool} exceeds ${providers.length} provider(s); it clamps at request time`);
+      }
+    }
+  }
+
+  // ---- presets ----
+  const presets = candidate.presets;
+  const modelIds = new Set(models && typeof models === "object" ? Object.keys(models) : []);
+  const presetIds = new Set(presets && typeof presets === "object" ? Object.keys(presets) : []);
+  if (!presets || typeof presets !== "object" || Array.isArray(presets)) {
+    err("presets", "must be an object keyed by preset id");
+  } else {
+    for (const [id, p] of Object.entries(presets)) {
+      const at = `presets.${id}`;
+      if (!p || typeof p !== "object") {
+        err(at, "must be an object");
+        continue;
+      }
+      if (p.strategy && !["affinity", "failover", "weighted"].includes(p.strategy)) {
+        warn(at + ".strategy", `unknown strategy '${p.strategy}'; the router falls back to affinity`);
+      }
+      if (modelIds.has(id)) warn(at, `id '${id}' is both a model and a preset; the preset wins in /v1/models`);
+      const list = Array.isArray(p.models) ? p.models : null;
+      if (!list) {
+        err(at + ".models", "must be an array of model or preset ids");
+        continue;
+      }
+      if (!list.length) warn(at + ".models", "empty: this preset has no valid models");
+      list.forEach((entry, i) => {
+        const ref = typeof entry === "string" ? entry : entry && entry.model;
+        const sat = `${at}.models[${i}]`;
+        if (typeof entry !== "string" && (!entry || typeof entry !== "object")) return err(sat, "must be a string or {model, weight}");
+        if (!ref) return err(sat, "model id is required");
+        if (!modelIds.has(ref) && !presetIds.has(ref)) {
+          err(sat, `unknown model or preset '${ref}'`);
+        }
+        if (!modelIds.has(ref) && presetIds.has(ref) && ref === id) {
+          err(sat, `preset '${id}' references itself`);
+        }
+      });
+    }
+  }
+
+  // ---- settings blocks ----
+  const mc = candidate.missCapture;
+  if (mc && typeof mc === "object" && typeof mc.file === "string") {
+    if (mc.file.includes("/") || mc.file.includes("\\") || mc.file.includes("..")) {
+      err("missCapture.file", "must be a bare filename in the config directory (no path separators or '..')");
+    }
+  }
+
+  const known = new Set([
+    "port", "prefix", "host", "masterKeyEnv", "uiPasswordEnv", "backends", "models", "presets",
+    "params", "backoff", "pricing", "missCapture", "alerts", "analytics", "relay",
+  ]);
+  for (const key of Object.keys(candidate)) {
+    if (!known.has(key)) warn(key, "unrecognized top-level key; the router ignores it");
+  }
+
+  return { errors, warnings };
 }
 
 function mask(key) {
@@ -2302,6 +2662,27 @@ async function relay(res, upstreamRes, stream, backendId, started, callId, idleT
   return { ttftMs, cacheHit, cacheHitPct, promptCacheHitTokens, promptCacheMissTokens, promptTokens, completionTokens, reasoningTokens, genMs, preview, relayError };
 }
 
+// Read and JSON-parse a request body. Returns { value } or { error } (a
+// newError-shaped object ready for writeError) so each route stays short.
+async function readJsonBody(req, limitBytes = 4 * 1024 * 1024) {
+  const chunks = [];
+  let size = 0;
+  for await (const c of req) {
+    size += c.length;
+    if (size > limitBytes) {
+      return { error: newError(413, JSON.stringify({ error: { message: "request body too large", type: "invalid_request_error" } })) };
+    }
+    chunks.push(c);
+  }
+  const text = Buffer.concat(chunks).toString("utf8");
+  if (!text.trim()) return { value: {} };
+  try {
+    return { value: JSON.parse(text) };
+  } catch (e) {
+    return { error: newError(400, JSON.stringify({ error: { message: `invalid JSON body: ${e.message}`, type: "invalid_request_error" } })) };
+  }
+}
+
 function writeError(res, e) {
   const status = e.status || 500;
   let buf;
@@ -2432,7 +2813,13 @@ function recordLoginAttempt(ip) {
 }
 
 // ---- inbound gate -----------------------------------------------------------
-// Gated paths: `/v1/chat/completions`, `/admin/*`, `/api/keys`. `masterKeyEnv`
+// Gated paths: `/v1/chat/completions`, `/admin/*`, `/api/keys`, `/api/config/*`.
+// NOTE: `GET /api/config` (the plain read-only view) shares the `/api/config`
+// prefix and is therefore gated too. That is a deliberate consequence of using
+// a prefix match here: the viewer endpoint is read-only and harmless, and
+// keeping one simple rule beats a special case that later routes can slip
+// past. The dashboard's own config viewer already sends auth when a master key
+// is configured, so the UI is unaffected. `masterKeyEnv`
 // names an env var whose value the client must echo as `Authorization: Bearer
 // <v>` (scheme matched case-insensitively); chat additionally accepts valid
 // issued keys. Both config keys are read from the LIVE cfg object at request
@@ -2449,7 +2836,7 @@ function requireAuth(cfg, req) {
   const url = req.url.split("?")[0];
   const p = (cfg.prefix || "/v1").replace(/\/$/, "");
   const isChat = url === p + "/chat/completions";
-  if (!isChat && !url.startsWith("/admin") && !url.startsWith("/api/keys")) return null;
+  if (!isChat && !url.startsWith("/admin") && !url.startsWith("/api/config") && !url.startsWith("/api/keys") && !url.startsWith("/api/env")) return null;
   const expected = process.env[name];
   const unauthorized = newError(401, JSON.stringify({ error: { message: "authentication required", type: "authentication_error" } }));
   if (!expected) {
@@ -2609,6 +2996,253 @@ function server() {
       // Safe: cfg.backends carry apiKeyEnv NAMES, never resolved key values.
       res.writeHead(200, { "content-type": "application/json" });
       return res.end(JSON.stringify(cfg));
+    }
+
+    // ---- config editing (raw read / save / restore) ------------------------
+    // The editor's read path is deliberately NOT /api/config: that serves the
+    // normalized config, which drops top-level keys normalization does not
+    // model (pricing, missCapture, alerts). See the block above loadConfig.
+
+    if (req.method === "GET" && url === "/api/config/raw") {
+      let raw;
+      try {
+        raw = readRawConfig();
+      } catch (e) {
+        return writeError(res, newError(500, JSON.stringify({ error: { message: `config file is not valid JSON: ${e.message}`, type: "router_error" } })));
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(
+        JSON.stringify({
+          config: raw,
+          revision: configRevision(),
+          snapshots: listSnapshots(),
+          envNames: envNames(),
+        })
+      );
+    }
+
+    if (req.method === "POST" && url === "/api/config") {
+      const body = await readJsonBody(req);
+      if (body.error) return writeError(res, body.error);
+      const input = body.value || {};
+      const candidate = input.config;
+      const dryRun = input.dryRun === true;
+
+      let current;
+      try {
+        current = readRawConfig();
+      } catch (e) {
+        return writeError(res, newError(500, JSON.stringify({ error: { message: `cannot read the current config: ${e.message}`, type: "router_error" } })));
+      }
+
+      const verdict = validateConfig(candidate, current);
+      if (verdict.errors.length) {
+        res.writeHead(400, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ ok: false, errors: verdict.errors, warnings: verdict.warnings }));
+      }
+
+      // Lost-update guard: the browser tells us which revision it edited. If
+      // the file moved underneath it (another tab, or a hand edit in an
+      // editor), refuse rather than silently clobbering, unless forced.
+      const base = input.baseRevision;
+      const currentRevision = configRevision();
+      if (!dryRun && base != null && Number(base) !== currentRevision && input.force !== true) {
+        res.writeHead(409, { "content-type": "application/json" });
+        return res.end(
+          JSON.stringify({
+            ok: false,
+            error: {
+              message: "the config file changed on disk since this page loaded it",
+              type: "conflict",
+            },
+            warnings: verdict.warnings,
+            current,
+            revision: currentRevision,
+          })
+        );
+      }
+
+      if (dryRun) {
+        res.writeHead(200, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ ok: true, dryRun: true, warnings: verdict.warnings, revision: currentRevision }));
+      }
+
+      const snapshot = snapshotConfig();
+      try {
+        writeConfigAtomic(candidate);
+      } catch (e) {
+        return writeError(res, newError(500, JSON.stringify({ error: { message: `failed to write config: ${e.message}`, type: "router_error" } })));
+      }
+      for (const w of verdict.warnings) {
+        console.warn(`[${new Date().toISOString()}] config save warning: ${w.path}: ${w.message}`);
+      }
+      console.error(`[${new Date().toISOString()}] config saved via web UI (snapshot ${snapshot || "unavailable"})`);
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ ok: true, warnings: verdict.warnings, snapshot, revision: configRevision() }));
+    }
+
+    if (req.method === "POST" && url === "/api/config/reset") {
+      const body = await readJsonBody(req);
+      if (body.error) return writeError(res, body.error);
+      const input = body.value || {};
+      const name = String(input.snapshot || "");
+      const bad = newError(400, JSON.stringify({ error: { message: "invalid snapshot name", type: "invalid_request_error" } }));
+      if (!name || !/^[A-Za-z0-9._-]+\.json$/.test(name) || name.includes("..")) return writeError(res, bad);
+      const available = listSnapshots();
+      if (!available.includes(name)) {
+        return writeError(res, newError(404, JSON.stringify({ error: { message: `snapshot '${name}' not found`, type: "not_found" } })));
+      }
+      let restored;
+      try {
+        restored = JSON.parse(readFileSync(join(SNAPSHOT_DIR, name), "utf8"));
+      } catch (e) {
+        return writeError(res, newError(500, JSON.stringify({ error: { message: `snapshot is unreadable: ${e.message}`, type: "router_error" } })));
+      }
+      const verdict = validateConfig(restored, restored);
+      if (verdict.errors.length) {
+        res.writeHead(400, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ ok: false, errors: verdict.errors, warnings: verdict.warnings }));
+      }
+      // Snapshot the state being replaced so a restore is itself undoable.
+      const safety = snapshotConfig();
+      try {
+        writeConfigAtomic(restored);
+      } catch (e) {
+        return writeError(res, newError(500, JSON.stringify({ error: { message: `failed to restore: ${e.message}`, type: "router_error" } })));
+      }
+      console.error(`[${new Date().toISOString()}] config restored from snapshot ${name} (previous state saved as ${safety || "unavailable"})`);
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ ok: true, restored: name, warnings: verdict.warnings, revision: configRevision() }));
+    }
+
+    // ---- env editor (managed secrets store) -----------------------------------
+    // The list endpoint carries NAMES and state only. The value exists in
+    // exactly one place: the reveal call, made deliberately per var.
+
+    if (req.method === "GET" && url === "/api/env") {
+      const secrets = readSecrets();
+      // Only variables the router actually cares about, not the whole process
+      // environment: listing every inherited shell var (PATH, ComSpec, ...)
+      // would bury the handful that matter and surface unrelated secrets from
+      // the operator's shell. A shell/`.env` name appears only when the config
+      // references it, plus anything already in the managed store.
+      const names = new Set([...referencedEnvNames(), ...Object.keys(secrets), ...dotenvNames()]);
+      const vars = [...names].sort().map((name) => {
+        const source = envSource(name);
+        const secretValue = secrets[name];
+        const current = process.env[name];
+        return {
+          name,
+          set: current != null && current !== "",
+          editable: !isProtectedEnvName(name),
+          reloadable: !STARTUP_ONLY_VARS.has(name),
+          source,
+          live: source === "shell" ? true : secretValue === undefined ? true : secretValue === current,
+        };
+      });
+      const restartRequired = vars.some((v) => !v.live && !STARTUP_ONLY_VARS.has(v.name));
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ vars, restartRequired, revision: secretsRevision() }));
+    }
+
+    if (req.method === "POST" && url === "/api/env/reveal") {
+      const body = await readJsonBody(req);
+      if (body.error) return writeError(res, body.error);
+      const name = body.value && body.value.name;
+      if (typeof name !== "string" || !/^[A-Z_][A-Z0-9_]*$/.test(name)) {
+        return writeError(res, newError(400, JSON.stringify({ error: { message: "invalid env name", type: "invalid_request_error" } })));
+      }
+      const value = process.env[name];
+      // Auth credentials are readable only as "set: true" from the list. The
+      // dashboard session is gated by uiPasswordEnv, but masterKeyEnv is a
+      // wider-scope machine credential (dsh/OpenCode hold it), so revealing it
+      // to any session holder would escalate past what the UI needs.
+      if (isProtectedEnvName(name)) {
+        res.writeHead(400, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ ok: false, error: { message: `${name} is an authentication credential and is never revealed`, type: "invalid_request_error" } }));
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ name, value: value == null ? null : value }));
+    }
+
+    if (req.method === "POST" && url === "/api/env") {
+      const body = await readJsonBody(req);
+      if (body.error) return writeError(res, body.error);
+      const input = body.value || {};
+      const name = input.name;
+      const value = input.value;
+      const problem = validateEnvEntry(name, value);
+      if (problem) {
+        res.writeHead(400, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ ok: false, error: { message: problem, type: "invalid_request_error" } }));
+      }
+
+      const secrets = readSecrets();
+      const base = input.baseRevision;
+      const currentRevision = secretsRevision();
+      if (base != null && Number(base) !== currentRevision && input.force !== true) {
+        res.writeHead(409, { "content-type": "application/json" });
+        return res.end(
+          JSON.stringify({
+            ok: false,
+            error: { message: "the secrets file changed on disk since this page loaded it", type: "conflict" },
+            revision: currentRevision,
+          })
+        );
+      }
+
+      const action = name in secrets ? "updated" : "added";
+      const snapshot = snapshotSecrets();
+      secrets[name] = value;
+      try {
+        writeSecretsAtomic(secrets);
+      } catch (e) {
+        return writeError(res, newError(500, JSON.stringify({ error: { message: `failed to write secrets store: ${e.message}`, type: "router_error" } })));
+      }
+      // The file watcher also fires for our own write; the direct call makes
+      // the response's applied/live claims true without depending on event
+      // timing.
+      const applied = applyRuntimeEnv().includes(name);
+      const live = process.env[name] === value;
+      console.error(`[${new Date().toISOString()}] env var '${name}' ${action} via web UI (snapshot ${snapshot || "unavailable"})`);
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ ok: true, name, action, applied, live, snapshot, revision: secretsRevision() }));
+    }
+
+    if (req.method === "DELETE" && url === "/api/env") {
+      const name = (req.url.split("?")[1] || "").match(/name=([A-Z_][A-Z0-9_]*)/);
+      if (!name) {
+        return writeError(res, newError(400, JSON.stringify({ error: { message: "missing or invalid name parameter", type: "invalid_request_error" } })));
+      }
+      const nameStr = name[1];
+      if (isProtectedEnvName(nameStr)) {
+        return writeError(res, newError(400, JSON.stringify({ error: { message: `'${nameStr}' is an authentication credential and cannot be changed from the UI`, type: "invalid_request_error" } })));
+      }
+      const secrets = readSecrets();
+      if (!(nameStr in secrets)) {
+        return writeError(
+          res,
+          newError(
+            409,
+            JSON.stringify({
+              error: {
+                message: `'${nameStr}' is not managed by the editor (source: ${envSource(nameStr)}); edit .env or the platform env instead`,
+                type: "conflict",
+              },
+            })
+          )
+        );
+      }
+      const snapshot = snapshotSecrets();
+      delete secrets[nameStr];
+      try {
+        writeSecretsAtomic(secrets);
+      } catch (e) {
+        return writeError(res, newError(500, JSON.stringify({ error: { message: `failed to write secrets store: ${e.message}`, type: "router_error" } })));
+      }
+      console.error(`[${new Date().toISOString()}] env var '${nameStr}' removed via web UI (snapshot ${snapshot || "unavailable"})`);
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ ok: true, name: nameStr, action: "removed" }));
     }
 
     if (req.method === "POST" && url === "/admin/backend") {
@@ -2772,12 +3406,34 @@ function server() {
 // ---- startup ---------------------------------------------------------------
 
 async function main() {
+  for (const k of Object.keys(process.env)) SHELL_ENV_NAMES.add(k);
   loadEnv();
+  loadSecrets();
   await loadConfig();
   seedAnalytics(historyPath);
   watchF(CONFIG_PATH, () => {
     loadConfig().catch((e) => console.error("config reload failed:", e.message));
   });
+  // The managed secrets store hot-reloads like the config: a UI write (or a
+  // hand edit) reaches process.env in ~300ms. Idempotent by design: editors
+  // can fire several change events per save. fs.watch needs the file to exist,
+  // so a fresh install gets an empty store rather than a dead watcher.
+  try {
+    if (!statSync(SECRETS_PATH).isFile()) throw new Error("not a file");
+  } catch {
+    try {
+      writeSecretsAtomic({});
+    } catch (e) {
+      console.error(`[${new Date().toISOString()}] secrets store not writable: ${e.message}`);
+    }
+  }
+  try {
+    watchF(SECRETS_PATH, () => {
+      loadSecrets();
+    });
+  } catch (e) {
+    console.error(`[${new Date().toISOString()}] secrets watcher unavailable: ${e.message}`);
+  }
 
   // Always listen on localhost (existing consumers: OpenCode, dsh, local UI).
   // When cfg.host is set (e.g. a Tailscale IP to expose the router on the
