@@ -84,7 +84,8 @@ Precedence, highest first: **real shell env > secrets.json > .env**.
 - `live`: the running `process.env` value equals what this layer would serve.
   False only when a watcher reload failed or a shell shadows the file; the UI
   shows a restart/stale warning only for these, not as a blanket rule.
-- `editable`: false for protected names.
+- `editable`: false for protected names and for names the real process env
+  owns (`source: "shell"`).
 - `reloadable`: false for startup-only names (`ROUTER_CONFIG`, `ROUTER_ENV`,
   `ROUTER_HISTORY`, `ROUTER_KEYS_FILE`, `NODE_OPTIONS`). Still writable (the
   file is the next boot's truth); flagged so the UI can say "applies on next

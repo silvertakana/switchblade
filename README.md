@@ -241,10 +241,13 @@ The managed store also hot-reloads via `fs.watch`, so a value saved in the UI
 reaches the running process without a restart.
 
 `.env` is read once at startup and is the bootstrapping fallback: it wins for
-nothing that a higher layer defines. A variable the real environment owns is
-never overridden by the store, and the UI labels it `shell` so the shadowing is
-visible rather than silent. `GET /api/env` reports `source` and `live` per
-variable for exactly this reason.
+nothing that a higher layer defines, and it stays editable in the env editor:
+saving a new value for a `.env`-declared name moves it into the managed store,
+which outranks the file. A variable the real environment owns is never
+overridden by the store, and the UI labels it `shell` so the shadowing is
+visible rather than silent; such a name is reported `editable: false` and a
+write to it is refused (400) with the owner named. `GET /api/env` reports
+`source` and `live` per variable for exactly this reason.
 
 ### Backward compatibility
 
@@ -271,8 +274,8 @@ three-layer shape at load, byte-identically for identical effective configs.
 | POST | `/api/keys` | `{name}` -> issues a chat-only key, raw value returned once; master key required |
 | DELETE | `/api/keys?id=<id>` | revokes an issued key; master key required |
 | GET | `/api/env` | env var NAMES with `set`/`editable`/`reloadable`/`source`/`live`; never values; admin required |
-| POST | `/api/env` | `{name, value, baseRevision}` -> writes the managed secrets store; 409 on a stale revision; admin required |
-| POST | `/api/env/reveal` | `{name}` -> `{name, value}` for ONE variable; admin required |
+| POST | `/api/env` | `{name, value, baseRevision}` -> writes the managed secrets store; 400 for protected or shell-owned names; 409 on a stale revision; admin required |
+| POST | `/api/env/reveal` | `{name}` -> `{name, value}` for ONE variable; 400 for protected auth names and for names outside the editor's set (config-referenced, managed, or `.env`-declared); admin required |
 | DELETE | `/api/env?name=X` | removes a managed variable; 409 for `.env`/shell-sourced names; admin required |
 | POST | `/admin/reset-health` | reset all cooling states |
 | POST | `/admin/backend` | `{id, action: "cool"\|"uncool", forMs?}` manual cool/uncool |
@@ -298,7 +301,10 @@ History lives in an in-memory ring buffer (500 entries) and appends to
   live in a managed `secrets.json` (gitignored, snapshotted to `secrets.history/`;
   override the path with `ROUTER_SECRETS`). The list endpoint serves NAMES and
   state only; a value is returned solely by the explicit per-variable reveal
-  call. `masterKeyEnv` and `uiPasswordEnv` are rejected on write server-side,
+  call, which is scoped to the same set the list serves (config-referenced
+  names, the managed store, and `.env`-declared names) so it cannot be used to
+  read arbitrary process variables. `masterKeyEnv` and `uiPasswordEnv` are
+  rejected on write server-side,
   because they are the credentials that unlock the editor itself, and they are
   also refused by reveal: the dashboard session is gated by `uiPasswordEnv`,
   while the master key is a wider-scope machine credential, so exposing it would
@@ -361,7 +367,7 @@ restarts; the contract is in DESIGN-3LAYER.md section 14.
 npm test   # node test.mjs
 ```
 
-The suite (349 assertions) spins up mock backends plus router instances on temp
+The suite (357 assertions) spins up mock backends plus router instances on temp
 configs — no keys, no network. It covers health, streaming, session affinity,
 failover, weighted selection, sticky/timed manual cools, fallback exclusion,
 dialect handling, synthesis from both legacy eras, the layered-params merge

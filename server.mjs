@@ -160,6 +160,9 @@ function validateEnvEntry(name, value) {
   if (value.length === 0) return "value is empty; use the remove action instead";
   if (value.length > 8192) return "value is too long (max 8 KiB)";
   if (isProtectedEnvName(name)) return `'${name}' is an authentication credential and cannot be changed from the UI`;
+  if (SHELL_ENV_NAMES.has(name)) {
+    return `'${name}' is set by the platform or shell environment and is not managed here; change it at the source (for example the Coolify application env vars or .env) instead`;
+  }
   return null;
 }
 
@@ -3134,7 +3137,7 @@ function server() {
         return {
           name,
           set: current != null && current !== "",
-          editable: !isProtectedEnvName(name),
+          editable: !isProtectedEnvName(name) && source !== "shell",
           reloadable: !STARTUP_ONLY_VARS.has(name),
           source,
           live: source === "shell" ? true : secretValue === undefined ? true : secretValue === current,
@@ -3151,6 +3154,13 @@ function server() {
       const name = body.value && body.value.name;
       if (typeof name !== "string" || !/^[A-Z_][A-Z0-9_]*$/.test(name)) {
         return writeError(res, newError(400, JSON.stringify({ error: { message: "invalid env name", type: "invalid_request_error" } })));
+      }
+      // Same scope the list serves: without this gate any name in the process
+      // environment (PATH, ComSpec, ...) could be read one call at a time.
+      const known = new Set([...referencedEnvNames(), ...Object.keys(readSecrets()), ...dotenvNames()]);
+      if (!known.has(name)) {
+        res.writeHead(400, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ ok: false, error: { message: `${name} is not managed by the env editor; only config-referenced, managed, and .env-declared variables can be revealed`, type: "invalid_request_error" } }));
       }
       const value = process.env[name];
       // Auth credentials are readable only as "set: true" from the list. The

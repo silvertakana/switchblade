@@ -1267,7 +1267,7 @@
           <span class="ico" data-icon="key"></span>
           <div>
             <h3>Environment</h3>
-            <div class="desc">Where each name comes from, and whether the running process has it yet. <b>managed</b> values live in the secrets store and are editable here; <b>shell</b> and <b>.env</b> values are owned outside this editor and must be changed there.</div>
+            <div class="desc">Where each name comes from, and whether the running process has it yet. <b>managed</b> values live in the secrets store and are editable here; a <b>shell</b> value is owned by the platform and is read-only; saving a new value for a <b>.env</b> name takes it over by moving it into the managed store, which outranks the file.</div>
           </div>
           <span class="count" id="cfgCountEnv">-</span>
         </div>

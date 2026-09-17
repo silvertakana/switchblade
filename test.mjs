@@ -3594,6 +3594,17 @@ async function main() {
       assert(revSE4b.status === 400, "zSE4e) revealing the uiPasswordEnv name -> 400 (got " + revSE4b.status + ")");
       // A non-protected name still reveals, so the refusal is targeted.
       assert((await reveal("SE_NEW")).value === "new-value-1", "zSE4f) an ordinary name still reveals after the protected refusal");
+      // The reveal call is scoped to the same known set the list serves, so a
+      // name that is only ambient process noise cannot be read out of band.
+      const revSE4c = await fetch(baseSE + "/api/env/reveal", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer master-secret" },
+        body: JSON.stringify({ name: "PATH" }),
+      });
+      assert(revSE4c.status === 400, "zSE4g) revealing an out-of-scope ambient name (PATH) -> 400 (got " + revSE4c.status + ")");
+      assert((await revSE4c.json()).value === undefined, "zSE4h) the refused out-of-scope reveal carries no value");
+      // The scope refusal is targeted: config-referenced names still reveal.
+      assert((await reveal("KEY_SE_A")).value === "secrets-value-a", "zSE4i) a config-referenced name still reveals after the scope guard");
 
       // SE5) a second write merges rather than replaces
       const rSE5 = await postEnv({ name: "SE_SECOND", value: "new-value-2", force: true });
@@ -3655,6 +3666,10 @@ async function main() {
       // The list is scoped to config-referenced + secrets + .env names, so
       // ambient shell noise must NOT appear.
       assert(!findVar(bSE10, "PATH") && !findVar(bSE10, "COMPUTERNAME"), "zSE10d) unrelated ambient shell vars are not listed");
+      // ROUTER_HISTORY is declared only in .env here: it stays editable, since
+      // saving it moves the name into the store, which outranks the file.
+      const histEditSE10 = findVar(bSE10, "ROUTER_HISTORY");
+      assert(!!histEditSE10 && histEditSE10.editable === true, "zSE10e) an .env-declared name stays editable (a save takes it over into the store)");
     } finally {
       childSE.kill();
       await rm(dirSE, { recursive: true, force: true });
@@ -3701,6 +3716,17 @@ async function main() {
       const otherP = (bP.vars || []).find((v) => v.name === "SE_OTHER");
       assert(!!otherP && otherP.source === "secrets" && otherP.live === true, "zSE11c) a secrets-only name still applies when the shell does not own it");
       assert((await (await apiSE(baseP, "/api/env/reveal", { body: { name: "SE_OTHER" } })).json()).value === "other-secret-p", "zSE11d) the secrets-only value reached process.env");
+      // A shell-owned name is display-only in the editor: editable:false, and a
+      // write is refused with 400 because the store entry would be silently
+      // ignored by applyRuntimeEnv anyway.
+      assert(varP.editable === false, "zSE11e) the shell-owned name reports editable:false");
+      const beforePE = await readFile(secretsPathP, "utf8");
+      const rPostP = await apiSE(baseP, "/api/env", { body: { name: "KEY_SE_P", value: "hijack-from-ui" } });
+      const bPostP = await rPostP.json();
+      assert(rPostP.status === 400 && JSON.stringify(bPostP).includes("KEY_SE_P") && /platform or shell environment/.test(JSON.stringify(bPostP)), "zSE11f) writing the shell-owned name -> 400 naming the owner");
+      assert((await readFile(secretsPathP, "utf8")) === beforePE, "zSE11g) the rejected shell-owned write left the secrets file byte-identical");
+      const otherEditP = (bP.vars || []).find((v) => v.name === "SE_OTHER");
+      assert(!!otherEditP && otherEditP.editable === true, "zSE11h) a secrets-owned name stays editable");
     } finally {
       childP.kill();
       await rm(dirP, { recursive: true, force: true });

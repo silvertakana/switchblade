@@ -41,7 +41,7 @@ Strategies (preset level): **affinity** (default, session-sticky spreading), **f
 | File | Role |
 |---|---|
 | `server.mjs` | The whole router (~1660 lines). Starts only when run as a script; exports the internals used by tests. |
-| `test.mjs` | Mock test suite — **349 passing assertions**. Spawns real `server.mjs` children on temp configs against in-process mock backends. No keys, no network. |
+| `test.mjs` | Mock test suite — **357 passing assertions**. Spawns real `server.mjs` children on temp configs against in-process mock backends. No keys, no network. |
 | `config.json` | MIRROR of the live homelab config (`/app/config.server.json`) for local dev and reference; **hot-reloads via `fs.watch` (~300 ms)** — no restart for schema/backend/model/preset/backoff changes. Validate JSON before saving. Editing it is not a deploy: provider/config changes are made on the homelab over SSH. |
 | `.env` | API keys (gitignored). Read once at startup; a restart is needed after edits. Never commit. Superseded per-name by the managed `secrets.json` (see Env editor). |
 | `.env.example` | Placeholder key names (`KEY=` only — CI fails if any example has a value). |
@@ -77,21 +77,21 @@ No build step exists. No lint or format tooling is configured (zero-dependency m
   node -e "JSON.parse(require('fs').readFileSync('config.json','utf8'))"
   ```
 - **`.env` changes**: keys are read once at startup, not at request time; a restart is needed after edits. Keys are referenced from config by NAME only (`apiKeyEnv`); values live in `.env`.
-- **Env editor (Config tab)**: `GET/POST/DELETE /api/env` plus `/api/env/reveal` manage credential env vars in a hot-reloading `secrets.json` (`ROUTER_SECRETS`), snapshotted to `secrets.history/` before every write. Precedence at boot and at reload: real shell env > `secrets.json` > `.env`; a name the real environment owns is never overridden and is reported as `source: "shell"`. The list endpoint serves NAMES and state only, a value comes back solely from the per-name reveal call, and `masterKeyEnv`/`uiPasswordEnv` are refused on write server-side (they are the credentials that unlock the editor) and also refused by reveal (400): the dashboard session is gated by `uiPasswordEnv`, while the master key is a wider-scope machine credential, so revealing it would let a dashboard password escalate to the machine credential. Names in `STARTUP_ONLY_VARS` are writable but report `reloadable: false`.
+- **Env editor (Config tab)**: `GET/POST/DELETE /api/env` plus `/api/env/reveal` manage credential env vars in a hot-reloading `secrets.json` (`ROUTER_SECRETS`), snapshotted to `secrets.history/` before every write. Precedence at boot and at reload: real shell env > `secrets.json` > `.env`; a name the real environment owns is never overridden: it is reported as `source: "shell"`, reported `editable: false`, and refused on write (400) with an error naming the platform/shell as the owner, because a store entry for it would be silently ignored. A `.env`-declared name stays editable: saving it writes the value into the managed store, which outranks `.env`. The list endpoint serves NAMES and state only, a value comes back solely from the per-name reveal call, and `masterKeyEnv`/`uiPasswordEnv` are refused on write server-side (they are the credentials that unlock the editor) and also refused by reveal (400): the dashboard session is gated by `uiPasswordEnv`, while the master key is a wider-scope machine credential, so revealing it would let a dashboard password escalate to the machine credential. Names in `STARTUP_ONLY_VARS` are writable but report `reloadable: false`.
 - **Config reload is non-destructive to health state** (health is keyed by backend id and survives reloads). Manual cools survive reloads too.
 - **Legacy configs keep working**: `normalizeConfig(cfg)` auto-synthesizes both pre-three-layer eras at every load. Old `models[id] = {backends, affinityPool}` and presets-with-`members` shapes normalize to the three-layer form byte-identically for identical effective configs.
 
 ## Testing Instructions
 
 ```bash
-npm test                    # node test.mjs -> expect "349 passed, 0 failed"
+npm test                    # node test.mjs -> expect "357 passed, 0 failed"
 node --check server.mjs     # syntax check (CI also checks test.mjs)
 ```
 
 - The suite **spins up mock backends plus router instances on temp configs — no real keys, no network**. Safe to run anytime, even while the production router is live on 8787 (test children bind port 0).
 - Coverage: health, non-stream + SSE streaming, session affinity, failover/weighted selection, sticky + timed manual cools, fallback exclusion, dialect handling (dropParams/paramMap/developer-role), synthesis from both legacy eras, layered-params merge order and precedence, preset-of-presets nesting (expansion, cycles, ordering), per-model retry/backoff budgets, cache tri-state, history `routedModel`, timeout failover, reasoning-key relay (`reasoning`/`reasoning_content`).
 - **Every behavior change ships with a test in `test.mjs`** (project rule, README Contributing). The legacy (`y*`) and three-layer (`z*`) blocks import `server.mjs` internals; integration blocks spawn the real server as a child.
-- Known environment quirk: the child-port banner capture can transiently crash with `TypeError: fetch failed ... bad port` (observed once 2026-08-22); a plain re-run passes 349/349. Do not treat a single crash as a regression — re-run first.
+- Known environment quirk: the child-port banner capture can transiently crash with `TypeError: fetch failed ... bad port` (observed once 2026-08-22); a plain re-run passes 357/357. Do not treat a single crash as a regression — re-run first.
 - Known hygiene quirk: the suite leaks its `lmr-test-*` temp dir behind each run (a child can still hold the directory when cleanup runs on Windows); they are tiny (tens of KB) and accumulate in `%TEMP%`. Cosmetic, not a failure.
 
 ## Config Contract (load-bearing — read `DESIGN-3LAYER.md` before touching)
@@ -125,8 +125,8 @@ Known bug (do not "fix" casually): weekly-limit cooling parses `Resets in N days
 | POST | `/api/keys` | `{name}` -> issues a chat-only key, raw value returned once; master key required |
 | DELETE | `/api/keys?id=<id>` | revokes an issued key; master key required |
 | GET | `/api/env` | env var NAMES with `set`/`editable`/`reloadable`/`source`/`live`; never values; admin required |
-| POST | `/api/env` | `{name, value, baseRevision}` -> writes the managed secrets store (`ROUTER_SECRETS`); 409 on a stale revision; admin required |
-| POST | `/api/env/reveal` | `{name}` -> `{name, value}` for ONE variable; 400 for `masterKeyEnv`/`uiPasswordEnv` (auth credentials are never revealed); admin required |
+| POST | `/api/env` | `{name, value, baseRevision}` -> writes the managed secrets store (`ROUTER_SECRETS`); 400 for protected or shell-owned names; 409 on a stale revision; admin required |
+| POST | `/api/env/reveal` | `{name}` -> `{name, value}` for ONE variable; 400 for `masterKeyEnv`/`uiPasswordEnv` (auth credentials are never revealed) and for any name outside the editor's known set (config-referenced, managed, or `.env`-declared); admin required |
 | DELETE | `/api/env?name=X` | removes a managed variable; 409 for `.env`/shell-sourced names; admin required |
 | POST | `/admin/reset-health` | reset all cooling states, including manual |
 | POST | `/admin/backend` | `{id, action: "cool"\|"uncool", forMs?}` manual cool/uncool |
@@ -184,15 +184,15 @@ No build step — `server.mjs` runs directly on the system Node (22+/25).
 - Do not commit `router-history.jsonl` (request payloads) or `*.log`.
 - Keep `.env.example` placeholder-only: `KEY=` with no value (CI enforces this).
 - Dashboard auth: `uiPasswordEnv` names the env var holding the UI password (`LMR_UI_PASSWORD`); unset keeps the UI open. Login is throttled (5 attempts / 10s per IP); the session cookie is `HttpOnly` + `SameSite=Strict`.
-- `masterKeyEnv` gates `POST /v1/chat/completions`, `/admin/*`, and `/api/keys`; it fails closed if the named env var is empty. Issued keys are chat-only — they never unlock `/admin/*` (admin stays master-key-only).
+- `masterKeyEnv` gates `POST /v1/chat/completions`, `/admin/*`, `/api/config*`, `/api/keys`, and `/api/env*`; it fails closed if the named env var is empty. Issued keys are chat-only — they never unlock `/admin/*` (admin stays master-key-only).
 - `api-keys.json` (issued-key store, SHA-256 hashes only) and `*.json.tmp` (atomic-write temp files) are gitignored.
-- The env editor's `secrets.json` holds key VALUES: gitignored, never echoed by `GET /api/env` (the list serves names and state only), reachable only one name at a time via `/api/env/reveal`, which is admin-gated like the rest of `/api/env*`. Reveal additionally refuses the protected auth names (`masterKeyEnv`, `uiPasswordEnv`), and `GET /api/env` is SCOPED to config-referenced names plus the managed store plus `.env`-declared names: it never walks the inherited process environment, which would list hundreds of unrelated system variables and operator secrets. `secrets.history/` is gitignored for the same reason. `/api/env` is in the same fail-closed auth gate as `/api/config*` and `/api/keys`.
-- Read-only endpoints (`/health`, `/v1/models`, `/api/stats`, `/api/history`, `/api/config`, `/api/auth/*`, `/`) stay open.
+- The env editor's `secrets.json` holds key VALUES: gitignored, never echoed by `GET /api/env` (the list serves names and state only), reachable only one name at a time via `/api/env/reveal`, which is admin-gated like the rest of `/api/env*`. Reveal additionally refuses the protected auth names (`masterKeyEnv`, `uiPasswordEnv`) and is scoped to the same set the list serves (config-referenced names, the managed store, and `.env`-declared names), so it cannot be used to read arbitrary process variables such as `PATH`; `GET /api/env` itself is SCOPED to that set and never walks the inherited process environment, which would list hundreds of unrelated system variables and operator secrets. `secrets.history/` is gitignored for the same reason. `/api/env` is in the same fail-closed auth gate as `/api/config*` and `/api/keys`.
+- Read-only endpoints (`/health`, `/v1/models`, `/api/stats`, `/api/history`, `/api/auth/*`, `/`) stay open. `/api/config` is NOT open: the config editor added the whole `/api/config` prefix to the auth gate (it must cover the config WRITES), so even reading the config now needs a dashboard session or the master key. Plain `curl` of `/api/config` returns 401 `authentication required`; the old "stays open" assumption is gone.
 
 ## Pull Request Guidelines
 
 - **Commit messages**: Conventional Commits — `feat:`, `fix:`, `refactor:`, `perf:` (see `git log`). One logical change per commit.
-- **Before pushing**: `node test.mjs` must pass 349/349 and `node --check server.mjs` must pass. CI re-checks on Node 22/24/25 plus secret scan.
+- **Before pushing**: `node test.mjs` must pass 357/357 and `node --check server.mjs` must pass. CI re-checks on Node 22/24/25 plus secret scan.
 - **Project rules (README Contributing)**: keep it zero-dependency (no new npm packages without a strong reason); every behavior change ships with a test in `test.mjs`; the config contract and its synthesis paths are load-bearing — change them only with a documented design note (update `DESIGN-3LAYER.md`).
 
 ## Troubleshooting
