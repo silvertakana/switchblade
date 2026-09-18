@@ -64,8 +64,10 @@ Fatal (reject the save, HTTP 400, change nothing):
 - A preset `models` entry referencing an id that is neither a model nor a preset (a preset of
   presets is legal, so both are accepted; the server expands recursively with cycle detection).
 - Duplicate model ids, duplicate preset ids.
-- `missCapture.file` containing a path separator or `..` (`configPathFor()` joins it to the config
-  directory, so traversal would let the editor write outside the intended location).
+- `missCapture.file` containing `..`, or containing a path separator when it is RELATIVE
+  (`missCapturePath()` resolves a bare filename against the config directory and uses an absolute
+  path as-is, so a separator in a relative name, or a `..` in either form, would write outside the
+  intended location; an absolute path is legitimate, the homelab points at a durable volume).
 
 Warnings (accepted, logged, surfaced in the UI, overridable by the user):
 

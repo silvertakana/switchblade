@@ -17,7 +17,7 @@ import { readFileSync, statSync, watch as watchF, appendFileSync, renameSync, op
 import { readFile as readFileP, rename as renameP, writeFile as writeFileP } from "node:fs/promises";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import crypto from "node:crypto";
 
@@ -404,8 +404,11 @@ function validateConfig(candidate, current) {
   // ---- settings blocks ----
   const mc = candidate.missCapture;
   if (mc && typeof mc === "object" && typeof mc.file === "string") {
-    if (mc.file.includes("/") || mc.file.includes("\\") || mc.file.includes("..")) {
-      err("missCapture.file", "must be a bare filename in the config directory (no path separators or '..')");
+    // An absolute path is legitimate: the homelab points `file` at a durable
+    // named volume outside the config directory. A RELATIVE name must stay a
+    // bare filename, and `..` is refused in BOTH forms so neither can escape.
+    if (mc.file.includes("..") || (!isAbsolute(mc.file) && (mc.file.includes("/") || mc.file.includes("\\")))) {
+      err("missCapture.file", "must be a bare filename in the config directory or an absolute path (no path separator in a relative name, and no '..')");
     }
   }
 
@@ -656,7 +659,10 @@ const MISS_CAPTURE = {
 
 function missCapturePath(cfg) {
   const name = (cfg.missCapture && cfg.missCapture.file) || MISS_CAPTURE.file;
-  return join(dirname(CONFIG_PATH), name);
+  // join() does NOT reset on an absolute second argument, so an absolute `file`
+  // must come back as-is: joining it produced a bogus path inside the config
+  // dir and every append died with ENOENT (swallowed by captureMiss).
+  return isAbsolute(name) ? name : join(dirname(CONFIG_PATH), name);
 }
 
 // Append one bounded payload row for a low-cache-hit request. Must NEVER crash

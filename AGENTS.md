@@ -52,7 +52,7 @@ Strategies (preset level): **affinity** (default, session-sticky spreading), **f
 | `.github/workflows/ci.yml` | CI: syntax check + test suite on Node 22/24/25, plus a secret-scan job and a `.env.example`-placeholder check. |
 | `docs/UI-PLAN.md`, `docs/VISUAL-PLAN.md` | UI design plans. |
 | `router-history.jsonl` | Request history append log (gitignored; override path with `ROUTER_HISTORY`). |
-| `router-misses.jsonl` | Bounded cache-miss payload capture (gitignored). Controlled by the `missCapture` config block; homelab path: `/data/history/router-misses.jsonl` (durable named volume); rotates to `.old` at `maxFileBytes`. Use for cache-break forensics (see the switchblade skill's Cache miss forensics section). |
+| `router-misses.jsonl` | Bounded cache-miss payload capture (gitignored). Controlled by the `missCapture` config block: `file` takes a bare filename (resolved against the config directory) or an absolute path (used as-is), and `..` is rejected in both forms. Homelab path: `/data/history/router-misses.jsonl` (durable named volume); rotates to `.old` at `maxFileBytes`. Use for cache-break forensics (see the switchblade skill's Cache miss forensics section). |
 | `api-keys.json` | Issued chat-only keys store (SHA-256 hashes only, gitignored; override path with `LMR_KEYS_FILE`). |
 | `secrets.json` | Managed env-var store written by the Config tab's env editor (VALUES only, gitignored; override path with `ROUTER_SECRETS`). Hot-reloads via `fs.watch`; snapshots to `secrets.history/`. |
 

@@ -1743,6 +1743,60 @@ async function main() {
     }
   }
 
+  // z34) integration: an ABSOLUTE missCapture.file is used as-is rather than
+  //      joined to the config directory, so capture really appends there. The
+  //      homelab config points at /data/history/router-misses.jsonl on a durable
+  //      named volume; join() ignored the absolute name, produced a bogus path
+  //      inside the config dir, and captureMiss swallowed the resulting ENOENT -
+  //      the feature was silently dead while the config still looked valid.
+  {
+    const srv34 = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        id: "z34m", object: "chat.completion",
+        choices: [{ message: { role: "assistant", content: "ok" } }],
+        usage: { prompt_tokens: 10000, completion_tokens: 5, prompt_cache_hit_tokens: 1000, prompt_cache_miss_tokens: 9000 },
+      }));
+    });
+    const port34 = await listen(srv34);
+    // The capture target lives OUTSIDE the config dir on purpose: if the path
+    // were joined to the config dir, the write would land somewhere else.
+    const absDir34 = await mkdtemp(join(tmpdir(), "lmr-miss-abs-"));
+    const absFile34 = join(absDir34, "router-misses.jsonl");
+    const cfgZ34 = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "z34", baseURL: `http://${HOST}:${port34}`, apiKeyEnv: "KEY_Z34" }],
+      models: { "m34": { providers: [{ backend: "z34", upstream: "u34" }], affinityPool: 1 } },
+      presets: { "p34": { strategy: "affinity", models: ["m34"] } },
+      backoff: BO,
+      missCapture: { enabled: true, maxMissPct: 50, minMissTokens: 1000, file: absFile34 },
+    };
+    const { child: childZ34, base: baseZ34, dir: dirZ34 } = await startRouterCfg(cfgZ34, "KEY_Z34=k\n");
+    try {
+      const r34 = await api(baseZ34, "/v1/chat/completions", { body: { model: "p34", messages: [{ role: "user", content: "z34 absolute probe" }] } });
+      assert(r34.status === 200, "z34a) p34 request succeeds (status=" + r34.status + ")");
+      await new Promise((r) => setTimeout(r, 300));
+      let rows34 = [];
+      try { rows34 = (await readFile(absFile34, "utf8")).split("\n").filter(Boolean); } catch { /* absent -> 0 rows */ }
+      const row34 = rows34.length ? JSON.parse(rows34[0]) : null;
+      assert(
+        row34 && row34.cacheHitPct === 10 && row34.cacheMissTokens === 9000 &&
+        Array.isArray(row34.payload && row34.payload.messages) && row34.payload.messages.some((m) => m.content === "z34 absolute probe"),
+        "z34b) absolute missCapture.file is used as-is: capture appended to that exact path (rows=" + rows34.length + ")"
+      );
+      let joined34 = [];
+      try { joined34 = (await readFile(join(dirZ34, "router-misses.jsonl"), "utf8")).split("\n").filter(Boolean); } catch { /* absent -> 0 rows */ }
+      assert(joined34.length === 0, "z34c) nothing is written next to the config for an absolute file (rows=" + joined34.length + ")");
+    } finally {
+      childZ34.kill();
+      srv34.close();
+      await rm(dirZ34, { recursive: true, force: true });
+      await rm(absDir34, { recursive: true, force: true });
+    }
+  }
+
   // z30) regression: a STREAMING upstream that reports ONLY cached_tokens
   //      (prompt_tokens_details, OpenAI style) must yield the cached/prompt
   //      percentage, not 100% - the collector folds cached into promptCacheHit
@@ -3364,6 +3418,19 @@ async function main() {
       await mkBad((d) => { d.missCapture.file = "../escape.jsonl"; }, "c) missCapture.file traversal");
       await mkBad((d) => { d.port = 9999; }, "d) restart-only port change");
       await mkBad((d) => { d.backends.push({ id: "ce-c", baseURL: "http://x", apiKeyEnv: "KEY_CE_A" }); }, "e) duplicate backend id");
+      await mkBad((d) => { d.missCapture.file = "sub/x.jsonl"; }, "f) missCapture.file with a separator in a relative name");
+      await mkBad((d) => { d.missCapture.file = "/data/../etc/router-misses.jsonl"; }, "g) missCapture.file with '..' inside an absolute path");
+      // zCE5h) an ABSOLUTE missCapture.file is legal. The live homelab config
+      // points at /data/history/router-misses.jsonl on a durable named volume;
+      // rejecting it made EVERY config-editor save return 400 in production.
+      const dAbsCE = JSON.parse(await rawOnDisk());
+      dAbsCE.missCapture.file = "/data/history/router-misses.jsonl";
+      const rAbsCE = await post("/api/config", { config: dAbsCE, dryRun: true });
+      const bAbsCE = await rAbsCE.json();
+      assert(
+        rAbsCE.status === 200 && bAbsCE.ok === true,
+        "zCE5 h) absolute missCapture.file accepted (" + rAbsCE.status + ", errors=" + JSON.stringify((bAbsCE.errors || []).map((e) => e.path)) + ")"
+      );
 
       // CE6) stale revision -> 409 with the current config, no write
       const before6 = await rawOnDisk();

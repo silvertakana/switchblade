@@ -244,11 +244,12 @@ missing, the router's behavior is byte-identical to before.
 - `missCapture` (object): `enabled` (bool, required to turn on), `maxMissPct`
   (default 50: only requests whose cache-hit percentage is BELOW this are
   captured), `minMissTokens` (default 1000: minimum estimated cache-miss prompt
-  tokens before capture), `file` (default `router-misses.jsonl`, resolved next
-  to the config), `maxFileBytes` (default 25000000; when the file exceeds this
-  it rotates to `<file>.old`). Captured rows are a bounded copy of the outgoing
-  payload (see `boundedPayload`), never API keys. Used to make a bad-miss night
-  recoverable (low cache-hit percentage = an EARLY cache break).
+  tokens before capture), `file` (default `router-misses.jsonl`: a bare filename
+  is resolved next to the config, an absolute path is used as-is, and `..` is
+  rejected in either form), `maxFileBytes` (default 25000000; when the file
+  exceeds this it rotates to `<file>.old`). Captured rows are a bounded copy of
+  the outgoing payload (see `boundedPayload`), never API keys. Used to make a
+  bad-miss night recoverable (low cache-hit percentage = an EARLY cache break).
 - `alerts.ntfy` (object): `baseUrl` (default `https://ntfy.sh`), `topic`
   (required), `minMissPct` (default 50) / `minMissTokens` (default 20000) for
   the `cache_miss` alert threshold, `cooldownMs` (default 600000, per-kind), and
