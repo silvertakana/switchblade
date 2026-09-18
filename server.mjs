@@ -268,10 +268,30 @@ function snapshotConfig() {
   return name;
 }
 
-function writeConfigAtomic(obj) {
-  const tmp = CONFIG_PATH + ".tmp";
-  writeFileSync(tmp, JSON.stringify(obj, null, 2) + "\n");
-  renameSync(tmp, CONFIG_PATH);
+// rename() cannot replace a single-file bind mount: Linux refuses to rename
+// onto a mount point with EBUSY, and even a successful swap would leave the
+// container's mount (and its fs.watch) pinned to the original inode, so the
+// router would keep reading the old file. Fall back to writing the validated
+// bytes in place, which is the only thing that works there.
+const IN_PLACE_WRITE_CODES = new Set(["EBUSY", "EXDEV", "ENOTSUP", "EOPNOTSUPP"]);
+
+function writeConfigAtomic(obj, target = CONFIG_PATH, replace = renameSync) {
+  const tmp = target + ".tmp";
+  const text = JSON.stringify(obj, null, 2) + "\n";
+  writeFileSync(tmp, text);
+  try {
+    replace(tmp, target);
+  } catch (e) {
+    // Anything else (EACCES, EROFS, ENOSPC) is a genuine failure: an in-place
+    // write would fail the same way, and swallowing it would only obscure why.
+    if (!IN_PLACE_WRITE_CODES.has(e.code)) throw e;
+    writeFileSync(target, text);
+    try {
+      unlinkSync(tmp);
+    } catch {
+      /* best effort */
+    }
+  }
 }
 
 // Env var NAMES that are currently set, so the editor can offer them in a
@@ -3481,4 +3501,4 @@ if (isMain) {
   });
 }
 
-export { candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost };
+export { candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost, writeConfigAtomic };

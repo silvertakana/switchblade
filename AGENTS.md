@@ -161,7 +161,7 @@ Every request gets a short stable `callId` returned in the `x-router-backend`/`x
 
 Production container details:
 
-- Live config is `/app/config.server.json` (env `ROUTER_CONFIG`), a bind mount from `/data/coolify/applications/a8dyidd8o8id2se9czgauem0/app/config.server.json`. `/app/config.json` inside the container is UNUSED.
+- Live config is `/app/config.server.json` (env `ROUTER_CONFIG`), a bind mount from `/data/coolify/applications/a8dyidd8o8id2se9czgauem0/app/config.server.json`. `/app/config.json` inside the container is UNUSED. Because it is a SINGLE-FILE bind mount, the router writes it IN PLACE: it cannot be replaced by rename, which fails `EBUSY` on a mount point and would also leave the container's mount (and its `fs.watch`) pinned to the old inode, so the router would keep reading the old config. The config editor (`POST /api/config`) is the supported way to change the live config in place while the router runs.
 - Durable request history is the named volume `/data/history/router-history.jsonl` (env `ROUTER_HISTORY`).
 - The managed env-var store is `/data/secrets.json` (env `ROUTER_SECRETS`, set as an image `ENV` in the `Dockerfile`), on that same durable `/data` volume, with snapshots at `/data/secrets.history/`. Without it the store would default to `/app/secrets.json` and be wiped by every image rebuild.
 - Keys: the container reads `/app/.env` at startup. That file lives in the container filesystem and is lost on a Coolify image rebuild; durable keys belong in the Coolify application env vars.

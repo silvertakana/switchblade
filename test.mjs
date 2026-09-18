@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { spawn } from "node:child_process";
 // Unit-level imports: server.mjs only starts the server when run as a script,
 // so importing it here gives direct access to strategy selection for tests.
-import { candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost } from "./server.mjs";
+import { candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost, writeConfigAtomic } from "./server.mjs";
 
 const HOST = "127.0.0.1";
 let passed = 0;
@@ -3493,6 +3493,59 @@ async function main() {
     } finally {
       childCE.kill();
       await rm(dirCE, { recursive: true, force: true });
+    }
+  }
+
+  // ---- config write path: single-file bind mount ----------------------------
+  // The live homelab config is a single-file bind mount. Linux refuses to
+  // rename() onto a mount point (EBUSY), and even a swap that succeeded would
+  // leave the container's mount and its fs.watch pinned to the old inode, so
+  // the save must fall back to writing the validated bytes IN PLACE. This block
+  // pins that fallback and, just as importantly, the errors it must NOT absorb.
+  {
+    const dirWA = await mkdtemp(join(tmpdir(), "lmr-write-"));
+    const wTarget = join(dirWA, "config.json");
+    const wObj = { port: 8765, backends: [{ id: "wa", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_WA" }] };
+    const wText = JSON.stringify(wObj, null, 2) + "\n";
+    const wSentinel = JSON.stringify({ sentinel: true }) + "\n";
+    // readFile returning null (not throwing) keeps a broken implementation
+    // failing the assertion instead of crashing the whole suite.
+    const readOrNull = async (p) => {
+      try { return await readFile(p, "utf8"); } catch { return null; }
+    };
+    const tmpPresent = async () => (await readdir(dirWA)).includes("config.json.tmp");
+    const mountError = (code) => () => {
+      throw Object.assign(new Error(code === "EBUSY" ? "resource busy or locked" : "permission denied"), { code });
+    };
+    try {
+      // WA1) EBUSY (the bind-mount case) -> in-place write, temp file removed
+      writeConfigAtomic(wObj, wTarget, mountError("EBUSY"));
+      assert((await readOrNull(wTarget)) === wText, "zWA1a) an EBUSY rename falls back to writing the config in place");
+      assert(!(await tmpPresent()), "zWA1b) the in-place fallback removes the temp file");
+
+      // WA2) a non-mount rename error must propagate with no fallback write
+      await writeFile(wTarget, wSentinel);
+      let threw2 = null;
+      try {
+        writeConfigAtomic(wObj, wTarget, mountError("EACCES"));
+      } catch (e) {
+        threw2 = e;
+      }
+      assert(!!threw2 && threw2.code === "EACCES", "zWA2a) EACCES propagates instead of being swallowed by the fallback");
+      assert((await readOrNull(wTarget)) === wSentinel, "zWA2b) the rejected write left the target byte-unchanged");
+      assert(await tmpPresent(), "zWA2c) the non-fallback path leaves the temp file as before (no cleanup on a real error)");
+
+      // WA3) the real renameSync path is unchanged
+      writeConfigAtomic(wObj, wTarget);
+      assert((await readOrNull(wTarget)) === wText, "zWA3a) the real renameSync path still writes the config");
+      assert(!(await tmpPresent()), "zWA3b) the atomic rename path leaves no temp file behind");
+
+      // WA4) the serialization contract: 2-space indent plus ONE trailing newline
+      const bytes4 = await readOrNull(wTarget);
+      assert(bytes4 === JSON.stringify(wObj, null, 2) + "\n", "zWA4a) bytes are JSON.stringify(obj, null, 2) plus one trailing newline");
+      assert(bytes4.endsWith("\n") && !bytes4.endsWith("\n\n"), "zWA4b) exactly one trailing newline");
+    } finally {
+      await rm(dirWA, { recursive: true, force: true });
     }
   }
 

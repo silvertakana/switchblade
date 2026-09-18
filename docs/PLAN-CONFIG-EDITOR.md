@@ -30,7 +30,8 @@ so no restart and no reload endpoint is needed for any schema-level change.
    by extending the path check, so a human can use the password they already log in with.
 4. **The file is live routing state.** A bad write can wedge routing for every consumer (dsh,
    OpenCode). Every save therefore takes a snapshot first, validates before writing, writes
-   atomically, and the UI offers one-click revert.
+   atomically (in place when the target is a single-file bind mount), and the UI offers one-click
+   revert.
 5. **Historical reality check**: the local history has exactly 1 request in the last 7 days
    (backend `freellm`), so there is no real local traffic to disrupt while developing.
 
@@ -42,9 +43,16 @@ so no restart and no reload endpoint is needed for any schema-level change.
 - `readRawConfig()` -> reads and JSON-parses the file as-is. Throws a typed error on parse failure.
 - `snapshotConfig()` -> copies the current file into `config.history/<ISO-timestamp>.json`.
   Prunes to the newest `MAX_SNAPSHOTS = 20` by filename sort. Returns the snapshot filename.
-- `writeConfigAtomic(obj)` -> serializes with 2-space indent, writes to `config.json.tmp` then
-  `renameSync` over the target (same pattern already used for the keys store). `*.json.tmp` is
-  already gitignored.
+- `writeConfigAtomic(obj, target = CONFIG_PATH, replace = renameSync)` -> serializes with 2-space
+  indent, writes to `<target>.tmp` then `replace` (default `renameSync`) over the target (same
+  pattern already used for the keys store). `*.json.tmp` is already gitignored.
+  **When the rename fails with `EBUSY` / `EXDEV` / `ENOTSUP` / `EOPNOTSUPP` it falls back to
+  writing the same bytes IN PLACE and best-effort removes the temp file.** That is the live
+  production case: `/app/config.server.json` is a single-file bind mount, so Linux refuses the
+  rename with `EBUSY`, and even a swap that succeeded would leave the container's mount and its
+  `fs.watch` pinned to the old inode while the router kept reading the old config. Any other error
+  code propagates, so a real failure (`EACCES`, `EROFS`) is never masked by a fallback that would
+  fail the same way. The `replace` parameter is a test seam.
 - `validateConfig(cfg, { env })` -> returns `{ fatal: [...], warnings: [...] }`.
 
 ### Validation rules
@@ -94,7 +102,8 @@ field.
     is not `force: true`**, with `{ error: { message, type: "conflict" }, current: <raw config> }`
     so the UI can show "the file changed on disk, reload?". This is the lost-update guard: two
     browser tabs, or the user editing the file in VS Code, must not silently clobber each other.
-  - On success: snapshot, atomic write, hot-reload via the existing watcher, respond
+  - On success: snapshot, write (atomic rename, or in place when the target is a single-file bind
+    mount -- see `writeConfigAtomic` above), hot-reload via the existing watcher, respond
     `{ ok: true, revision, warnings, snapshot }`.
   - The write happens ONLY after validation passes; a fatal error leaves the file byte-identical.
 - `POST /api/config/reset` -> body `{ snapshot }`. Validates the snapshot name is a bare basename
