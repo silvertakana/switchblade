@@ -41,11 +41,26 @@ const CONSUMER_SPECIFIER = "./server.mjs";
 let ran = 0;
 let failed = 0;
 
+// Output budget: a clean run is read for exactly two things, the PASS/FAIL
+// lines and the suite tail. The non-fatal validator notices repeat every run
+// and would bury them, so by default they are counted, not printed. They are
+// still printed in full when a check FAILs (a failure must be self-diagnosing
+// without a second invocation) and whenever --notices is passed.
+const args = process.argv.slice(2);
+const SHOW_NOTICES = args.includes("--notices");
+const MODE = args.find((a) => !a.startsWith("--")) || "";
+const UNKNOWN_FLAG = args.find((a) => a.startsWith("--") && a !== "--notices");
+
 function report(id, title, ok, evidence, notes) {
   ran++;
   if (!ok) failed++;
   console.log(`${ok ? "PASS" : "FAIL"} ${id} ${title}: ${evidence}`);
-  for (const note of notes || []) console.log(`  ${note}`);
+  const list = notes || [];
+  if (list.length && (!ok || SHOW_NOTICES)) {
+    for (const note of list) console.log(`  ${note}`);
+  } else if (list.length) {
+    console.log(`  ${list.length} notice(s) suppressed (informational only); re-run with --notices to list them`);
+  }
   return ok;
 }
 
@@ -635,14 +650,18 @@ function runSuite() {
 }
 
 async function main() {
-  const mode = process.argv[2] || "";
-  if (mode && mode !== "static" && mode !== "suite") {
-    console.error(`unknown mode '${mode}'; expected 'static', 'suite', or no argument`);
-    console.error("usage: node scripts/ci/check.mjs [static|suite]");
+  if (UNKNOWN_FLAG) {
+    console.error(`unknown flag '${UNKNOWN_FLAG}'; only --notices is recognised`);
+    console.error("usage: node scripts/ci/check.mjs [static|suite] [--notices]");
     process.exit(2);
   }
-  if (mode !== "suite") await runStatic();
-  if (mode !== "static") runSuite();
+  if (MODE && MODE !== "static" && MODE !== "suite") {
+    console.error(`unknown mode '${MODE}'; expected 'static', 'suite', or no argument`);
+    console.error("usage: node scripts/ci/check.mjs [static|suite] [--notices]");
+    process.exit(2);
+  }
+  if (MODE !== "suite") await runStatic();
+  if (MODE !== "static") runSuite();
   console.log(`CI RESULT: ${failed ? "FAIL" : "PASS"} (${failed} of ${ran} checks failed)`);
   process.exit(failed ? 1 : 0);
 }
