@@ -4708,6 +4708,7 @@ async function envRemove(name) {
     return;
   }
   await loadEnvVars({ keepIssue: true });
+  await refreshCfgEnvNames();
   env.issue = { kind: "ok", text: name + " removed from the managed secrets store." };
   renderEnv();
 }

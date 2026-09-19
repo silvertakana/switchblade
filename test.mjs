@@ -5159,7 +5159,7 @@ async function main() {
       const u8Needed = [
         "cfgDeepCopy", "cfgRawParseError", "cfgCurrentObject", "loadRawConfig", "applyRawPayload",
         "refreshConfigFromDisk", "cfgPost", "cfgSave", "cfgEnvNames", "applyEnvPayload", "loadEnvVars",
-        "envAddProblem", "envPost", "envErrText", "envFlagsAuth", "envAdd", "envSaveEdit",
+        "envAddProblem", "envPost", "envErrText", "envFlagsAuth", "envAdd", "envSaveEdit", "envRemove",
         "cfgField", "renderConfig", "cfgTableHead", "cfgRowActions", "cfgInjectIcons", "cfgSetCount",
         "renderCfgBackends",
       ];
@@ -5240,6 +5240,11 @@ async function main() {
           if (!u8Served.includes(body.name)) u8Served = u8Served.concat([body.name]);
           return { status: 200, ok: true, json: async () => ({ action: "written", live: true, applied: true }) };
         }
+        if (u.startsWith("/api/env?name=") && method === "DELETE") {
+          const gone = decodeURIComponent(u.slice("/api/env?name=".length));
+          u8Served = u8Served.filter((n) => n !== gone);
+          return { status: 200, ok: true, json: async () => ({ removed: gone, live: true }) };
+        }
         if (u === "/api/config" && method === "POST") {
           const sent = JSON.parse(opts.body).config;
           u8Raw = Object.assign({}, u8Raw, { config: Object.assign({}, sent, { u8ServerNormalized: true }), revision: "rev-2" });
@@ -5271,7 +5276,7 @@ async function main() {
         fetch: u8Fetch,
         document: { getElementById: u8El, querySelectorAll: () => [], querySelector: () => null, createElement: () => u8Node() },
       };
-      const u8Exports = ["$", "esc", "cfgSave", "cfgDeepCopy", "cfgEnvNames", "cfgField", "loadEnvVars", "envAdd", "envSaveEdit", "renderConfig", "renderCfgBackends", "refreshConfigFromDisk"].concat(u8NewBroken.length ? [] : u8New);
+      const u8Exports = ["$", "esc", "cfgSave", "cfgDeepCopy", "cfgEnvNames", "cfgField", "loadEnvVars", "envAdd", "envSaveEdit", "envRemove", "renderConfig", "renderCfgBackends", "refreshConfigFromDisk"].concat(u8NewBroken.length ? [] : u8New);
       let api8 = null;
       let u8EvalError = null;
       if (u8Broken.length === 0) {
@@ -5279,7 +5284,7 @@ async function main() {
         try { api8 = vm.runInContext(program, vm.createContext(u8Sandbox)); } catch (e) { u8EvalError = e.message; }
       }
       const u8Found = u8Needed.length - u8Broken.filter((n) => u8Needed.includes(n)).length;
-      const u8Ok = u8Broken.length === 0 && !u8EvalError && !!api8 && typeof api8.cfgSave === "function" && typeof api8.envAdd === "function" && typeof api8.envSaveEdit === "function" && typeof api8.renderConfig === "function";
+      const u8Ok = u8Broken.length === 0 && !u8EvalError && !!api8 && typeof api8.cfgSave === "function" && typeof api8.envAdd === "function" && typeof api8.envSaveEdit === "function" && typeof api8.envRemove === "function" && typeof api8.renderConfig === "function";
       assert(
         u8Ok,
         "u8a) the post-save refresh harness extracted " + u8Found + "/" + u8Needed.length + " function(s) plus $ and esc and evaluated them in a vm context" +
@@ -5396,6 +5401,21 @@ async function main() {
             /u8-typed-by-user/.test(u8El("cfgModalBody").innerHTML) &&
             u8El("f_apiKeyEnv").optionValues().includes("KEY_CC"),
           "u8h) the env refresh updates the picker while leaving an open modal body and the unsaved draft untouched (draft changed " + (jw8(u8Cfg.draft) !== draftBefore) + ", modal changed " + (jw8(u8Cfg.modal) !== modalBefore) + ", options " + jw8(u8El("f_apiKeyEnv").optionValues()) + ")"
+        );
+
+        // (6) A removal changes the name set exactly as much as an add does, so it
+        // is the same contract: the removed name leaves the picker, and the open
+        // form's selection stays where it was.
+        u8Cfg.draft = u8ViewerCfg();
+        u8Cfg.envNames = ["KEY_GO", "KEY_CC", "U8_DOOMED"];
+        u8Served = ["KEY_GO", "KEY_CC", "U8_DOOMED"];
+        const u8RemSel = u8StagePicker("KEY_GO");
+        const u8RemBefore = u8RemSel.optionValues();
+        await api8.envRemove("U8_DOOMED");
+        const u8RemAfter = u8RemSel.optionValues();
+        assert(
+          u8RemBefore.includes("U8_DOOMED") && !u8Served.includes("U8_DOOMED") && !u8RemAfter.includes("U8_DOOMED") && u8RemAfter.includes("KEY_CC") && u8RemSel.value === "KEY_GO",
+          "u8i) a successful env removal drops the name from the open Key env picker and keeps the selection (before " + jw8(u8RemBefore) + ", after " + jw8(u8RemAfter) + ", selection " + jw8(u8RemSel.value) + ", served " + jw8(u8Served) + ")"
         );
       }
     }
