@@ -3813,6 +3813,40 @@ async function main() {
       const r10b = await post("/api/config/reset", { snapshot: "nope.json" });
       assert(r10b.status === 404, "zCE10b) unknown snapshot -> 404 (got " + r10b.status + ")");
 
+      // reset hardening: the restore path is a SAVE-class write to the live
+      // file, so it runs the same validator against what is actually on disk
+      // and enforces the same lost-update guard. A snapshot is a config the
+      // browser asked us to restore, not an escape from the save contract.
+      const snaps35 = await (await fetch(baseCE + "/api/config/raw")).json();
+      // The newest snapshot is the pre-reset state zCE9 replaced, so its bytes
+      // DIFFER from the live file: any write on the refused path is visible.
+      const newerSnap = snaps35.snapshots[0];
+      const before35 = await rawOnDisk();
+      const r35 = await post("/api/config/reset", { snapshot: newerSnap, baseRevision: 1 });
+      const b35 = await r35.json();
+      assert(
+        r35.status === 409 && b35.error && b35.error.type === "conflict",
+        "v35a) stale baseRevision on reset -> 409 conflict (got " + r35.status + ")"
+      );
+      assert((await rawOnDisk()) === before35, "v35a2) a conflicted reset did not touch the live file");
+      const r35b = await post("/api/config/reset", { snapshot: newerSnap, baseRevision: 1, force: true });
+      assert(r35b.status === 200, "v35b) forced reset with guards passes (got " + r35b.status + ")");
+
+      // the startup-only key guard is part of the reset contract too: a snapshot
+      // that changes `port` is refused with the field path instead of being
+      // applied (validateConfig(restored, restored) made this vacuous).
+      const snapPort = JSON.parse(await rawOnDisk());
+      snapPort.port = 9999;
+      await writeFile(join(dirCE, "config.history", "v35-port.json"), JSON.stringify(snapPort, null, 2) + "\n");
+      const before35c = await rawOnDisk();
+      const r35c = await post("/api/config/reset", { snapshot: "v35-port.json", force: true });
+      const b35c = await r35c.json();
+      assert(
+        r35c.status === 400 && (b35c.errors || []).some((e) => e.path === "port"),
+        "v35c) a snapshot that changes a startup-only key is refused (400, got " + r35c.status + ", errors=" + JSON.stringify((b35c.errors || []).map((e) => e.path)) + ")"
+      );
+      assert((await rawOnDisk()) === before35c, "v35c2) a refused reset left the live file byte-identical");
+
       // CE11) secret hygiene: no apiKeyEnv VALUE appears in any response body
       const bodies = [
         JSON.stringify(raw1), JSON.stringify(b2), JSON.stringify(b4),

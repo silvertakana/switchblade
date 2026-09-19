@@ -3201,10 +3201,36 @@ function server() {
       } catch (e) {
         return writeError(res, newError(500, JSON.stringify({ error: { message: `snapshot is unreadable: ${e.message}`, type: "router_error" } })));
       }
-      const verdict = validateConfig(restored, restored);
+      // Save-class, like every other write to the live file: `current` is what
+      // is actually on disk, so the startup-only keys the UI cannot change are
+      // refused here too, and the snapshot is judged as the config it would
+      // become rather than against itself. A restore is a deliberate user
+      // action, so a bad snapshot is refused with its field paths instead of
+      // being silently loaded.
+      let currentRaw;
+      try {
+        currentRaw = readRawConfig();
+      } catch (e) {
+        return writeError(res, newError(500, JSON.stringify({ error: { message: `cannot read the current config: ${e.message}`, type: "router_error" } })));
+      }
+      const verdict = validateConfig(restored, currentRaw);
       if (verdict.errors.length) {
         res.writeHead(400, { "content-type": "application/json" });
         return res.end(JSON.stringify({ ok: false, errors: verdict.errors, warnings: verdict.warnings }));
+      }
+      // Same lost-update guard as POST /api/config. Conditional on the caller
+      // having sent a revision: a reset that omits baseRevision is a deliberate
+      // "restore this snapshot now" and must still be accepted.
+      if (input.baseRevision != null && Number(input.baseRevision) !== configRevision() && input.force !== true) {
+        res.writeHead(409, { "content-type": "application/json" });
+        return res.end(
+          JSON.stringify({
+            ok: false,
+            error: { message: "the config file changed on disk since this page loaded it", type: "conflict" },
+            warnings: verdict.warnings,
+            revision: configRevision(),
+          })
+        );
       }
       // Snapshot the state being replaced so a restore is itself undoable.
       const safety = snapshotConfig();
