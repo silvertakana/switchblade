@@ -5147,6 +5147,257 @@ async function main() {
           "u7k) a served model is still posted with its own id, so the empty-id guard is not a dead send path (posted " + aSent.length + ")"
         );
       }
+
+      // ---- post-save and post-env-write refresh (Task 8) ----------------------
+      // Two pieces of state the page kept from an earlier render: the config viewer
+      // (written only by the dashboard loader) and the backend modal's "Key env"
+      // select (built once by cfgField and re-rendered by nothing). Both claims are
+      // measured through the REAL success paths - cfgSave, envAdd, envSaveEdit -
+      // against a stubbed fetch, with the fake DOM's options parsed out of the HTML
+      // those functions actually emit, so a render/refresh divergence cannot hide
+      // behind a hand-fed form.
+      const u8Needed = [
+        "cfgDeepCopy", "cfgRawParseError", "cfgCurrentObject", "loadRawConfig", "applyRawPayload",
+        "refreshConfigFromDisk", "cfgPost", "cfgSave", "cfgEnvNames", "applyEnvPayload", "loadEnvVars",
+        "envAddProblem", "envPost", "envErrText", "envFlagsAuth", "envAdd", "envSaveEdit",
+        "cfgField", "renderConfig", "cfgTableHead", "cfgRowActions", "cfgInjectIcons", "cfgSetCount",
+        "renderCfgBackends",
+      ];
+      const u8New = ["renderEnvPickers", "refreshCfgEnvNames"];
+      const u8Bodies = [];
+      const u8Broken = [];
+      const u8NewBroken = [];
+      for (const name of u8Needed) {
+        const body = sliceFunction(htmlSource, name);
+        if (!body || !parses(body)) { u8Broken.push(name); continue; }
+        u8Bodies.push(body);
+      }
+      for (const name of u8New) {
+        const body = sliceFunction(htmlSource, name);
+        if (!body || !parses(body)) { u8NewBroken.push(name); continue; }
+        u8Bodies.push(body);
+      }
+      if (!dollarDecl || !parses(dollarDecl)) u8Broken.push("$");
+      if (!rEsc || !parses(rEsc)) u8Broken.push("esc");
+
+      // A fake DOM fed by the emitted HTML, with a <select> that follows the
+      // browser's rules: the option carrying `selected` wins, otherwise the first.
+      const u8Dom = new Map();
+      const u8Node = () => ({
+        value: "", checked: false, disabled: false, hidden: false, className: "", textContent: "",
+        style: {}, dataset: {}, children: [],
+        classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } },
+        appendChild(c) { this.children.push(c); return c; },
+        addEventListener() {}, focus() {}, select() {},
+        querySelectorAll() { return []; },
+        get innerHTML() { return this._html || ""; },
+        set innerHTML(v) { this._html = String(v); },
+      });
+      const u8Select = () => {
+        const el = u8Node();
+        let opts = [];
+        let picked = null;
+        Object.defineProperty(el, "innerHTML", {
+          get: () => el._html || "",
+          set: (html) => {
+            el._html = String(html);
+            opts = Array.from(String(html).matchAll(/<option value='([^']*)'([^>]*)>([\s\S]*?)<\/option>/g)).map((m) => ({
+              value: rUnesc(m[1]),
+              selected: /(^|\s)selected(\s|$)/.test(m[2]),
+              label: rUnesc(m[3]),
+            }));
+            picked = opts.find((o) => o.selected) || opts[0] || null;
+          },
+        });
+        Object.defineProperty(el, "value", {
+          get: () => (picked ? picked.value : ""),
+          set: (v) => { picked = opts.find((o) => o.value === String(v)) || null; },
+        });
+        el.optionValues = () => opts.map((o) => o.value);
+        return el;
+      };
+      const u8El = (id) => {
+        if (!u8Dom.has(id)) u8Dom.set(id, id === "f_apiKeyEnv" ? u8Select() : u8Node());
+        return u8Dom.get(id);
+      };
+
+      // The server mock: /api/env serves a name list that gains whatever was just
+      // written, and /api/config/raw serves the file the last save stored - with a
+      // field the server added itself, so "the viewer shows the current draft" is
+      // distinguishable from "the viewer shows the object the page posted".
+      let u8Served = [];
+      let u8Raw = null;
+      const u8Fetched = [];
+      const u8Fetch = async (url, opts) => {
+        const u = String(url);
+        const method = (opts && opts.method) || "GET";
+        u8Fetched.push(method + " " + u);
+        if (u === "/api/env" && method === "GET") {
+          return { status: 200, ok: true, json: async () => ({ vars: u8Served.map((n) => ({ name: n, live: true, editable: true })), revision: "env-rev-1" }) };
+        }
+        if (u === "/api/env" && method === "POST") {
+          const body = JSON.parse(opts.body);
+          if (!u8Served.includes(body.name)) u8Served = u8Served.concat([body.name]);
+          return { status: 200, ok: true, json: async () => ({ action: "written", live: true, applied: true }) };
+        }
+        if (u === "/api/config" && method === "POST") {
+          const sent = JSON.parse(opts.body).config;
+          u8Raw = Object.assign({}, u8Raw, { config: Object.assign({}, sent, { u8ServerNormalized: true }), revision: "rev-2" });
+          return { status: 200, ok: true, json: async () => ({ warnings: [], revision: "rev-2" }) };
+        }
+        if (u === "/api/config/raw") return { status: 200, ok: true, json: async () => u8Raw };
+        return { status: 404, ok: false, json: async () => ({}) };
+      };
+
+      const u8Cfg = { draft: null, disk: null, modal: null, mode: "forms", dirty: false, loaded: false, text: null, revision: null, envNames: [], snapshots: [], errors: [], warnings: [] };
+      const u8Env = { vars: [], revision: null, restartRequired: false, loaded: false, issue: null, revealed: {}, editing: null, draftValue: "", busy: {}, copied: null, status: {} };
+      const u8Calls = { renderEnv: 0, hl: 0 };
+      const u8HlArgs = [];
+      const u8Sandbox = {
+        cfg: u8Cfg,
+        env: u8Env,
+        console,
+        confirm: () => true,
+        renderCfgModels: () => {},
+        renderCfgPresets: () => {},
+        renderCfgSettings: () => {},
+        renderCfgSnapshots: () => {},
+        renderEnv: () => { u8Calls.renderEnv++; },
+        showAuthBanner: () => {},
+        hideAuthBanner: () => {},
+        keysApiAuth: () => null,
+        highlightJSON: (o) => { u8Calls.hl++; u8HlArgs.push(o); return "HL:" + JSON.stringify(o); },
+        ICONS: { warn: "", check: "", clock: "" },
+        fetch: u8Fetch,
+        document: { getElementById: u8El, querySelectorAll: () => [], querySelector: () => null, createElement: () => u8Node() },
+      };
+      const u8Exports = ["$", "esc", "cfgSave", "cfgDeepCopy", "cfgEnvNames", "cfgField", "loadEnvVars", "envAdd", "envSaveEdit", "renderConfig", "renderCfgBackends", "refreshConfigFromDisk"].concat(u8NewBroken.length ? [] : u8New);
+      let api8 = null;
+      let u8EvalError = null;
+      if (u8Broken.length === 0) {
+        const program = [dollarDecl, rEsc].concat(u8Bodies, ["({ " + u8Exports.join(", ") + " })"]).join("\n");
+        try { api8 = vm.runInContext(program, vm.createContext(u8Sandbox)); } catch (e) { u8EvalError = e.message; }
+      }
+      const u8Found = u8Needed.length - u8Broken.filter((n) => u8Needed.includes(n)).length;
+      const u8Ok = u8Broken.length === 0 && !u8EvalError && !!api8 && typeof api8.cfgSave === "function" && typeof api8.envAdd === "function" && typeof api8.envSaveEdit === "function" && typeof api8.renderConfig === "function";
+      assert(
+        u8Ok,
+        "u8a) the post-save refresh harness extracted " + u8Found + "/" + u8Needed.length + " function(s) plus $ and esc and evaluated them in a vm context" +
+          (u8Broken.length ? " [NOT FOUND OR UNPARSEABLE: " + u8Broken.join(", ") + "]" : "") +
+          (u8EvalError ? " [evaluation failed: " + u8EvalError + "]" : "")
+      );
+      assert(
+        u8NewBroken.length === 0,
+        "u8b) the refresh helpers exist in index.html and were extracted [NOT FOUND OR UNPARSEABLE: " + u8NewBroken.join(", ") + "]"
+      );
+
+      if (!u8Ok) {
+        assert(false, "u8a2) the post-save refresh contract could not be exercised: the harness did not come up");
+      } else {
+        const jw8 = (v) => JSON.stringify(v);
+        const u8ViewerCfg = () => ({ port: 8787, backends: [{ id: "go", baseURL: "http://go", apiKeyEnv: "KEY_GO" }], models: { "u8-marker-model": { providers: [{ backend: "go", upstream: "up-1" }] } }, presets: {} });
+        // Stage the picker the way the modal does: the REAL cfgField builds the
+        // options out of cfgEnvNames() and marks the entry's current value.
+        const u8StagePicker = (value) => {
+          u8El("f_apiKeyEnv").innerHTML = api8.cfgField("Key env (NAME, not the key)", "f_apiKeyEnv", {
+            type: "select",
+            value,
+            options: [{ value: "", label: "(choose an environment variable)" }].concat(api8.cfgEnvNames().map((n) => ({ value: n, label: n }))),
+          });
+          return u8El("f_apiKeyEnv");
+        };
+        const u8CanRefresh = typeof api8.renderEnvPickers === "function" && typeof api8.refreshCfgEnvNames === "function";
+
+        // (1) A successful save must leave the config viewer showing the config that
+        // is now on disk, not the file the page loaded at startup.
+        const firstDraft = u8ViewerCfg();
+        u8Cfg.loaded = true;
+        u8Cfg.mode = "forms";
+        u8Cfg.dirty = true;
+        u8Cfg.draft = JSON.parse(JSON.stringify(firstDraft));
+        u8Cfg.revision = "rev-1";
+        u8Raw = { config: JSON.parse(JSON.stringify(firstDraft)), revision: "rev-1", envNames: ["KEY_GO"], snapshots: [] };
+        u8El("configView").innerHTML = "STALE-VIEWER";
+        u8Calls.hl = 0;
+        u8HlArgs.length = 0;
+        await api8.cfgSave();
+        const viewHTML = u8El("configView").innerHTML;
+        assert(
+          viewHTML !== "STALE-VIEWER" && /u8-marker-model/.test(viewHTML) && /u8ServerNormalized/.test(viewHTML) && u8Calls.hl === 1 && jw8(u8HlArgs[0]) === jw8(u8Cfg.draft),
+          "u8c) a successful save rewrites the config viewer from the config just written (viewer " + jw8(viewHTML.slice(0, 90)) + ", highlighter calls " + u8Calls.hl + ")" +
+            (u8Calls.hl === 1 && jw8(u8HlArgs[0]) !== jw8(u8Cfg.draft) ? " [highlighted a different object than cfg.draft]" : "")
+        );
+
+        // (2) A successful env write must add the new name to the backend "Key env"
+        // picker that cfgField built once, and keep the open form's selection.
+        u8Served = ["KEY_GO", "KEY_CC"];
+        u8Cfg.envNames = ["KEY_GO"];
+        u8Cfg.draft = u8ViewerCfg();
+        const u8Sel = u8StagePicker("KEY_GO");
+        const u8Before = u8Sel.optionValues();
+        u8El("cfgBackendsTable").innerHTML = "STALE-BACKENDS-TABLE";
+        u8El("envAddName").value = "U8_ADDED_KEY";
+        u8El("envAddValue").value = "u8-secret-value";
+        u8Env.revision = "env-rev-1";
+        await api8.envAdd();
+        const u8After = u8Sel.optionValues();
+        assert(
+          u8After.includes("U8_ADDED_KEY") && u8After.includes("KEY_CC") && u8After.includes("KEY_GO") && u8Sel.value === "KEY_GO",
+          "u8d) a successful env add puts the new name in the open backend Key env picker without a reload and keeps the selection (before " + jw8(u8Before) + ", after " + jw8(u8After) + ", selection " + jw8(u8Sel.value) + ")"
+        );
+        assert(
+          u8El("cfgBackendsTable").innerHTML !== "STALE-BACKENDS-TABLE",
+          "u8e) the env refresh re-renders the backends table too (its 'not set in this environment' badge reads the same list) (got " + jw8(u8El("cfgBackendsTable").innerHTML.slice(0, 60)) + ")"
+        );
+
+        // (3) The other env success path (inline row save) must refresh identically.
+        u8Served = ["KEY_GO", "KEY_CC"];
+        u8Cfg.envNames = ["KEY_GO"];
+        u8StagePicker("KEY_GO");
+        u8Env.draftValue = "u8-rotated-value";
+        await api8.envSaveEdit("KEY_GO");
+        const u8AfterEdit = u8El("f_apiKeyEnv").optionValues();
+        assert(
+          u8AfterEdit.includes("KEY_CC") && u8El("f_apiKeyEnv").value === "KEY_GO",
+          "u8f) a successful inline env edit refreshes the same picker and keeps the selection (after " + jw8(u8AfterEdit) + ", selection " + jw8(u8El("f_apiKeyEnv").value) + ")"
+        );
+
+        // (4) A name the open form still holds but the served list has dropped must
+        // survive the re-render as an extra option instead of being reset to "".
+        u8Cfg.draft = u8ViewerCfg();
+        u8Cfg.envNames = ["KEY_GO", "KEY_ORPHAN"];
+        u8StagePicker("KEY_ORPHAN");
+        assert(
+          u8El("f_apiKeyEnv").value === "KEY_ORPHAN",
+          "u8g0) harness self-check: the staged Key env picker holds KEY_ORPHAN before the refresh"
+        );
+        u8Served = ["KEY_GO"];
+        if (u8CanRefresh) await api8.refreshCfgEnvNames();
+        const u8OrphanOpts = u8El("f_apiKeyEnv").optionValues();
+        assert(
+          u8CanRefresh && u8OrphanOpts.includes("KEY_ORPHAN") && u8El("f_apiKeyEnv").value === "KEY_ORPHAN",
+          "u8g) a stored env name the served list no longer carries stays as a selected extra option (options " + jw8(u8OrphanOpts) + ", selection " + jw8(u8El("f_apiKeyEnv").value) + ")" +
+            (u8CanRefresh ? "" : " [renderEnvPickers/refreshCfgEnvNames NOT FOUND IN index.html]")
+        );
+
+        // (5) The refresh calls renderConfig(), so pin that it cannot reach into an
+        // open modal or the draft: that would be a new way to lose typed input.
+        u8Cfg.draft = u8ViewerCfg();
+        u8Cfg.modal = { kind: "backends", key: null, data: { id: "u8-new", baseURL: "http://x", apiKeyEnv: "KEY_GO" }, index: null, provs: [], models: [] };
+        const draftBefore = jw8(u8Cfg.draft);
+        const modalBefore = jw8(u8Cfg.modal);
+        u8El("cfgModalBody").innerHTML = "<input id='f_id' value='u8-typed-by-user'>";
+        u8Served = ["KEY_GO", "KEY_CC"];
+        if (u8CanRefresh) await api8.refreshCfgEnvNames();
+        assert(
+          u8CanRefresh &&
+            jw8(u8Cfg.draft) === draftBefore &&
+            jw8(u8Cfg.modal) === modalBefore &&
+            /u8-typed-by-user/.test(u8El("cfgModalBody").innerHTML) &&
+            u8El("f_apiKeyEnv").optionValues().includes("KEY_CC"),
+          "u8h) the env refresh updates the picker while leaving an open modal body and the unsaved draft untouched (draft changed " + (jw8(u8Cfg.draft) !== draftBefore) + ", modal changed " + (jw8(u8Cfg.modal) !== modalBefore) + ", options " + jw8(u8El("f_apiKeyEnv").optionValues()) + ")"
+        );
+      }
     }
   }
 

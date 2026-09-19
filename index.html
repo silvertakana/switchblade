@@ -4027,6 +4027,10 @@ async function cfgSave() {
     cfg.warnings = (payload && payload.warnings) || [];
     cfg.errors = [];
     await refreshConfigFromDisk(true);
+    // The dashboard only writes the viewer on load, so without this the panel
+    // keeps showing the file the page started with.
+    const cv = $("configView");
+    if (cv) cv.innerHTML = cfg.draft ? highlightJSON(cfg.draft) : "Config unavailable.";
   } catch (e) {
     cfg.errors = [{ path: "", message: "Save failed: " + e.message }];
     renderConfig();
@@ -4385,6 +4389,37 @@ function applyEnvPayload(p) {
   env.copied = null;
 }
 
+// The backend modal's Key env <select> is built by cfgField when the modal opens
+// and nothing re-rendered it since, so a variable written from the env editor did
+// not show up until a page reload. This is the single re-render path for it.
+function renderEnvPickers() {
+  const names = cfgEnvNames();
+  const sel = $("f_apiKeyEnv");
+  if (sel) {
+    const cur = sel.value;
+    // A name the open form already holds but the served list has dropped stays as
+    // an option: resetting the pick would silently change what gets saved.
+    const opts = ["<option value=''>(choose an environment variable)</option>"].concat(
+      (names.includes(cur) || !cur ? names : names.concat([cur])).map((n) => "<option value='" + esc(n) + "'" + (n === cur ? " selected" : "") + ">" + esc(n) + "</option>")
+    );
+    sel.innerHTML = opts.join("");
+  }
+  // The table's "not set in this environment" badge reads the same list.
+  if (cfg.draft) renderCfgBackends();
+}
+
+// Re-read the env NAME list so a variable just written appears in the Key env
+// picker without a page reload. Best-effort: a refresh that fails must not
+// change the outcome the write already reported.
+async function refreshCfgEnvNames() {
+  try {
+    const r = await fetch("/api/env", { headers: keysApiAuth() || {}, cache: "no-store" });
+    const p = await r.json();
+    const names = Array.isArray(p.vars) ? p.vars.map((v) => v.name).filter(Boolean) : null;
+    if (names) { cfg.envNames = names; renderConfig(); renderEnvPickers(); }
+  } catch { /* the picker keeps the options it already has */ }
+}
+
 async function envPost(path, body) {
   const headers = Object.assign({ "content-type": "application/json" }, keysApiAuth() || {});
   try {
@@ -4538,6 +4573,7 @@ async function envAdd() {
   $("envAddName").value = "";
   $("envAddValue").value = "";
   await loadEnvVars({ keepIssue: true });
+  await refreshCfgEnvNames();
   const applied = payload && payload.applied;
   const live = payload && payload.live;
   env.issue = {
@@ -4644,6 +4680,7 @@ async function envSaveEdit(name) {
   env.editing = null;
   env.draftValue = "";
   await loadEnvVars({ keepIssue: true });
+  await refreshCfgEnvNames();
   env.status[name] = live ? "Value updated and live in the running process." : "Value updated; it takes effect on the next process start.";
   renderEnv();
 }
