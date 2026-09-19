@@ -767,6 +767,21 @@ async function main() {
     delete process.env.KEY_B1;
   }
 
+  // v32) an id that is both a model and a preset stays WARNING-class: the save
+  //      is not blocked, because old-shape configs carry such collisions today.
+  {
+    process.env.KEY_B1 = "x";
+    const cfg = {
+      backends: [{ id: "b1", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_B1" }],
+      models: { "same": { providers: [{ backend: "b1", upstream: "u1" }] } },
+      presets: { "same": { strategy: "affinity", models: ["same"] } }
+    };
+    const v = validateConfig(cfg, cfg);
+    assert(v.errors.length === 0, "v32a) old-shape collision is NOT an error (" + JSON.stringify(v.errors) + ")");
+    assert(v.warnings.some((w) => w.path === "presets.same"), "v32b) old-shape collision warns at presets.same (" + JSON.stringify(v.warnings) + ")");
+    delete process.env.KEY_B1;
+  }
+
   // ---- z-series: three-layer routing (new-shape configs, mock backends) ----
 
   const BO = { rateLimitBaseMs: 50, rateLimitMaxMs: 200, serverBaseMs: 50, serverMaxMs: 200, authBaseMs: 50, authMaxMs: 200, weeklyDefaultMs: 1000 };
