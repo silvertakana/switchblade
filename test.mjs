@@ -2765,7 +2765,7 @@ async function main() {
     }
   }
 
-  // z21) unit-level: top-level strategy governs ordering over the EXPANDED
+  // z21e-z21g) unit-level: top-level strategy governs ordering over the EXPANDED
   //      list. failover through a nested preset's models in declared order;
   //      weighted keeps the top-level weight of the nested preset position.
   {
@@ -2851,7 +2851,7 @@ async function main() {
     }
   }
 
-  // y1) session affinity from request body session fields (session_id / sessionId);
+  // y10-y12) session affinity from request body session fields (session_id / sessionId);
   //     x-session-id header still takes precedence over the body.
   {
     const srvA = mockBackend("sya", {});
