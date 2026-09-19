@@ -83,14 +83,24 @@ async function startRouter(mocks, extraEnv = {}) {
     env: { ...process.env, ROUTER_CONFIG: cfgPath, ROUTER_ENV: envPath, PORT: "0", ...extraEnv },
     stdio: ["ignore", "pipe", "pipe"],
   });
-  // Wait for the listening banner.
+  // Wait for the listening banner. A child that never prints it is the opaque
+  // failure this file already paid for once: carry the child's own stderr tail
+  // and exit state into the thrown error, so a config the loader rejects names
+  // its field paths instead of only "server did not start".
   let port = null;
+  let childErr = "";
+  let childExit = null;
+  child.on("exit", (code, signal) => { childExit = code === null ? "signal:" + signal : code; });
   await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("server did not start")), 8000);
+    const timer = setTimeout(
+      () => reject(new Error("server did not start (exit=" + childExit + ", stderr tail: " + JSON.stringify(childErr.slice(-600)) + ")")),
+      8000
+    );
     let out = "";
     child.stdout.on("data", (d) => { out += d; });
     child.stderr.on("data", (d) => {
       const s = d.toString();
+      childErr += s;
       const m = /listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(s);
       if (m) { port = parseInt(m[1], 10); clearTimeout(timer); resolve(); }
     });
@@ -112,10 +122,18 @@ async function startRouterCfg(cfg, envLines, extraEnv = {}) {
     stdio: ["ignore", "pipe", "pipe"],
   });
   let port = null;
+  let childErr = "";
+  let childExit = null;
+  child.on("exit", (code, signal) => { childExit = code === null ? "signal:" + signal : code; });
   await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("server did not start")), 8000);
+    const timer = setTimeout(
+      () => reject(new Error("server did not start (exit=" + childExit + ", stderr tail: " + JSON.stringify(childErr.slice(-600)) + ")")),
+      8000
+    );
     child.stderr.on("data", (d) => {
-      const m = /listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(d.toString());
+      const s = d.toString();
+      childErr += s;
+      const m = /listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(s);
       if (m) { port = parseInt(m[1], 10); clearTimeout(timer); resolve(); }
     });
   });
@@ -886,7 +904,7 @@ async function main() {
     let base = null;
     let err = "";
     await new Promise((resolve, reject) => {
-      const t = setTimeout(() => reject(new Error("v34b server did not start")), 8000);
+      const t = setTimeout(() => reject(new Error("v34b server did not start (stderr tail: " + JSON.stringify(err.slice(-400)) + ")")), 8000);
       child.stderr.on("data", (d) => {
         const s = d.toString();
         err += s;
@@ -928,7 +946,7 @@ async function main() {
     let base = null;
     let err = "";
     await new Promise((resolve, reject) => {
-      const t = setTimeout(() => reject(new Error("v34c server did not start")), 8000);
+      const t = setTimeout(() => reject(new Error("v34c server did not start (stderr tail: " + JSON.stringify(err.slice(-400)) + ")")), 8000);
       child.stderr.on("data", (d) => {
         const s = d.toString();
         err += s;
@@ -997,6 +1015,59 @@ async function main() {
     } finally {
       child.kill();
       await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  {
+    // v34e) BOOT tolerance for the two required keys the loader SYNTHESIZES.
+    //       `backends` is the only one normalizeConfig does not create, which is
+    //       why v34d can abort on it; a missing `presets` or `models` must still
+    //       start and serve. The legacy fixtures pin this incidentally (and fail
+    //       opaquely, at the first child, if it ever regresses); this pins the
+    //       modern shape directly and names the warning's field path.
+    for (const missing of ["presets", "models"]) {
+      const dir = await mkdtemp(join(tmpdir(), "lmr-v34e-" + missing + "-"));
+      const cfgPath = join(dir, "config.json");
+      const envPath = join(dir, ".env");
+      const cfgE = {
+        port: 0, prefix: "/v1", masterKeyEnv: null,
+        backends: [{ id: "v34e", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_V34E" }],
+        models: { "v34em": { providers: [{ backend: "v34e", upstream: "u" }] } },
+        presets: { "v34ep": { strategy: "affinity", models: ["v34em"] } }
+      };
+      delete cfgE[missing];
+      await writeFile(cfgPath, JSON.stringify(cfgE, null, 2));
+      await writeFile(envPath, "KEY_V34E=k\n");
+      const child = spawn(process.execPath, ["server.mjs"], {
+        cwd: join(import.meta.dirname),
+        env: { ...process.env, ROUTER_CONFIG: cfgPath, ROUTER_ENV: envPath },
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+      let base = null;
+      let err = "";
+      await new Promise((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error("v34e (" + missing + ") did not start (stderr tail: " + JSON.stringify(err.slice(-400)) + ")")), 8000);
+        child.stderr.on("data", (d) => {
+          const s = d.toString();
+          err += s;
+          const m = /listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(s);
+          if (m) { base = "http://127.0.0.1:" + parseInt(m[1], 10); clearTimeout(t); resolve(); }
+        });
+      });
+      try {
+        const live = await (await fetch(base + "/api/config")).json();
+        assert(
+          missing === "presets" ? !!(live.models && live.models.v34em) : !!(live.backends || []).find((b) => b.id === "v34e"),
+          "v34e) a config with no `" + missing + "` still boots and serves"
+        );
+        assert(
+          new RegExp("not fatal at boot\\): " + missing + ": ").test(err),
+          "v34e2) the missing `" + missing + "` tolerance logs its boot warning at the " + missing + " path"
+        );
+      } finally {
+        child.kill();
+        await rm(dir, { recursive: true, force: true });
+      }
     }
   }
 
