@@ -10,7 +10,7 @@ import { spawn } from "node:child_process";
 import vm from "node:vm";
 // Unit-level imports: server.mjs only starts the server when run as a script,
 // so importing it here gives direct access to strategy selection for tests.
-import { candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost, writeConfigAtomic, validateConfig } from "./server.mjs";
+import { candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost, writeConfigAtomic, validateConfig, convertLegacyConfig } from "./server.mjs";
 
 const HOST = "127.0.0.1";
 let passed = 0;
@@ -3900,6 +3900,162 @@ async function main() {
       childCE.kill();
       await rm(dirCE, { recursive: true, force: true });
     }
+  }
+
+  // ---- legacy -> v3 bridge converter ----------------------------------------
+  // The converter is the only bridge between today's two-layer config and the
+  // three-layer shape, so its warnings are a contract: warn exactly when the
+  // conversion changes routing behavior, stay silent when it does not. The
+  // fixture also carries the three empty-string values the pre-fix config
+  // editor used to write, because no config in the repo carries them and the
+  // repair sweep would otherwise be unpinned.
+  {
+    // a served id is addressable when either layer still answers for it
+    const addressable = (cfg, id) => Boolean(cfg.models[id]) || Boolean(cfg.presets[id]);
+    const old = {
+      backends: [
+        { id: "b1", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_B1" },
+        { id: "b2", baseURL: "http://127.0.0.1:2", apiKeyEnv: "KEY_B2", params: "" },
+        { id: "b3", baseURL: "http://127.0.0.1:3", apiKeyEnv: "KEY_B3" }
+      ],
+      models: {
+        m1: { providers: [{ backend: "b1", upstream: "u" }, { backend: "b2", upstream: "u", params: "" }, { backend: "b3", upstream: "u" }], affinityPool: 2 },
+        "kimi-k3": { providers: [{ backend: "b1", upstream: "u" }] },
+        "glm-5.2": { providers: [{ backend: "b1", upstream: "u" }], retry: "" },
+        "qwen3.7-plus": { providers: [{ backend: "b1", upstream: "u" }] }
+      },
+      presets: {
+        "kimi-k3": { strategy: "affinity", models: [{ model: "kimi-k3", weight: 1 }] },
+        w: { strategy: "weighted", models: ["m1"] },
+        tier: { strategy: "failover", models: ["m1", "kimi-k3"] },
+        amulti: { strategy: "affinity", models: ["m1", "kimi-k3"] },
+        "muse-spark-1.3-contributor": { strategy: "affinity", models: ["glm-5.2"], params: "" },
+        // the live config's actual shape: the empty-string preset params sits on
+        // an IDENTITY preset, which step 1 deletes. Only the repair pass BEFORE
+        // the mapping step can report it - the mapping step never sees it.
+        "qwen3.7-plus": { strategy: "affinity", models: [{ model: "qwen3.7-plus", weight: 1 }], params: "" }
+      },
+      params: { temperature: 0.2 },
+      backoff: { serverBaseMs: 50 }
+    };
+    const r = convertLegacyConfig(old);
+    assert(r.config.models.m1.deployments.length === 3, "v36a) providers map 1:1 to deployments");
+    assert(r.config.models.m1.deployments[2].backupOnly === true, "v36b) affinityPool 2 of 3 marks providers[2..] backupOnly");
+    assert(!r.config.presets["kimi-k3"], "v36c) identity preset dropped, model stays addressable");
+    assert(r.config.presets.w.strategy === "fallback", "v36d) weighted preset maps to fallback silently (order preserved; per-ref weights warned separately)");
+    assert(r.warnings.some((w) => w.includes("kimi-k3")), "v36e) identity drop warned first");
+    assert(r.config.params.temperature === 0.2 && r.config.backoff.serverBaseMs === 50, "v36f) untouched blocks carried through");
+    // Warn ONLY on behavior changes: an affinity preset with MORE THAN ONE ref
+    // loses its session spread under ordered fallback. The live mirror's five
+    // affinity presets are each single-ref, so none is a behavior change (the
+    // three that are identity presets fell to step 1, and the two aliases keep
+    // behaving exactly as before). failover->fallback and weighted->fallback
+    // preserve declared order, so they stay silent.
+    assert(r.warnings.some((w) => w.includes("amulti")), "v36g) affinity multi-model preset warns (session-spread lost)");
+    assert(!r.warnings.some((w) => w.includes("'tier'")), "v36h) failover->fallback does not warn (order preserved)");
+    assert(!r.warnings.some((w) => w.includes("'w'") && w.includes("strategy")), "v36i) weighted->fallback does not warn (order preserved)");
+    // the empty-string repair sweep: the pre-fix editor wrote "" for any JSON
+    // textarea it rendered empty, and a model-level retry/params "" is a
+    // save-mode ERROR that blocks EVERY save (the whole candidate is
+    // validated), so the sweep has to drop every position it can reach.
+    assert(r.config.models["glm-5.2"].retry === undefined, "v36j) a model-level empty-string retry is dropped");
+    assert(old.backends[1].params === "", "v36k2) the sweep does not mutate its input");
+    assert(r.config.backends[1].params === undefined, "v36k) a backend-level empty-string params is dropped");
+    assert(r.config.models.m1.deployments[1].params === undefined, "v36k3) a DEPLOYMENT-level empty-string params is dropped (the provider position maps into the deployment)");
+    assert(r.config.presets["muse-spark-1.3-contributor"].params === undefined, "v36l) a preset-level empty-string params is dropped");
+    assert(
+      r.warnings.filter((w) => w.includes("was an empty string")).length === 5,
+      "v36m) every repaired value warns, all five from one shared sentence (" + JSON.stringify(r.warnings.filter((w) => w.includes("was an empty string"))) + ")"
+    );
+    // the repair pass runs BEFORE the identity drop and before the mapping step.
+    // The live config's shape is exactly this: an empty-string preset params on
+    // a preset that is ALSO an identity preset, so the mapping step never sees
+    // it. Only this assertion makes the early pass load-bearing - with the
+    // mapping step's own silent delete in place, the drop is otherwise invisible.
+    const idRepair = r.warnings.filter((w) => w.includes("presets.qwen3.7-plus.params"));
+    assert(
+      idRepair.length === 1 && idRepair[0].endsWith("was an empty string (an older config editor wrote it); dropped - it was already ignored at runtime"),
+      "v36m2) an empty-string params on an IDENTITY preset is still repaired and reported (" + JSON.stringify(idRepair) + ")"
+    );
+    assert(
+      !r.config.presets["qwen3.7-plus"] && r.config.models["qwen3.7-plus"],
+      "v36m3) and that preset is still dropped as an identity, its id served by the model"
+    );
+    assert(
+      r.warnings.filter((w) => w.includes("presets.muse-spark-1.3-contributor.params")).length === 1,
+      "v36m4) a surviving preset's repair is reported exactly once (no double warn)"
+    );
+    // a non-object preset params (e.g. the number 5, which validateConfig
+    // rejects outright) must not survive conversion either: the repair pass
+    // owns empty strings and the mapping step owns everything else present.
+    const oddPreset = JSON.parse(JSON.stringify(old));
+    oddPreset.presets.tier.params = 5;
+    const r3 = convertLegacyConfig(oddPreset);
+    assert(r3.config.presets.tier.params === undefined, "v36m5) a non-object preset params is dropped by the mapping step");
+    // step 5: a collision that survives the identity drop is refused, not guessed.
+    let refused = null;
+    try {
+      const clash = JSON.parse(JSON.stringify(old));
+      clash.presets.tier.models = ["m1", "tier"];
+      clash.models.tier = { providers: [{ backend: "b1", upstream: "u" }] };
+      convertLegacyConfig(clash);
+    } catch (e) {
+      refused = e;
+    }
+    assert(refused && /conversion refused/.test(refused.message) && refused.message.includes("'tier'"), "v36n) a residual model/preset collision is refused");
+    assert(r.config.models.m1.exposed === true && r.config.presets.w.exposed === true, "v36o) converted entries default to exposed");
+    // Structural completeness: the conversion FINISHED rather than merely ran.
+    // v3-only validator checks are Task 10b's, so what this block can pin today
+    // is that no legacy key survived anywhere and no empty-string artifact did
+    // either. Scope note: the sweep is defined over the value positions the
+    // converter owns (backend, model, deployment, preset), NOT over arbitrary
+    // nested UI data - a nested `meta.pricing.offPeak: ""` in the live file is
+    // deliberately left alone (it is only ever read as === true), so this
+    // assertion is about the fixture's value positions, not a global property.
+    {
+      const emptyAt = [];
+      const walk = (obj, at) => {
+        if (!obj || typeof obj !== "object") return;
+        for (const [k, v] of Object.entries(obj)) {
+          if (v === "") emptyAt.push(at + "." + k);
+          else if (v && typeof v === "object") walk(v, at + "." + k);
+        }
+      };
+      walk(r.config, "config");
+      assert(emptyAt.length === 0, "v36p) no empty-string value survives at any value position of the fixture (" + JSON.stringify(emptyAt) + ")");
+      const legacy = [];
+      for (const [id, m] of Object.entries(r.config.models)) {
+        if (m.providers !== undefined) legacy.push("models." + id + ".providers");
+        if (m.affinityPool !== undefined) legacy.push("models." + id + ".affinityPool");
+        if (!Array.isArray(m.deployments) || !m.deployments.length) legacy.push("models." + id + ".deployments");
+        else {
+          m.deployments.forEach((d, i) => {
+            if (typeof d.backend !== "string" || !d.backend) legacy.push("models." + id + ".deployments[" + i + "].backend");
+            if (typeof d.upstream !== "string" || !d.upstream) legacy.push("models." + id + ".deployments[" + i + "].upstream");
+          });
+        }
+      }
+      for (const [id, p] of Object.entries(r.config.presets)) {
+        if (p.strategy !== "fallback") legacy.push("presets." + id + ".strategy=" + p.strategy);
+        if (p.members !== undefined) legacy.push("presets." + id + ".members");
+        if (p.models.some((e) => typeof e !== "string")) legacy.push("presets." + id + ".models[non-string]");
+      }
+      assert(legacy.length === 0, "v36q) every model is v3-shaped and every preset is fallback with string refs (" + JSON.stringify(legacy) + ")");
+      // exposed defaults where absent and is PRESERVED where already set.
+      const withFlag = JSON.parse(JSON.stringify(old));
+      withFlag.models.m1.exposed = false;
+      withFlag.presets.w.exposed = false;
+      const r2 = convertLegacyConfig(withFlag);
+      assert(r2.config.models.m1.exposed === false && r2.config.presets.w.exposed === false, "v36r) an existing exposed:false is preserved, not overwritten");
+    }
+    // Step 1 is what makes a 20-collision production config convertible, so its
+    // arithmetic is pinned directly: every identity preset goes, and every
+    // model-level id it used to shadow stays addressable.
+    assert(Object.keys(r.config.presets).length === 4, "v36s) exactly the identity preset was dropped (" + Object.keys(r.config.presets).join(",") + ")");
+    assert(
+      Object.keys(old.presets).every((id) => addressable(r.config, id)),
+      "v36t) every preset id dropped as an identity stays served by the same-named model"
+    );
   }
 
   // ---- config write path: single-file bind mount ----------------------------

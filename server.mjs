@@ -1294,6 +1294,136 @@ function seedAnalytics(file) {
   }
 }
 
+// ---- legacy -> v3 bridge ----------------------------------------------------
+
+// Convert today's two-layer config into the three-layer shape. The ORDER is
+// load-bearing and fixed: the identity-preset drop runs FIRST, so every later
+// pass sees the same ids a golden run would, and the residual-collision refusal
+// runs LAST, after the repair sweep has removed the reasons a converted payload
+// would otherwise be unsaveable. Returns { config, warnings }; throws only when
+// a model and a preset still share an id after the drop, which needs a human to
+// decide which one keeps the name.
+// The pre-fix config editor wrote "" for any JSON textarea it rendered empty, so
+// a config saved through it can carry `retry: ""` or `params: ""`. The sentence
+// is ONE constant because two call sites report the same repair (the preset
+// params mapping and the sweep below) and a count that depends on two literals
+// staying byte-identical would drift the moment either is reworded.
+const EMPTY_STRING_REPAIR_MSG = " was an empty string (an older config editor wrote it); dropped - it was already ignored at runtime";
+const repairEmptyString = (obj, at, key, warnings) => {
+  delete obj[key];
+  warnings.push(at + "." + key + EMPTY_STRING_REPAIR_MSG);
+};
+
+function convertLegacyConfig(raw) {
+  const warnings = [];
+  const cfg = JSON.parse(JSON.stringify(raw));
+  cfg.models = cfg.models || {};
+  cfg.presets = cfg.presets || {};
+  // 1) a preset's empty-string `params` is repaired FIRST, before the identity
+  // drop: an IDENTITY preset is deleted in step 2, so a repair reported only
+  // from a later pass would silently skip it - and the live config's only
+  // empty-string preset params sits on exactly such a preset. Reporting it over
+  // the whole set keeps the warning list independent of which presets survive.
+  for (const [id, p] of Object.entries(cfg.presets)) {
+    if (p && typeof p === "object" && p.params === "") repairEmptyString(p, "presets." + id, "params", warnings);
+  }
+  // 2) identity-preset drop: a preset named exactly like a model, listing only
+  // that same name, is a pure pass-through, so dropping it leaves the id served
+  // by the same-named model and frees the name for the v3 XOR rule.
+  for (const [id, p] of Object.entries(cfg.presets)) {
+    const refs = p && Array.isArray(p.models) ? p.models : null;
+    if (refs && refs.length === 1) {
+      const only = typeof refs[0] === "string" ? refs[0] : refs[0] && refs[0].model;
+      if (only === id && cfg.models[id]) {
+        delete cfg.presets[id];
+        warnings.push("preset '" + id + "' is an identity preset and was dropped; the model stays directly addressable");
+      }
+    }
+  }
+  // 3) per-ref weights and preset affinityPool: warn ONLY when routing-relevant.
+  // A weighted preset's per-ref weights WERE honored at request time (weighted
+  // random over models), so losing them changes behavior; affinity picks by
+  // session hash and failover by declared order, so their weights were already
+  // ignored. preset-affinityPool always warns: pool > 1 widened the session
+  // spread under every strategy and v3's fallback has no pool at all.
+  for (const [id, p] of Object.entries(cfg.presets)) {
+    for (const e of p.models || []) {
+      if (e && typeof e === "object" && e.weight != null && p.strategy === "weighted") warnings.push("preset '" + id + "' per-ref weight dropped; weights live on deployments");
+    }
+    if (p.affinityPool !== undefined) warnings.push("preset '" + id + "' affinityPool dropped");
+  }
+  // 4) providers -> deployments 1:1, in declared order. affinityPool N of M
+  // marks the providers past N as backupOnly, which is what the v2 pool meant:
+  // the first N are the session-spread set and the rest are ordered fallbacks.
+  for (const [id, m] of Object.entries(cfg.models)) {
+    if (!m || typeof m !== "object" || !Array.isArray(m.providers)) continue;
+    const pool = m.affinityPool;
+    m.deployments = m.providers.map((pr, i) => {
+      const d = { backend: pr.backend, upstream: pr.upstream };
+      if (pr.weight !== undefined && pr.weight !== 1) d.weight = pr.weight;
+      if (typeof pool === "number" && i >= pool) d.backupOnly = true;
+      for (const k of ["params", "dropParams", "paramMap"]) if (pr[k] !== undefined) d[k] = pr[k];
+      return d;
+    });
+    delete m.providers;
+    delete m.affinityPool;
+    if (m.exposed === undefined) m.exposed = true;
+  }
+  // 5) preset strategies collapse to fallback, preserving declared ref order as
+  // plain model id strings. Only a behavior change warns: an affinity preset
+  // with more than one ref loses its session spread under ordered fallback,
+  // while failover and weighted keep declared order and stay silent.
+  for (const [id, p] of Object.entries(cfg.presets)) {
+    if (p.strategy !== "fallback") {
+      if (p.strategy && p.strategy !== "affinity" && p.strategy !== "failover" && p.strategy !== "weighted") warnings.push("preset '" + id + "' unknown strategy treated as fallback");
+      else if (p.strategy === "affinity" && (p.models || []).length > 1) warnings.push("preset '" + id + "' affinity spread mapped to fallback (ordered failover); session-spread behavior changes");
+      p.strategy = "fallback";
+    }
+    p.models = (p.models || []).map((e) => (typeof e === "string" ? e : e.model));
+    delete p.affinityPool;
+    // Dropping a preset's params is a real behavior change when the value is a
+    // non-empty object (the v2 merge chain had a preset layer, v3 has none), so
+    // that case warns. Every OTHER present value - an empty string, or a
+    // non-object such as `params: 5` that the object check above rejects - is an
+    // editor artifact of the class the repair pass drops, and is dropped here
+    // without a second message.
+    if (p.params !== undefined) {
+      if (p.params && typeof p.params === "object" && !Array.isArray(p.params) && Object.keys(p.params).length) {
+        warnings.push("preset '" + id + "' params dropped; v3 has no preset-level params layer");
+      }
+      delete p.params;
+    }
+    // /api/config serves a derived `members` key; nobody reads it in v3, and a
+    // mixed-era snapshot would otherwise convert carrying a stale key.
+    delete p.members;
+    if (p.exposed === undefined) p.exposed = true;
+  }
+  // 6) empty-string repair sweep. Only MODEL-level retry/params are object-
+  // validated, so only those are save/reload ERRORS - but POST /api/config
+  // validates the WHOLE candidate, so ONE surviving error-class value blocks
+  // every save. All of them are dropped regardless: none means anything at
+  // runtime, so this is a repair, and it warns because it rewrites data the
+  // operator never asked to change.
+  const repairEmpty = (obj, at) => {
+    if (!obj || typeof obj !== "object") return;
+    for (const k of ["params", "retry", "dropParams", "paramMap", "offPeak"]) {
+      if (obj[k] === "") repairEmptyString(obj, at, k, warnings);
+    }
+  };
+  for (const b of cfg.backends || []) repairEmpty(b, "backends." + b.id);
+  for (const [id, m] of Object.entries(cfg.models)) {
+    repairEmpty(m, "models." + id);
+    (m.deployments || []).forEach((d, i) => repairEmpty(d, "models." + id + ".deployments[" + i + "]"));
+  }
+  for (const [id, p] of Object.entries(cfg.presets)) repairEmpty(p, "presets." + id);
+  // 7) residual model/preset collision refuses: a converted config where the
+  // same id is still both cannot be resolved by rule, only by a human.
+  for (const id of Object.keys(cfg.models)) {
+    if (cfg.presets[id]) throw new Error("conversion refused: id '" + id + "' is both a model and a preset");
+  }
+  return { config: cfg, warnings };
+}
+
 // ---- config normalization ---------------------------------------------------
 
 // Normalize the three-layer config at load (initial + hot-reload), in place.
@@ -3601,4 +3731,4 @@ if (isMain) {
   });
 }
 
-export { candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost, writeConfigAtomic, validateConfig };
+export { candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost, writeConfigAtomic, validateConfig, convertLegacyConfig };
