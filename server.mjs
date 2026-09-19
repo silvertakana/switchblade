@@ -2933,6 +2933,41 @@ let cfg = null;
 async function loadConfig() {
   const raw = await readFileP(CONFIG_PATH, "utf8");
   const parsed = JSON.parse(raw);
+  // Validate the on-disk shape BEFORE normalizeConfig repairs it: normalize
+  // silently synthesizes legacy shapes, so validating afterwards would judge
+  // the repair instead of what was written. `cfg` is undefined at boot, which
+  // is what makes the RESTART_ONLY checks vacuous there; load mode is what
+  // makes a dangling preset reference a warning on this path (save still
+  // refuses it).
+  //
+  // The abort is deliberately narrow, because the validator's error set is the
+  // SAVE-side contract and is stricter than what this loader tolerates: it
+  // repairs a non-object `retry` (the live production config carries
+  // retry: ""), synthesizes `models`/`presets` when they are absent or not an
+  // object, and leaves an unset apiKeyEnv to fail closed per backend. A
+  // save-side error the loader repairs must never be able to stop a running
+  // router, so at boot only what the loader genuinely cannot interpret aborts:
+  // a non-object root, or a missing `backends` (ensureBackends and the startup
+  // banner both walk cfg.backends unguarded). A pre-presets-era config file
+  // keeps booting. Everything else is logged and the router starts. At reload,
+  // where a config is already running, ANY error-class finding rejects the
+  // write and the previous config is kept.
+  const verdict = validateConfig(parsed, cfg, { mode: "load" });
+  if (verdict.errors.length) {
+    const detail = verdict.errors.map((e) => (e.path || "(root)") + ": " + e.message).join("; ");
+    if (cfg) {
+      console.error(`[${new Date().toISOString()}] config reload rejected: ${detail}`);
+      return cfg;
+    }
+    const fatal = verdict.errors.filter((e) => e.path === "" || e.path === "backends");
+    if (fatal.length) throw new Error("config invalid: " + detail);
+    for (const e of verdict.errors) {
+      console.error(`[${new Date().toISOString()}] config warning (not fatal at boot): ${e.path || "(root)"}: ${e.message}`);
+    }
+  }
+  for (const w of verdict.warnings) {
+    console.error(`[${new Date().toISOString()}] config warning: ${w.path}: ${w.message}`);
+  }
   // Normalize the three-layer shape (backends -> models -> presets) on every
   // load: validate new-shape entries, synthesize legacy configs, derive preset
   // members. Routing and /api/config only ever see the normalized form.

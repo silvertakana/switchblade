@@ -808,6 +808,198 @@ async function main() {
     delete process.env.KEY_B1;
   }
 
+  // ---- v34) config load wiring: validate before normalize, non-destructive --
+  // Two regimes. BOOT (no previous config): only findings that make the config
+  // UNINTERPRETABLE abort; the classes the loader repairs (an unset apiKeyEnv,
+  // retry: "") log a warning and the router starts. RELOAD (a config is
+  // already running): ANY error-class finding rejects the write and the running
+  // config is kept. The validator's error set is the stricter SAVE-side
+  // contract, so it must never be able to take a running router down.
+  {
+    const dir = await mkdtemp(join(tmpdir(), "lmr-v34-"));
+    const cfgPath = join(dir, "config.json");
+    const envPath = join(dir, ".env");
+    const good = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "v34", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_V34" }],
+      models: { "v34m": { providers: [{ backend: "v34", upstream: "u" }], meta: { label: "good" } } },
+      presets: {}
+    };
+    await writeFile(cfgPath, JSON.stringify(good, null, 2));
+    await writeFile(envPath, "KEY_V34=k\n");
+    const child = spawn(process.execPath, ["server.mjs"], {
+      cwd: join(import.meta.dirname),
+      env: { ...process.env, ROUTER_CONFIG: cfgPath, ROUTER_ENV: envPath },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let base = null;
+    await new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error("no start")), 8000);
+      child.stderr.on("data", (d) => {
+        const m = /listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(d.toString());
+        if (m) { base = "http://127.0.0.1:" + parseInt(m[1], 10); clearTimeout(t); resolve(); }
+      });
+    });
+    try {
+      await new Promise((r) => setTimeout(r, 300));
+      // meta.label SURVIVES normalizeConfig verbatim (normalize never touches
+      // meta), so flipping it proves whether the broken reload was rejected or
+      // loaded: retry:"" would be silently dropped by normalize and is useless
+      // as a probe here.
+      const bad = JSON.parse(JSON.stringify(good));
+      bad.models.v34m.retry = "";
+      bad.models.v34m.meta.label = "broken-write";
+      await writeFile(cfgPath, JSON.stringify(bad, null, 2));
+      await new Promise((r) => setTimeout(r, 900));
+      const live = await (await fetch(base + "/api/config")).json();
+      assert(live.models.v34m && live.models.v34m.meta.label === "good", "v34a) bad reload keeps the previous config running (label=" + (live.models.v34m && live.models.v34m.meta.label) + ")");
+    } finally {
+      child.kill();
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  {
+    // v34b) BOOT tolerance: a backend whose apiKeyEnv names a variable that is
+    //       not set in the child's process is a save-side error the loader
+    //       lets fail closed per backend, so it must not stop startup.
+    const dir = await mkdtemp(join(tmpdir(), "lmr-v34b-"));
+    const cfgPath = join(dir, "config.json");
+    const envPath = join(dir, ".env");
+    const cfgB = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "v34b", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_V34B_MISSING" }],
+      models: { "v34bm": { providers: [{ backend: "v34b", upstream: "u" }] } },
+      presets: {}
+    };
+    await writeFile(cfgPath, JSON.stringify(cfgB, null, 2));
+    await writeFile(envPath, "V34B_UNUSED=x\n");
+    // The child must NOT see the variable: inheriting it would make the test
+    // vacuous wherever the shell happens to define it.
+    const childEnv = { ...process.env, ROUTER_CONFIG: cfgPath, ROUTER_ENV: envPath };
+    delete childEnv.KEY_V34B_MISSING;
+    const child = spawn(process.execPath, ["server.mjs"], {
+      cwd: join(import.meta.dirname),
+      env: childEnv,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let base = null;
+    let err = "";
+    await new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error("v34b server did not start")), 8000);
+      child.stderr.on("data", (d) => {
+        const s = d.toString();
+        err += s;
+        const m = /listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(s);
+        if (m) { base = "http://127.0.0.1:" + parseInt(m[1], 10); clearTimeout(t); resolve(); }
+      });
+    });
+    try {
+      const live = await (await fetch(base + "/api/config")).json();
+      assert(!!(live.backends || []).find((b) => b.id === "v34b"), "v34b) an unset apiKeyEnv does not stop startup");
+      assert(/backends\[0\]\.apiKeyEnv/.test(err) && /config warning/.test(err), "v34b2) the boot tolerance logs the apiKeyEnv field path as a warning");
+    } finally {
+      child.kill();
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  {
+    // v34c) BOOT tolerance on the REAL production shape: the live config
+    //       carries models.glm-5.2.retry === "" (a save-side error the loader
+    //       repairs by warning and deleting). Aborting a boot on it would have
+    //       taken the router down, so this exact shape must start and serve.
+    const dir = await mkdtemp(join(tmpdir(), "lmr-v34c-"));
+    const cfgPath = join(dir, "config.json");
+    const envPath = join(dir, ".env");
+    const cfgC = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "v34c", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_V34C" }],
+      models: { "v34cm": { providers: [{ backend: "v34c", upstream: "u" }], retry: "" } },
+      presets: {}
+    };
+    await writeFile(cfgPath, JSON.stringify(cfgC, null, 2));
+    await writeFile(envPath, "KEY_V34C=k\n");
+    const child = spawn(process.execPath, ["server.mjs"], {
+      cwd: join(import.meta.dirname),
+      env: { ...process.env, ROUTER_CONFIG: cfgPath, ROUTER_ENV: envPath },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let base = null;
+    let err = "";
+    await new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error("v34c server did not start")), 8000);
+      child.stderr.on("data", (d) => {
+        const s = d.toString();
+        err += s;
+        const m = /listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(s);
+        if (m) { base = "http://127.0.0.1:" + parseInt(m[1], 10); clearTimeout(t); resolve(); }
+      });
+    });
+    try {
+      const live = await (await fetch(base + "/api/config")).json();
+      assert(!!(live.models && live.models.v34cm), "v34c) a model carrying retry:'' does not stop startup");
+      assert(/models\.v34cm\.retry/.test(err) && /config warning/.test(err), "v34c2) the retry:'' boot tolerance logs the field path as a warning");
+    } finally {
+      child.kill();
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  {
+    // v34d) BOOT abort, so the tolerance above cannot silently widen into
+    //       "nothing ever aborts". The fatal class is what the LOADER cannot
+    //       interpret: a non-object root, or a missing `backends` (ensureBackends
+    //       and the startup banner both walk cfg.backends unguarded). A missing
+    //       `models` or `presets` is NOT fatal, because normalizeConfig
+    //       synthesizes both, so a pre-presets-era config file keeps booting.
+    //
+    //       A missing `backends` also dies on the pre-change code, as an
+    //       incidental TypeError, so "exits without a banner" alone would pass
+    //       in BOTH directions and prove nothing. The assertion therefore
+    //       discriminates on the FAILURE MODE: the validator's field-path
+    //       message, and no TypeError. Waits for real process exit (a fixed
+    //       sleep could pass on timing alone); a timeout is a FAILURE, not a pass.
+    const dir = await mkdtemp(join(tmpdir(), "lmr-v34d-"));
+    const cfgPath = join(dir, "config.json");
+    const envPath = join(dir, ".env");
+    const cfgD = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      models: { "v34dm": { providers: [{ backend: "v34d", upstream: "u" }] } },
+      presets: {}
+      // `backends` deliberately absent.
+    };
+    await writeFile(cfgPath, JSON.stringify(cfgD, null, 2));
+    await writeFile(envPath, "KEY_V34D=k\n");
+    const child = spawn(process.execPath, ["server.mjs"], {
+      cwd: join(import.meta.dirname),
+      env: { ...process.env, ROUTER_CONFIG: cfgPath, ROUTER_ENV: envPath },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let banner = false;
+    let err = "";
+    child.stderr.on("data", (d) => {
+      const s = d.toString();
+      err += s;
+      if (/listening on http:\/\/127\.0\.0\.1:\d+/.test(s)) banner = true;
+    });
+    const exited = await new Promise((resolve) => {
+      const t = setTimeout(() => resolve("timeout"), 15000);
+      child.on("exit", (code) => { clearTimeout(t); resolve(code); });
+    });
+    try {
+      assert(
+        exited !== "timeout" && exited !== 0 && banner === false &&
+        /config invalid:/.test(err) && /'backends' is required at the top level/.test(err) &&
+        !/TypeError/.test(err),
+        "v34d) a config missing `backends` aborts startup with the validator's field-path message, not an incidental TypeError (exit=" + exited + ", banner=" + banner + ", stderr=" + JSON.stringify(err.slice(-240)) + ")"
+      );
+    } finally {
+      child.kill();
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
   // ---- z-series: three-layer routing (new-shape configs, mock backends) ----
 
   const BO = { rateLimitBaseMs: 50, rateLimitMaxMs: 200, serverBaseMs: 50, serverMaxMs: 200, authBaseMs: 50, authMaxMs: 200, weeklyDefaultMs: 1000 };
