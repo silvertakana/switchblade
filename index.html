@@ -2278,6 +2278,23 @@ async function poll() {
 
 let playgroundStateLoaded = false;
 
+// The model ids this router serves to clients, in the same set and order as
+// /v1/models: exposed presets first, then exposed models, each id once (a preset
+// id wins a collision with a model id). The pickers list exactly this, so the
+// Playground can only request what a client could.
+function servedIds(cfg) {
+  const out = [];
+  for (const id of Object.keys((cfg && cfg.presets) || {})) {
+    if (cfg.presets[id] && cfg.presets[id].exposed === false) continue;
+    if (!out.includes(id)) out.push(id);
+  }
+  for (const id of Object.keys((cfg && cfg.models) || {})) {
+    if (cfg.models[id] && cfg.models[id].exposed === false) continue;
+    if (!out.includes(id)) out.push(id);
+  }
+  return out;
+}
+
 async function loadConfig() {
   try {
     const r = await fetch("/api/config");
@@ -2310,7 +2327,7 @@ async function loadConfig() {
   const sel = $("pgModel");
   const prev = sel.value;
   sel.innerHTML = "";
-  const models = state.cfg && state.cfg.presets ? Object.keys(state.cfg.presets) : [];
+  const models = servedIds(state.cfg);
   for (const m of models) {
     const opt = document.createElement("option");
     opt.value = m;
@@ -3172,9 +3189,11 @@ function loadPlaygroundState() {
     if (saved.model) {
       const sel = $("pgModel");
       if (sel) {
-        let found = false;
-        for (const opt of sel.options) { if (opt.value === saved.model) { found = true; break; } }
-        if (found) sel.value = saved.model;
+        // A selection the config no longer serves must fall back to the first
+        // served id: leaving the picker unselected would post an empty model.
+        const models = servedIds(state.cfg);
+        if (models.includes(saved.model)) sel.value = saved.model;
+        else sel.value = models[0] || "";
       }
     }
     if (saved.stream != null) $("pgStream").checked = !!saved.stream;
@@ -3372,6 +3391,13 @@ async function pgSend() {
   const text = input.value.trim();
   if (!text || pg.streaming) return;
   const model = $("pgModel").value;
+  if (!model) {
+    // An empty id has nothing to route to, so refuse it here rather than posting
+    // a request the router can only answer with a 404.
+    pg.msgs.push({ role: "assistant", content: "Pick a model before sending.", error: true });
+    renderThread();
+    return;
+  }
   const stream = $("pgStream").checked;
   const session = $("pgSession").value.trim();
   const tempRaw = parseFloat($("pgTemp").value);
@@ -3606,7 +3632,7 @@ function populateCompareModels() {
   if (!host) return;
   const prev = new Set(Array.from(host.querySelectorAll("input:checked")).map((cb) => cb.value));
   host.innerHTML = "";
-  const models = state.cfg && state.cfg.presets ? Object.keys(state.cfg.presets) : [];
+  const models = servedIds(state.cfg);
   for (const m of models) {
     const lbl = document.createElement("label");
     lbl.className = "check";

@@ -4336,7 +4336,8 @@ async function main() {
     // template literals and comments are skipped so a brace inside one cannot end
     // the body early (none of the extracted bodies holds a regex literal).
     function sliceFunction(source, name) {
-      const at = source.indexOf("\nfunction " + name + "(");
+      let at = source.indexOf("\nfunction " + name + "(");
+      if (at < 0) at = source.indexOf("\nasync function " + name + "(");
       if (at < 0) return null;
       let depth = 0;
       for (let i = source.indexOf("{", at); i >= 0 && i < source.length; i++) {
@@ -4888,6 +4889,264 @@ async function main() {
         rInvalid === 0,
         "u6m5) every payload the real render path produces validates in save mode (" + rInvalid + " of " + rCount + " entry saves were rejected)" + (rErrs.length ? ": " + rErrs.join(" | ") : "")
       );
+
+      // ---- served-id pickers (Task 7) -----------------------------------------
+      // The Playground selector, the Compare checkboxes and the persisted-selection
+      // restore must all list what the router serves: exposed presets first, then
+      // exposed models, no duplicate. The lists are read back OUT of the DOM the
+      // real functions wrote - loadConfig owns the pgModel populate - and the rule
+      // is cross-checked against a real spawned router's /v1/models, so a picker
+      // that diverges from the served rule fails here rather than in a browser.
+      const pickNeeded = ["loadConfig", "populateCompareModels", "loadPlaygroundState", "pgSend"];
+      const pickBodies = [];
+      const pickBroken = [];
+      for (const name of pickNeeded) {
+        const body = sliceFunction(htmlSource, name);
+        if (!body || !parses(body)) { pickBroken.push(name); continue; }
+        pickBodies.push(body);
+      }
+      const servedBody = sliceFunction(htmlSource, "servedIds");
+      const servedOk = !!servedBody && parses(servedBody);
+      const pickOk = pickBroken.length === 0 && typeof dollarDecl === "string";
+      assert(
+        pickOk,
+        "u7a) the served-id picker harness extracted " + pickBodies.length + "/" + pickNeeded.length + " function(s) plus $ from index.html" +
+          (pickBroken.length ? " [NOT FOUND OR UNPARSEABLE: " + pickBroken.join(", ") + "]" : "") +
+          (typeof dollarDecl === "string" ? "" : " [NOT FOUND OR UNPARSEABLE: $]")
+      );
+
+      if (!pickOk) {
+        assert(false, "u7a2) the served-id picker contract could not be exercised: the harness did not come up");
+      } else {
+        const mkNode = (tag) => ({
+          tagName: String(tag || "div").toUpperCase(),
+          children: [],
+          options: [],
+          value: "",
+          checked: false,
+          disabled: false,
+          className: "",
+          textContent: "",
+          _html: "",
+          style: {},
+          scrollTop: 0,
+          scrollHeight: 0,
+          classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } },
+          appendChild(c) {
+            this.children.push(c);
+            if (this.tagName === "SELECT" && c && c.tagName === "OPTION") this.options.push(c);
+            return c;
+          },
+          get innerHTML() { return this._html; },
+          set innerHTML(v) { this._html = String(v); this.children = []; this.options = []; },
+          addEventListener() {},
+          focus() {},
+          querySelectorAll(sel) {
+            const out = [];
+            const walk = (n) => {
+              for (const c of n.children || []) {
+                if (sel === "input:checked" && c.tagName === "INPUT" && c.checked) out.push(c);
+                walk(c);
+              }
+            };
+            walk(this);
+            return out;
+          },
+        });
+        // A <select> whose value follows the browser's rule: it holds a value only
+        // while an option with that value exists, so a picker left without a
+        // matching option reads "" - the state the send path has to refuse.
+        const mkSelect = () => {
+          const el = mkNode("select");
+          let selected = null;
+          Object.defineProperty(el, "value", {
+            get: () => (selected ? selected.value : ""),
+            set: (v) => { selected = el.options.find((o) => o.value === String(v)) || null; },
+          });
+          Object.defineProperty(el, "innerHTML", {
+            get: () => el._html,
+            set: (v) => { el._html = String(v); el.children = []; el.options = []; selected = null; },
+          });
+          return el;
+        };
+        const servedRule = (c) => {
+          const out = [];
+          for (const id of Object.keys((c && c.presets) || {})) {
+            if (c.presets[id] && c.presets[id].exposed === false) continue;
+            if (!out.includes(id)) out.push(id);
+          }
+          for (const id of Object.keys((c && c.models) || {})) {
+            if (c.models[id] && c.models[id].exposed === false) continue;
+            if (!out.includes(id)) out.push(id);
+          }
+          return out;
+        };
+        const jw = (v) => JSON.stringify(v);
+
+        // Mount the real loadConfig - which builds the pgModel options, populates
+        // the compare list, then applies the persisted selection - against a fake
+        // DOM that those functions themselves create.
+        const mkPicker = async (cfg, saved) => {
+          const els = new Map();
+          const el = (id) => {
+            if (!els.has(id)) els.set(id, id === "pgModel" ? mkSelect() : mkNode("div"));
+            return els.get(id);
+          };
+          const posted = [];
+          const sandbox = {
+            console,
+            state: { cfg: null },
+            PRESET_META: {},
+            playgroundStateLoaded: false,
+            PG_STORAGE_KEY: "lmr-test-pg",
+            pg: { msgs: [], streaming: false, cacheHits: 0, cacheMisses: 0 },
+            safeGet: () => JSON.stringify(saved || {}),
+            highlightJSON: () => "",
+            renderPresets: () => {},
+            renderModels: () => {},
+            renderThread: () => {},
+            restoreDebugState: () => {},
+            setDebug: () => {},
+            setLatencyMetric: () => {},
+            setTokensMetric: () => {},
+            setCostMetric: () => {},
+            savePlaygroundState: () => {},
+            applyServerDebugMetrics: () => {},
+            poll: async () => {},
+            esc: (v) => String(v == null ? "" : v),
+            chatUrl: () => "http://127.0.0.1:9/v1/chat/completions",
+            pgAuthHeader: () => null,
+            modelUsesThinkingControl: () => false,
+            document: {
+              getElementById: (id) => el(id),
+              createElement: (t) => (t === "select" ? mkSelect() : mkNode(t)),
+              createTextNode: (t) => ({ nodeValue: t }),
+            },
+            fetch: async (url, opts) => {
+              if (opts && opts.body) posted.push({ url: String(url), body: opts.body });
+              if (String(url).includes("/api/config")) return { json: async () => cfg };
+              return { ok: true, headers: { get: () => "u7mock" }, json: async () => ({ choices: [{ message: { content: "ok" } }] }) };
+            },
+          };
+          const exports = "({ $, loadConfig, populateCompareModels, loadPlaygroundState, pgSend" + (servedOk ? ", servedIds" : "") + " })";
+          const program = [dollarDecl].concat(pickBodies, servedOk ? [servedBody] : [], [exports]).join("\n");
+          const api = vm.runInContext(program, vm.createContext(sandbox));
+          await api.loadConfig();
+          return {
+            api,
+            posted,
+            el,
+            pg: sandbox.pg,
+            select: el("pgModel"),
+            options: () => el("pgModel").options.map((o) => o.value),
+            checkedIds: () => el("pgCompareModels").querySelectorAll("input:checked").map((c) => c.value),
+          };
+        };
+
+        const pickCfg = {
+          presets: {
+            "hidden-p": { exposed: false, models: ["m1"] },
+            p1: { models: ["m1"] },
+            shared: { models: ["m2"] },
+          },
+          models: {
+            m1: {},
+            "hidden-m": { exposed: false },
+            shared: {},
+            m2: {},
+          },
+        };
+        const want = servedRule(pickCfg);
+        const A = await mkPicker(pickCfg, { model: "gone-xyz", msgs: [] });
+        const servedList = servedOk && typeof A.api.servedIds === "function" ? A.api.servedIds(pickCfg) : null;
+
+        assert(
+          servedList !== null && jw(servedList) === jw(want),
+          "u7b) servedIds(cfg) lists exposed presets then exposed models, drops duplicates, and lets a preset id win a collision (got " +
+            (servedList === null ? "[servedIds NOT FOUND IN index.html]" : jw(servedList)) + ", want " + jw(want) + ")"
+        );
+        assert(
+          jw(A.options()) === jw(want),
+          "u7c) the real Playground picker lists exactly the served ids (got " + jw(A.options()) + ", want " + jw(want) + ")"
+        );
+        assert(
+          jw(A.checkedIds()) === jw(want),
+          "u7d) the real Compare picker lists exactly the served ids (got " + jw(A.checkedIds()) + ", want " + jw(want) + ")"
+        );
+        assert(
+          A.select.value === want[0] && A.select.value !== "",
+          "u7e) restoring a selection whose model no longer exists falls back to the FIRST served id (got " + jw(A.select.value) + ", want " + jw(want[0]) + ")"
+        );
+
+        const B = await mkPicker(pickCfg, { model: "m2", msgs: [] });
+        assert(
+          B.select.value === "m2",
+          "u7f) restoring a selection that is still served keeps it, including a served model id (got " + jw(B.select.value) + ", want " + jw("m2") + ")"
+        );
+
+        // The rule is pinned against a real router, not only against a locally
+        // recomputed expectation: the same ids in the same order as /v1/models.
+        const xCfg = {
+          port: 0,
+          prefix: "/v1",
+          masterKeyEnv: null,
+          backends: [{ id: "u7b", baseURL: "http://127.0.0.1:9", apiKeyEnv: "KEY_U7", model: "up-1" }],
+          models: {
+            p1: { providers: [{ backend: "u7b", upstream: "up-1" }] },
+            m2: { providers: [{ backend: "u7b", upstream: "up-2" }] },
+          },
+          presets: { p1: { strategy: "failover", models: ["p1"] }, p2: { strategy: "failover", models: ["m2"] } },
+        };
+        const X = await mkPicker(xCfg, { model: "p1", msgs: [] });
+        let servedByServer = null;
+        let servedError = null;
+        try {
+          const x = await startRouterCfg(xCfg, "KEY_U7=test-key\n");
+          try {
+            const rr = await fetch(x.base + "/v1/models");
+            servedByServer = (await rr.json()).data.map((d) => d.id);
+          } finally {
+            x.child.kill();
+          }
+        } catch (e) {
+          servedError = e.message;
+        }
+        assert(
+          !!servedByServer && servedByServer.length > 0,
+          "u7g) a real router's /v1/models list was read for the served-id cross-check" + (servedError ? " [child failed: " + servedError + "]" : "")
+        );
+        const xList = servedOk && typeof X.api.servedIds === "function" ? X.api.servedIds(xCfg) : null;
+        assert(
+          xList !== null && jw(xList) === jw(servedByServer),
+          "u7h) servedIds(cfg) yields the same ids in the same order as a real router's /v1/models (got " +
+            (xList === null ? "[servedIds NOT FOUND IN index.html]" : jw(xList)) + ", server " + jw(servedByServer) + ")"
+        );
+        assert(
+          jw(X.options()) === jw(servedByServer),
+          "u7i) the Playground picker lists exactly what a real router serves, in the same order (got " + jw(X.options()) + ", server " + jw(servedByServer) + ")"
+        );
+
+        // With nothing served the picker cannot hold a value at all, so the send
+        // path must refuse instead of posting a request the router can only reject.
+        const C = await mkPicker({ presets: {}, models: {} }, { model: "gone-xyz", msgs: [] });
+        C.el("pgInput").value = "hello";
+        C.el("pgStream").checked = false;
+        await C.api.pgSend();
+        assert(
+          C.posted.length === 0 && C.pg.msgs.length === 1 && C.pg.msgs[0].error === true,
+          "u7j) the send path refuses to post an empty model id (posted " + C.posted.length + ", msgs " + jw(C.pg.msgs.map((m) => m.content)) + ")"
+        );
+
+        A.pg.msgs.length = 0;
+        A.el("pgInput").value = "hello";
+        A.el("pgStream").checked = false;
+        await A.api.pgSend();
+        const aSent = A.posted.filter((p) => !p.url.includes("/api/config"));
+        assert(
+          aSent.length === 1 && JSON.parse(aSent[0].body).model === want[0],
+          "u7k) a served model is still posted with its own id, so the empty-id guard is not a dead send path (posted " + aSent.length + ")"
+        );
+      }
     }
   }
 
