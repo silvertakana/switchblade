@@ -377,6 +377,37 @@ function validateConfig(candidate, current) {
           err(pat + ".upstream", `no upstream given and backend '${pr.backend}' has no default model`);
         }
       });
+      if (m.affinityPool !== undefined && (!Number.isInteger(m.affinityPool) || m.affinityPool < 1)) {
+        err(at + ".affinityPool", "affinityPool must be an integer >= 1");
+      }
+      if (m.retry !== undefined) {
+        if (!m.retry || typeof m.retry !== "object" || Array.isArray(m.retry)) {
+          err(at + ".retry", "retry must be an object {maxRetries, baseMs, maxMs, multiplier, totalMs}");
+        } else {
+          if (!Number.isInteger(m.retry.maxRetries) || m.retry.maxRetries < 0) err(at + ".retry.maxRetries", "retry.maxRetries must be a non-negative integer");
+          for (const k of ["baseMs", "maxMs", "multiplier", "totalMs"]) {
+            if (m.retry[k] !== undefined && (typeof m.retry[k] !== "number" || !(m.retry[k] >= 0))) err(at + ".retry." + k, "retry." + k + " must be a number");
+          }
+        }
+      }
+      if (m.params !== undefined && (!m.params || typeof m.params !== "object" || Array.isArray(m.params))) {
+        err(at + ".params", "params must be an object");
+      }
+      providers.forEach((pr, i) => {
+        const pat = at + ".providers[" + i + "]";
+        if (pr && pr.params !== undefined && (!pr.params || typeof pr.params !== "object" || Array.isArray(pr.params))) err(pat + ".params", "params must be an object");
+        if (pr && pr.paramMap !== undefined && (!pr.paramMap || typeof pr.paramMap !== "object" || Array.isArray(pr.paramMap))) err(pat + ".paramMap", "paramMap must be an object");
+      });
+      if (m.meta !== undefined && m.meta.pricing !== undefined) {
+        const prc = m.meta.pricing;
+        if (!prc || typeof prc !== "object" || Array.isArray(prc)) {
+          err(at + ".meta.pricing", "meta.pricing must be an object");
+        } else {
+          for (const k of ["inputPerM", "outputPerM", "cacheHitInputPerM"]) {
+            if (prc[k] !== undefined && typeof prc[k] !== "number") err(at + ".meta.pricing." + k, "meta.pricing." + k + " must be a number");
+          }
+        }
+      }
       if (typeof m.affinityPool === "number" && m.affinityPool > providers.length) {
         warn(at + ".affinityPool", `affinityPool ${m.affinityPool} exceeds ${providers.length} provider(s); it clamps at request time`);
       }
@@ -3501,4 +3532,4 @@ if (isMain) {
   });
 }
 
-export { candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost, writeConfigAtomic };
+export { candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost, writeConfigAtomic, validateConfig };

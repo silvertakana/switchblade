@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { spawn } from "node:child_process";
 // Unit-level imports: server.mjs only starts the server when run as a script,
 // so importing it here gives direct access to strategy selection for tests.
-import { candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost, writeConfigAtomic } from "./server.mjs";
+import { candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost, writeConfigAtomic, validateConfig } from "./server.mjs";
 
 const HOST = "127.0.0.1";
 let passed = 0;
@@ -739,6 +739,32 @@ async function main() {
       imp.ordered.length === 1 && imp.ordered[0].model === "b" && imp.ordered[0].backend === "b" && imp.ordered[0].upstream === "ub",
       "y9) implicit bare-model addressing returns single-model ordered list (" + JSON.stringify(imp) + ")"
     );
+  }
+
+  // v31) typed model validation: the save-side validator rejects a bad type on
+  //      every model field the editor can write (old shape, no schema change).
+  {
+    const base = {
+      backends: [{ id: "b1", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_B1" }],
+      models: {
+        "m1": {
+          providers: [{ backend: "b1", upstream: "u1" }],
+          retry: "",
+          affinityPool: 1.5,
+          params: "nope",
+          meta: { pricing: { inputPerM: "cheap" } }
+        }
+      },
+      presets: { "p1": { strategy: "affinity", models: ["m1"] } }
+    };
+    process.env.KEY_B1 = "x";
+    const v = validateConfig(base, base);
+    const paths = v.errors.map((e) => e.path);
+    assert(paths.includes("models.m1.retry"), "v31a) retry \"\" is an error (" + JSON.stringify(paths) + ")");
+    assert(paths.includes("models.m1.affinityPool"), "v31b) non-integer affinityPool is an error");
+    assert(paths.includes("models.m1.params"), "v31c) non-object params is an error");
+    assert(paths.includes("models.m1.meta.pricing.inputPerM"), "v31d) non-numeric pricing is an error");
+    delete process.env.KEY_B1;
   }
 
   // ---- z-series: three-layer routing (new-shape configs, mock backends) ----
