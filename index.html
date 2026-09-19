@@ -4805,7 +4805,7 @@ function renderCfgModal() {
       cfgField("Off-peak pricing (JSON, optional)", "f_offPeak", { type: "textarea", value: data.meta && data.meta.pricing && data.meta.pricing.offPeak, sub: "For models with discounted off-peak rates, e.g. {\"inputPerM\":0.14,\"outputPerM\":0.28}." }) +
       cfgField("Extra params (JSON, optional)", "f_params", { type: "textarea", value: data.params }) +
       cfgField("Retry (JSON, optional)", "f_retry", { type: "textarea", value: data.retry, sub: "Per-provider transient retry: maxRetries, baseMs, maxMs, multiplier, totalMs." });
-    cfg.modal.provs = (Array.isArray(data.providers) ? data.providers : []).map((p) => ({ backend: p.backend || "", upstream: p.upstream || "" }));
+    cfg.modal.provs = (Array.isArray(data.providers) ? data.providers : []).map((p) => ({ backend: p.backend || "", upstream: p.upstream || "", prev: p }));
     renderProvList();
   } else if (kind === "presets") {
     $("cfgModalTitle").textContent = isNew ? "Add preset" : "Edit preset: " + key;
@@ -4903,62 +4903,78 @@ function cfgModalCollect() {
   const num = (id) => { const s = String(val(id)).trim(); return s === "" ? undefined : Number(s); };
   const bool = (id) => { const el = $(id); return el ? el.checked : false; };
 
+  // The modal edits a SUBSET of an entry's keys, so every branch starts from the
+  // entry as it stands and touches only its own fields: a key with no field here
+  // (a dialect key, a v3 shape, anything the form does not know yet) survives a
+  // save, and a box the user emptied removes its key instead of keeping the value
+  // that is no longer on screen.
+  const prevEntry = (bucket) => {
+    const src = (cfg.draft || {})[bucket];
+    const raw = Array.isArray(src)
+      ? (cfg.modal.index == null ? null : src[cfg.modal.index])
+      : (cfg.modal.key == null ? null : src && src[cfg.modal.key]);
+    return raw && typeof raw === "object" && !Array.isArray(raw) ? cfgDeepCopy(raw) : {};
+  };
+  const setText = (o, key, id) => { const v = String(val(id)).trim(); if (v) o[key] = v; else delete o[key]; };
+  const setNum = (o, key, id) => { const n = num(id); if (n !== undefined && !Number.isNaN(n)) o[key] = n; else delete o[key]; };
+  const setJson = (o, key, id) => { const v = cfgParseMaybeJson(val(id)); if (v !== undefined) o[key] = v; else delete o[key]; };
+
   if (kind === "backends") {
-    const b = {};
-    if (val("f_id").trim()) b.id = val("f_id").trim();
-    if (val("f_baseURL").trim()) b.baseURL = val("f_baseURL").trim();
-    if (val("f_apiKeyEnv").trim()) b.apiKeyEnv = val("f_apiKeyEnv").trim();
-    const t = num("f_timeoutMs");
-    if (t !== undefined && !Number.isNaN(t)) b.timeoutMs = t;
+    const b = prevEntry("backends");
+    setText(b, "id", "f_id");
+    setText(b, "baseURL", "f_baseURL");
+    setText(b, "apiKeyEnv", "f_apiKeyEnv");
+    setNum(b, "timeoutMs", "f_timeoutMs");
     if (bool("f_translateDeveloperRole")) b.translateDeveloperRole = true;
-    if (val("f_model").trim()) b.model = val("f_model").trim();
-    const params = cfgParseMaybeJson(val("f_params"));
-    if (params !== undefined) b.params = params;
+    else delete b.translateDeveloperRole;
+    setText(b, "model", "f_model");
+    setJson(b, "params", "f_params");
     return b;
   }
   if (kind === "models") {
-    const m = {};
-    if (val("f_id").trim()) m.id = val("f_id").trim();
+    const m = prevEntry("models");
+    setText(m, "id", "f_id");
     m.providers = (cfg.modal.provs || [])
       .filter((p) => p.backend)
-      .map((p) => (p.upstream ? { backend: p.backend, upstream: p.upstream } : { backend: p.backend }));
-    const ap = num("f_affinityPool");
-    if (ap !== undefined && !Number.isNaN(ap)) m.affinityPool = ap;
-    const meta = {};
-    if (val("f_metaLabel").trim()) meta.label = val("f_metaLabel").trim();
-    const ctx = num("f_metaCtx");
-    if (ctx !== undefined && !Number.isNaN(ctx)) meta.contextWindow = ctx;
-    const pricing = {};
-    const pin = num("f_priceIn"), pout = num("f_priceOut"), pcache = num("f_priceCache");
-    if (pin !== undefined && !Number.isNaN(pin)) pricing.inputPerM = pin;
-    if (pout !== undefined && !Number.isNaN(pout)) pricing.outputPerM = pout;
-    if (pcache !== undefined && !Number.isNaN(pcache)) pricing.cacheHitInputPerM = pcache;
-    const off = cfgParseMaybeJson(val("f_offPeak"));
-    if (off !== undefined) pricing.offPeak = off;
+      .map((p) => {
+        const out = p.prev && typeof p.prev === "object" ? cfgDeepCopy(p.prev) : {};
+        out.backend = p.backend;
+        if (p.upstream) out.upstream = p.upstream;
+        else delete out.upstream;
+        return out;
+      });
+    setNum(m, "affinityPool", "f_affinityPool");
+    const meta = Object.assign({}, m.meta && typeof m.meta === "object" && !Array.isArray(m.meta) ? m.meta : {});
+    const pricing = Object.assign({}, meta.pricing && typeof meta.pricing === "object" && !Array.isArray(meta.pricing) ? meta.pricing : {});
+    setText(meta, "label", "f_metaLabel");
+    setNum(meta, "contextWindow", "f_metaCtx");
+    setNum(pricing, "inputPerM", "f_priceIn");
+    setNum(pricing, "outputPerM", "f_priceOut");
+    setNum(pricing, "cacheHitInputPerM", "f_priceCache");
+    setJson(pricing, "offPeak", "f_offPeak");
     if (Object.keys(pricing).length) meta.pricing = pricing;
+    else delete meta.pricing;
     if (Object.keys(meta).length) m.meta = meta;
-    const params = cfgParseMaybeJson(val("f_params"));
-    if (params !== undefined) m.params = params;
-    const retry = cfgParseMaybeJson(val("f_retry"));
-    if (retry !== undefined) m.retry = retry;
+    else delete m.meta;
+    setJson(m, "params", "f_params");
+    setJson(m, "retry", "f_retry");
     return m;
   }
   if (kind === "presets") {
-    const p = {};
-    if (val("f_id").trim()) p.id = val("f_id").trim();
+    const p = prevEntry("presets");
+    setText(p, "id", "f_id");
     p.strategy = val("f_strategy") || "affinity";
     p.models = (cfg.modal.models || [])
       .filter((e) => e.model)
       .map((e) => (e.weight == null || e.weight === "" ? e.model : { model: e.model, weight: Number(e.weight) }));
-    const ap = num("f_affinityPool");
-    if (ap !== undefined && !Number.isNaN(ap)) p.affinityPool = ap;
-    const meta = {};
-    if (val("f_metaLabel").trim()) meta.label = val("f_metaLabel").trim();
-    if (val("f_metaTier").trim()) meta.tier = val("f_metaTier").trim();
-    if (val("f_metaWhen").trim()) meta.whenToUse = val("f_metaWhen").trim();
+    setNum(p, "affinityPool", "f_affinityPool");
+    const meta = Object.assign({}, p.meta && typeof p.meta === "object" && !Array.isArray(p.meta) ? p.meta : {});
+    setText(meta, "label", "f_metaLabel");
+    setText(meta, "tier", "f_metaTier");
+    setText(meta, "whenToUse", "f_metaWhen");
     if (Object.keys(meta).length) p.meta = meta;
-    const params = cfgParseMaybeJson(val("f_params"));
-    if (params !== undefined) p.params = params;
+    else delete p.meta;
+    setJson(p, "params", "f_params");
     return p;
   }
   return null;

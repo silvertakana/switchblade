@@ -7,6 +7,7 @@ import { writeFile, mkdtemp, rm, readFile, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
+import vm from "node:vm";
 // Unit-level imports: server.mjs only starts the server when run as a script,
 // so importing it here gives direct access to strategy selection for tests.
 import { candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost, writeConfigAtomic, validateConfig } from "./server.mjs";
@@ -4311,6 +4312,340 @@ async function main() {
     } finally {
       childW.kill();
       await rm(dirW, { recursive: true, force: true });
+    }
+  }
+
+  // ---- config editor: merge-preserve contract (index.html) -------------------
+  // index.html ships its UI as one inline <script>, and the config editor's
+  // collect/apply pair are top-level declarations - so they are extracted BY NAME
+  // with brace matching and evaluated in a node:vm context against stub globals.
+  // That runs the real production editor code headlessly: no browser, no jsdom,
+  // no dependency. The extractor is the part that can rot silently, so u6a proves
+  // it found every function before any contract assertion runs and fails loudly
+  // (naming what was missing) if it did not.
+  {
+    let htmlSource = "";
+    let readError = null;
+    try {
+      htmlSource = await readFile(join(import.meta.dirname, "index.html"), "utf8");
+    } catch (e) {
+      readError = e.message;
+    }
+
+    // Source of one top-level `function NAME(...) {...}`, located by name. Strings,
+    // template literals and comments are skipped so a brace inside one cannot end
+    // the body early (none of the extracted bodies holds a regex literal).
+    function sliceFunction(source, name) {
+      const at = source.indexOf("\nfunction " + name + "(");
+      if (at < 0) return null;
+      let depth = 0;
+      for (let i = source.indexOf("{", at); i >= 0 && i < source.length; i++) {
+        const c = source[i];
+        if (c === "\"" || c === "'" || c === "`") {
+          for (i++; i < source.length && source[i] !== c; i++) if (source[i] === "\\") i++;
+          continue;
+        }
+        if (c === "/" && source[i + 1] === "/") {
+          const nl = source.indexOf("\n", i);
+          if (nl < 0) break;
+          i = nl;
+          continue;
+        }
+        if (c === "/" && source[i + 1] === "*") {
+          const end = source.indexOf("*/", i + 2);
+          if (end < 0) break;
+          i = end + 1;
+          continue;
+        }
+        if (c === "{") depth++;
+        else if (c === "}" && --depth === 0) return source.slice(at + 1, i + 1);
+      }
+      return null;
+    }
+
+    const needed = ["cfgDeepCopy", "cfgParseMaybeJson", "cfgMutate", "cfgCloseModal", "renderCfgModal", "cfgModalCollect", "cfgApplyModal", "countRefsTo"];
+    const bodies = [];
+    const broken = [];
+    for (const name of needed) {
+      const body = sliceFunction(htmlSource, name);
+      if (!body || !(() => { try { new vm.Script(body); return true; } catch { return false; } })()) {
+        broken.push(name);
+        continue;
+      }
+      bodies.push(body);
+    }
+    const dollarDecl = (htmlSource.match(/\nconst \$ = [^\n;]*;/) || [])[0];
+    if (!dollarDecl || !(() => { try { new vm.Script(dollarDecl); return true; } catch { return false; } })()) broken.push("$");
+
+    // The vm globals: `cfg` is the draft/modal state, getElementById serves form
+    // stubs, and the HTML-building helpers stay inert - only the two functions
+    // that read the form and write the draft are under test here.
+    const fields = new Map();
+    const stubField = (v) => ({ value: typeof v === "boolean" ? String(v) : v == null ? "" : String(v), checked: v === true, style: {}, innerHTML: "", textContent: "" });
+    const mountFields = (spec) => {
+      fields.clear();
+      for (const [id, v] of Object.entries(spec)) fields.set(id, stubField(v));
+    };
+    const confirmLog = [];
+    let confirmAnswer = true;
+    const cfg = { draft: null, modal: null, dirty: false };
+    const sandbox = {
+      cfg,
+      console,
+      confirm: (msg) => { confirmLog.push(msg); return confirmAnswer; },
+      renderConfig: () => {},
+      document: { getElementById: (id) => { if (!fields.has(id)) fields.set(id, stubField("")); return fields.get(id); } },
+      esc: (v) => String(v == null ? "" : v),
+      cfgField: () => "",
+      cfgJsonText: () => "",
+      cfgEnvNames: () => [],
+      renderProvList: () => {},
+      renderPresetModelList: () => {},
+    };
+    let api = null;
+    let evalError = null;
+    if (broken.length === 0) {
+      const program = [dollarDecl]
+        .concat(bodies, ["({ $, cfgDeepCopy, cfgParseMaybeJson, cfgMutate, cfgCloseModal, renderCfgModal, cfgModalCollect, cfgApplyModal, countRefsTo })"])
+        .join("\n");
+      try {
+        api = vm.runInContext(program, vm.createContext(sandbox));
+      } catch (e) {
+        evalError = e.message;
+      }
+    }
+    const harnessOk = broken.length === 0 && !evalError && !!api && typeof api.$ === "function" && typeof api.cfgModalCollect === "function" && typeof api.cfgApplyModal === "function";
+    assert(
+      harnessOk,
+      "u6a) the index.html editor harness extracted " + bodies.length + "/" + needed.length + " function(s) plus $ and evaluated them in a vm context" +
+        (readError ? " [index.html unreadable: " + readError + "]" : "") +
+        (broken.length ? " [NOT FOUND OR UNPARSEABLE: " + broken.join(", ") + "]" : "") +
+        (evalError ? " [evaluation failed: " + evalError + "]" : "")
+    );
+
+    if (!harnessOk) {
+      assert(false, "u6a2) the config editor merge-preserve contract could not be exercised: the harness did not come up");
+    } else {
+      const norm = (v) => JSON.stringify(v, (k, x) => (x && typeof x === "object" && !Array.isArray(x) ? Object.keys(x).sort().reduce((o, kk) => ((o[kk] = x[kk]), o), {}) : x));
+      const same = (a, b) => norm(a) === norm(b);
+      const open = (kind, key, data, index) => {
+        cfg.modal = { kind, key, data: api.cfgDeepCopy(data || {}), index: index == null ? null : index, provs: [], models: [] };
+      };
+
+      const modelEntry = {
+        providers: [
+          { backend: "go", upstream: "glm-5.3", dropParams: ["temperature"], params: { top_p: 1 }, paramMap: { max_tokens: "max_output_tokens" }, unownedRowKey: 7 },
+          { backend: "cc", upstream: "glm-5.3-cc", dropParams: ["top_p"] },
+        ],
+        affinityPool: 2,
+        retry: { maxRetries: 2, baseMs: 500, maxMs: 4000, multiplier: 2, totalMs: 20000 },
+        params: { temperature: 0.7 },
+        meta: { label: "GLM 5.3", contextWindow: 200000, unownedMeta: "keep", pricing: { inputPerM: 0.1, outputPerM: 0.4, cacheHitInputPerM: 0.01, unownedPricing: "keep" } },
+        exposed: false,
+        deployments: [{ backend: "go", upstream: "glm-5.3", backupOnly: true }],
+      };
+      const presetEntry = {
+        strategy: "failover",
+        models: ["glm-5.3-flash", { model: "z", weight: 3 }],
+        affinityPool: 3,
+        params: { reasoning_effort: "high" },
+        exposed: false,
+        strategyV3: { kind: "ordered" },
+        meta: { label: "Tier", tier: "balanced", whenToUse: "cheap", unownedMeta: "keep" },
+      };
+      const backendEntry = { id: "go", baseURL: "http://go", apiKeyEnv: "KEY_GO", translateDeveloperRole: true, model: "deepseek-v4-flash", timeoutMs: 90000, params: { temperature: 0.2 }, dropParams: ["n"], unownedBackendKey: "keep" };
+      const freshDraft = () => ({
+        port: 8787,
+        backends: [{ id: "go", baseURL: "http://go", apiKeyEnv: "KEY_GO" }, { id: "cc", baseURL: "http://cc", apiKeyEnv: "KEY_CC" }],
+        models: {
+          a: { providers: [{ backend: "go", upstream: "ua" }] },
+          "glm-5.3-flash": api.cfgDeepCopy(modelEntry),
+          z: { providers: [{ backend: "cc", upstream: "uz" }] },
+        },
+        presets: {
+          "p-one": { strategy: "affinity", models: [{ model: "glm-5.3-flash", weight: 2 }] },
+          "p-two": { strategy: "failover", models: ["glm-5.3-flash"] },
+        },
+      });
+      const modelFields = (over) =>
+        Object.assign(
+          {
+            f_id: "glm-5.3-flash",
+            f_affinityPool: "2",
+            f_metaLabel: "GLM 5.3",
+            f_metaCtx: "200000",
+            f_priceIn: "0.1",
+            f_priceOut: "0.4",
+            f_priceCache: "0.01",
+            f_offPeak: "",
+            f_params: '{"temperature":0.7}',
+            f_retry: '{"maxRetries":2,"baseMs":500,"maxMs":4000,"multiplier":2,"totalMs":20000}',
+          },
+          over || {}
+        );
+
+      // A model whose providers carry dialect keys, rendered by the REAL
+      // renderCfgModal: the row objects it builds are what collect sees, so a row
+      // that stops carrying its previous provider fails here.
+      cfg.draft = freshDraft();
+      open("models", "glm-5.3-flash", Object.assign({ id: "glm-5.3-flash" }, api.cfgDeepCopy(modelEntry)));
+      mountFields(modelFields());
+      api.renderCfgModal();
+      assert(
+        cfg.modal.provs.length === 2 && !!cfg.modal.provs[0].prev && same(cfg.modal.provs[0].prev.dropParams, ["temperature"]),
+        "u6b) the real modal render keeps each provider's previous object reachable on its row"
+      );
+      const merged = api.cfgModalCollect();
+      assert(same(merged.providers, modelEntry.providers), "u6b2) collect keeps dropParams/params/paramMap and unowned keys on every provider row");
+      assert(merged.exposed === false && same(merged.deployments, modelEntry.deployments), "u6b3) collect keeps a model-level unowned key, including the v3 exposed/deployments shapes");
+      assert(merged.meta.unownedMeta === "keep" && merged.meta.pricing.unownedPricing === "keep", "u6b4) collect keeps unowned keys inside meta and meta.pricing");
+
+      const mergedSnap = api.cfgDeepCopy(merged);
+      delete mergedSnap.id;
+      api.cfgApplyModal();
+      const storedModel = cfg.draft.models["glm-5.3-flash"];
+      assert(
+        !!storedModel && same(storedModel, mergedSnap) && !("prev" in storedModel) && !("data" in storedModel),
+        "u6c) apply stores the merged model under its own key with no modal bookkeeping keys left behind"
+      );
+
+      cfg.draft.presets.mix = api.cfgDeepCopy(presetEntry);
+      open("presets", "mix", Object.assign({ id: "mix" }, api.cfgDeepCopy(presetEntry)));
+      mountFields({ f_id: "mix", f_strategy: "failover", f_affinityPool: "3", f_metaLabel: "Tier", f_metaTier: "balanced", f_metaWhen: "cheap", f_params: '{"reasoning_effort":"high"}' });
+      api.renderCfgModal();
+      const mergedPreset = api.cfgModalCollect();
+      assert(
+        mergedPreset.exposed === false && same(mergedPreset.strategyV3, { kind: "ordered" }) && mergedPreset.meta.unownedMeta === "keep",
+        "u6d) a preset keeps unowned keys (exposed, a real v3 field) and unowned meta keys"
+      );
+      const presetSnap = api.cfgDeepCopy(mergedPreset);
+      delete presetSnap.id;
+      api.cfgApplyModal();
+      assert(
+        same(cfg.draft.presets.mix, presetSnap) && same(cfg.draft.presets.mix.models, ["glm-5.3-flash", { model: "z", weight: 3 }]),
+        "u6d2) apply stores the merged preset without disturbing its model rows"
+      );
+
+      cfg.draft = freshDraft();
+      cfg.draft.backends[0] = api.cfgDeepCopy(backendEntry);
+      open("backends", "go", api.cfgDeepCopy(backendEntry), 0);
+      mountFields({ f_id: "go", f_baseURL: "http://go", f_apiKeyEnv: "KEY_GO", f_timeoutMs: "90000", f_translateDeveloperRole: true, f_model: "deepseek-v4-flash", f_params: '{"temperature":0.2}' });
+      api.renderCfgModal();
+      assert(same(api.cfgModalCollect(), backendEntry), "u6e) a backend keeps unowned keys (dropParams, backend-level params) through collect");
+
+      // An emptied box is an explicit clear: its key must go, never silently keep
+      // the previous value.
+      cfg.draft = freshDraft();
+      open("models", "glm-5.3-flash", Object.assign({ id: "glm-5.3-flash" }, api.cfgDeepCopy(modelEntry)));
+      mountFields(modelFields({ f_affinityPool: "", f_metaLabel: "", f_metaCtx: "", f_priceIn: "", f_priceOut: "", f_priceCache: "", f_params: "", f_retry: "" }));
+      api.renderCfgModal();
+      const cleared = api.cfgModalCollect();
+      assert(!("params" in cleared) && !("retry" in cleared) && !("affinityPool" in cleared), "u6f1) an emptied model field removes its key instead of silently keeping the previous value");
+      assert(
+        !!cleared.meta && !("label" in cleared.meta) && !("contextWindow" in cleared.meta) && !("inputPerM" in cleared.meta) && cleared.meta.unownedMeta === "keep" && cleared.meta.pricing.unownedPricing === "keep",
+        "u6f2) clearing meta/pricing fields removes only the keys the form owns"
+      );
+      cfg.draft.models.bare = { providers: [{ backend: "go", upstream: "u" }], meta: { label: "x" } };
+      open("models", "bare", { id: "bare", providers: [{ backend: "go", upstream: "u" }], meta: { label: "x" } });
+      mountFields({ f_id: "bare" });
+      api.renderCfgModal();
+      assert(!("meta" in api.cfgModalCollect()), "u6f3) a meta object whose every form-owned key was cleared is dropped, not left as {}");
+
+      cfg.draft = freshDraft();
+      cfg.draft.backends[0] = api.cfgDeepCopy(backendEntry);
+      open("backends", "go", api.cfgDeepCopy(backendEntry), 0);
+      mountFields({ f_id: "go", f_baseURL: "http://go", f_apiKeyEnv: "KEY_GO", f_translateDeveloperRole: false });
+      api.renderCfgModal();
+      assert(!("translateDeveloperRole" in api.cfgModalCollect()), "u6f4) unchecking the developer-role box clears its key (an unchecked box is an explicit clear)");
+
+      cfg.draft = freshDraft();
+      open("models", "glm-5.3-flash", Object.assign({ id: "glm-5.3-flash" }, api.cfgDeepCopy(modelEntry)));
+      mountFields(modelFields({ f_affinityPool: "3", f_metaLabel: "Renamed", f_metaCtx: "100000", f_priceIn: "0.2", f_priceOut: "", f_priceCache: "", f_offPeak: '{"inputPerM":0.14}', f_params: '{"temperature":0.9}', f_retry: '{"maxRetries":5}' }));
+      api.renderCfgModal();
+      const edited = api.cfgModalCollect();
+      assert(
+        edited.affinityPool === 3 && edited.meta.label === "Renamed" && edited.meta.contextWindow === 100000 && edited.meta.pricing.inputPerM === 0.2 &&
+          same(edited.meta.pricing.offPeak, { inputPerM: 0.14 }) && same(edited.params, { temperature: 0.9 }) && same(edited.retry, { maxRetries: 5 }) && !("outputPerM" in edited.meta.pricing),
+        "u6g) a non-empty field overrides the previous value and a cleared one is removed, in the same save"
+      );
+
+      // Create path: no previous entry exists, so nothing may leak from the keys
+      // the modal itself keeps, and a row added with the + button stays clean.
+      cfg.draft = freshDraft();
+      open("models", null, {});
+      mountFields({ f_id: "fresh", f_affinityPool: "1", f_metaLabel: "Fresh", f_params: '{"a":1}' });
+      api.renderCfgModal();
+      cfg.modal.provs.push({ backend: "go", upstream: "go-model" });
+      assert(
+        same(api.cfgModalCollect(), { id: "fresh", providers: [{ backend: "go", upstream: "go-model" }], affinityPool: 1, meta: { label: "Fresh" }, params: { a: 1 } }),
+        "u6h) a brand-new model with no previous entry collects a clean object"
+      );
+      open("presets", null, {});
+      mountFields({ f_id: "freshp", f_strategy: "weighted" });
+      api.renderCfgModal();
+      cfg.modal.models.push({ model: "a", weight: null });
+      assert(same(api.cfgModalCollect(), { id: "freshp", strategy: "weighted", models: ["a"] }), "u6h2) a brand-new preset with no previous entry collects a clean object");
+      open("backends", null, {});
+      mountFields({ f_id: "newb", f_baseURL: "http://new", f_apiKeyEnv: "KEY_NEW", f_timeoutMs: "1000" });
+      api.renderCfgModal();
+      assert(
+        same(api.cfgModalCollect(), { id: "newb", baseURL: "http://new", apiKeyEnv: "KEY_NEW", timeoutMs: 1000 }),
+        "u6h3) a brand-new backend with no previous entry collects a clean object"
+      );
+
+      // The apply half still renames: prompt, reference rewrite, key order.
+      cfg.draft = freshDraft();
+      confirmLog.length = 0;
+      confirmAnswer = true;
+      open("models", "glm-5.3-flash", Object.assign({ id: "glm-5.3-flash" }, api.cfgDeepCopy(modelEntry)));
+      mountFields(modelFields({ f_id: "glm-5.4-flash", f_metaLabel: "", f_metaCtx: "", f_priceIn: "", f_priceOut: "", f_priceCache: "", f_offPeak: "", f_params: "", f_retry: "" }));
+      api.renderCfgModal();
+      api.cfgApplyModal();
+      assert(Object.keys(cfg.draft.models).join(",") === "a,glm-5.4-flash,z", "u6i) renaming a model keeps its position in the ordered key rebuild");
+      assert(
+        confirmLog.length === 1 && /Rename 'glm-5\.3-flash' to 'glm-5\.4-flash'\?/.test(confirmLog[0]) && /2 reference\(s\)/.test(confirmLog[0]),
+        "u6i2) the rename prompt still names both ids and the reference count"
+      );
+      assert(
+        cfg.draft.presets["p-one"].models[0].model === "glm-5.4-flash" && cfg.draft.presets["p-two"].models[0] === "glm-5.4-flash",
+        "u6i3) a rename rewrites preset references in both row shapes"
+      );
+      assert(same(cfg.draft.models["glm-5.4-flash"].providers, modelEntry.providers), "u6i4) the renamed entry keeps its per-provider dialect keys");
+      cfg.draft.backends[0] = { id: "go", baseURL: "http://go", apiKeyEnv: "KEY_GO", dropParams: ["y"] };
+      confirmLog.length = 0;
+      open("backends", "go", api.cfgDeepCopy(cfg.draft.backends[0]), 0);
+      mountFields({ f_id: "go-2", f_baseURL: "http://go", f_apiKeyEnv: "KEY_GO" });
+      api.renderCfgModal();
+      api.cfgApplyModal();
+      assert(
+        cfg.draft.models.a.providers[0].backend === "go-2" && cfg.draft.models["glm-5.4-flash"].providers[0].backend === "go-2",
+        "u6i5) renaming a backend still rewrites the provider references that point at it"
+      );
+
+      // Collect must copy the previous entry: starting from the live draft object
+      // and deleting keys on it would edit the draft before the user saves.
+      cfg.draft = freshDraft();
+      const draftSnap = api.cfgDeepCopy(cfg.draft);
+      open("models", "glm-5.3-flash", Object.assign({ id: "glm-5.3-flash" }, api.cfgDeepCopy(modelEntry)));
+      mountFields(modelFields({ f_metaLabel: "", f_params: "", f_affinityPool: "" }));
+      api.renderCfgModal();
+      api.cfgModalCollect();
+      assert(same(cfg.draft, draftSnap), "u6j) collect copies the previous entry instead of aliasing and editing the live draft");
+
+      // Provider rows fed directly, so the row contract is pinned independently of
+      // the modal render: emptied upstream, unowned row key, backend-less row, new row.
+      cfg.draft = freshDraft();
+      open("models", "glm-5.3-flash", Object.assign({ id: "glm-5.3-flash" }, api.cfgDeepCopy(modelEntry)));
+      cfg.modal.provs = [
+        { backend: "go", upstream: "", prev: { backend: "go", upstream: "glm-5.3", dropParams: ["z"], unownedRowKey: 1 } },
+        { backend: "", upstream: "ghost", prev: { backend: "old", upstream: "ghost" } },
+        { backend: "cc", upstream: "new-upstream" },
+      ];
+      const rowMerged = api.cfgModalCollect();
+      assert(
+        rowMerged.providers.length === 2 && same(rowMerged.providers[0], { backend: "go", dropParams: ["z"], unownedRowKey: 1 }) && same(rowMerged.providers[1], { backend: "cc", upstream: "new-upstream" }),
+        "u6k) an emptied upstream is deleted, unowned row keys survive, a backend-less row is dropped, and a new row stays clean"
+      );
     }
   }
 
