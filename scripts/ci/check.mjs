@@ -101,6 +101,81 @@ function firstLines(text, count) {
   return (text || "").trim().split(/\r?\n/).slice(0, count).join(" | ");
 }
 
+// Blank `/* ... */` and `<!-- ... -->` regions before scanning, so an
+// import-shaped line or a `url(...)` written inside a comment is not reported
+// as a dependency. Every blanked character becomes a space (newlines are kept),
+// so match offsets - and the line numbers derived from them - stay valid
+// against the original text.
+//
+// This walks the text instead of running `/\*[\s\S]*?\*\//` over it, because
+// the repo is full of prose like `// Master key for /admin/* and /api/keys`:
+// that `/*` sits inside a LINE COMMENT, and a bare regex would treat it as an
+// opener and blank real code up to the next `*/` - hiding a real dependency,
+// which is a worse bug than the false positive being fixed. Strings, template
+// literals and `//` line comments are therefore RECOGNISED and skipped over,
+// never removed.
+//
+// DOCUMENTED BOUNDARY - text that can still be reported spuriously:
+//   * a specifier-shaped line, a `url(...)` or an `@import "..."` at the start
+//     of a line inside a multi-line TEMPLATE LITERAL (and, because its body is
+//     not modelled, a multi-line template literal also cannot open a comment);
+//   * a `/*` with no closing `*/`, or a `<!--` with no closing `-->`: left
+//     alone rather than blanked to end of file, so a truncated marker cannot
+//     swallow the rest of the source.
+// Blanking template literals would need nesting and `${...}` handling that this
+// scanner does not attempt; a false positive on one is the safer failure.
+function blankComments(src) {
+  const blank = (text) => text.replace(/[^\n]/g, " ");
+  let out = "";
+  let plain = 0;
+  let i = 0;
+  const flush = (end) => {
+    if (end > plain) out += src.slice(plain, end);
+  };
+  while (i < src.length) {
+    const c = src[i];
+    if (c === '"' || c === "'" || c === "`") {
+      let j = i + 1;
+      while (j < src.length) {
+        if (src[j] === "\\") {
+          j += 2;
+          continue;
+        }
+        if (src[j] === c) {
+          j++;
+          break;
+        }
+        j++;
+      }
+      i = j;
+      continue;
+    }
+    if (c === "/" && src[i + 1] === "/") {
+      const nl = src.indexOf("\n", i);
+      i = nl < 0 ? src.length : nl;
+      continue;
+    }
+    let stop = -1;
+    if (c === "/" && src[i + 1] === "*") {
+      const end = src.indexOf("*/", i + 2);
+      if (end >= 0) stop = end + 2;
+    } else if (c === "<" && src.startsWith("<!--", i)) {
+      const end = src.indexOf("-->", i + 4);
+      if (end >= 0) stop = end + 3;
+    }
+    if (stop < 0) {
+      i++;
+      continue;
+    }
+    flush(i);
+    out += blank(src.slice(i, stop));
+    i = stop;
+    plain = i;
+  }
+  flush(src.length);
+  return out;
+}
+
 function walk(dir, acc = [], depth = 0) {
   if (depth > 6) return acc;
   let entries;
@@ -186,7 +261,10 @@ function checkBareImports() {
     for (const file of files) {
       if (!IMPORT_EXTENSIONS.includes(file.slice(file.lastIndexOf(".")))) continue;
       scanned++;
-      const src = readFileSync(file, "utf8");
+      // Comments are blanked first: an import-shaped line in a block comment
+      // (this file's own documentation is a live example of the hazard) is not
+      // a dependency.
+      const src = blankComments(readFileSync(file, "utf8"));
       for (const pattern of SPECIFIER_PATTERNS) {
         pattern.lastIndex = 0;
         let m;
@@ -214,17 +292,26 @@ function isExternalAsset(value) {
 // mistaken for an asset reference.
 const CSS_URL_PATTERN = /url\(\s*(?:"([^"]*)"|'([^']*)'|([^)'"]*))\s*\)/gi;
 
-function scanCssUrls(text, baseLine, where, notes) {
-  CSS_URL_PATTERN.lastIndex = 0;
-  let m;
+// `@import "https://..."` pulls an external stylesheet with no `url()` token,
+// so it needs its own pattern. The `url(...)` form is already covered above and
+// is excluded here by the lookahead, so one reference is reported once. All
+// four spellings are covered: double-quoted, single-quoted, unquoted, and (via
+// the url() pattern) the function form.
+const CSS_IMPORT_PATTERN = /@import\s+(?:"([^"]*)"|'([^']*)'|(?!url\s*\()([^;"'()\s]+))/gi;
+
+function scanCss(text, baseLine, where, notes) {
   let found = 0;
-  while ((m = CSS_URL_PATTERN.exec(text)) !== null) {
-    const value = (m[1] ?? m[2] ?? m[3] ?? "").trim();
-    if (!value) continue;
-    found++;
-    if (isExternalAsset(value)) {
-      const at = baseLine + (text.slice(0, m.index).split("\n").length - 1);
-      notes.push(`index.html:${at}: external asset reference '${value}' ${where} (the UI is single-file: no http(s), protocol-relative, or CDN assets)`);
+  for (const pattern of [CSS_URL_PATTERN, CSS_IMPORT_PATTERN]) {
+    pattern.lastIndex = 0;
+    let m;
+    while ((m = pattern.exec(text)) !== null) {
+      const value = (m[1] ?? m[2] ?? m[3] ?? "").trim();
+      if (!value) continue;
+      found++;
+      if (isExternalAsset(value)) {
+        const at = baseLine + (text.slice(0, m.index).split("\n").length - 1);
+        notes.push(`index.html:${at}: external asset reference '${value}' ${where} (the UI is single-file: no http(s), protocol-relative, or CDN assets)`);
+      }
     }
   }
   return found;
@@ -243,7 +330,9 @@ function scanInlineScripts(html, notes) {
   let m;
   while ((m = re.exec(html)) !== null) {
     blocks++;
-    const body = m[2];
+    // Blanked so an import-shaped line in a JavaScript block comment is not
+    // read as a dependency; template literals are the documented boundary.
+    const body = blankComments(m[2]);
     const bodyLine = lineOf(html, m.index + m[0].indexOf(">") + 1);
     for (const pattern of SPECIFIER_PATTERNS) {
       pattern.lastIndex = 0;
@@ -299,19 +388,20 @@ function checkExternalAssets() {
     }
   }
 
-  // Inline CSS, then inline style attributes.
+  // Inline CSS, then inline style attributes. Comments are blanked in both, so
+  // a commented-out `url(...)` or `@import` is not read as a live reference.
   const styleRe = /<style\b([^>]*)>([\s\S]*?)<\/style\s*>/gi;
   let style;
   while ((style = styleRe.exec(html)) !== null) {
     const bodyStart = style.index + style[0].indexOf(">") + 1;
-    refs += scanCssUrls(style[2], lineOf(html, bodyStart), "in inline CSS", notes);
+    refs += scanCss(blankComments(style[2]), lineOf(html, bodyStart), "in inline CSS", notes);
   }
   const styleAttrRe = /(?<!\.)style\s*=\s*(?:"([^"]*)"|'([^']*)')/gi;
   let attr;
   while ((attr = styleAttrRe.exec(html)) !== null) {
     const value = attr[1] ?? attr[2] ?? "";
-    if (!/url\s*\(/i.test(value)) continue;
-    refs += scanCssUrls(value, lineOf(html, attr.index), "in an inline style attribute", notes);
+    if (!/(?:url\s*\(|@import)/i.test(value)) continue;
+    refs += scanCss(blankComments(value), lineOf(html, attr.index), "in an inline style attribute", notes);
   }
 
   const scripts = scanInlineScripts(html, notes);
@@ -347,7 +437,14 @@ function checkDependencies() {
 
   return {
     ok: notes.length === 0,
-    evidence: `${declared} dependency block(s), ${imports.scanned} import-scanned file(s), ${assets.scripts ?? 0} inline <script> block(s), ${assets.refs ?? 0} index.html asset ref(s)`,
+    // When index.html is missing the asset scan cannot run at all, and printing
+    // "0 inline <script> block(s), 0 index.html asset ref(s)" would read like a
+    // clean result rather than a check that never happened.
+    evidence: `${declared} dependency block(s), ${imports.scanned} import-scanned file(s), ${
+      assets.refs === undefined
+        ? "index.html NOT scanned (external-asset scan did not run)"
+        : `${assets.scripts} inline <script> block(s), ${assets.refs} index.html asset ref(s)`
+    }`,
     notes,
   };
 }
@@ -373,6 +470,7 @@ function checkInlineUi() {
   }
   const openTags = (html.match(/<script\b/gi) || []).length;
   const notes = [];
+  const broken = [];
   if (blocks.length !== openTags) {
     notes.push(`found ${openTags} opening <script> tag(s) but only ${blocks.length} closed block(s); the extraction is incomplete`);
   }
@@ -393,6 +491,7 @@ function checkInlineUi() {
       writeFileSync(tmpFile, block.body, "utf8");
       const res = spawnSync(process.execPath, ["--check", tmpFile], { encoding: "utf8" });
       if (res.error) {
+        broken.push(i + 1);
         notes.push(`inline script ${i + 1}: ${res.error.message}`);
         return;
       }
@@ -402,6 +501,7 @@ function checkInlineUi() {
       const found = new RegExp(`${escaped}:(\\d+)`).exec(text);
       const bodyLine = lineOf(html, block.bodyStart);
       const at = found ? `index.html:${bodyLine + Number(found[1]) - 1}` : "index.html: (line unknown)";
+      broken.push(i + 1);
       notes.push(`${at}: syntax error in inline <script> ${i + 1} (${isModule ? "module" : "classic"})`);
       notes.push(`  ${firstLines(text, 3)}`);
     });
@@ -409,11 +509,16 @@ function checkInlineUi() {
     rmSync(dir, { recursive: true, force: true });
   }
 
-  return {
-    ok: notes.length === 0,
-    evidence: `${blocks.length} inline <script> block(s) parsed (${blocks.map((b) => (/\btype\s*=\s*["']?\s*module/i.test(b.attrs) ? "module" : "classic")).join(", ")})`,
-    notes,
-  };
+  const kinds = blocks.map((b) => (/\btype\s*=\s*["']?\s*module/i.test(b.attrs) ? "module" : "classic")).join(", ");
+  // Same rule as S1 and S4: on a FAIL the evidence line describes what went
+  // wrong, instead of restating "parsed" about a block that did not parse.
+  const evidence =
+    blocks.length !== openTags
+      ? `${blocks.length} inline <script> block(s) extracted, but ${openTags} opening tag(s) found`
+      : broken.length > 0
+        ? `${broken.length} of ${blocks.length} inline <script> block(s) FAILED to parse (${kinds})`
+        : `${blocks.length} inline <script> block(s) parsed (${kinds})`;
+  return { ok: notes.length === 0, evidence, notes };
 }
 
 // ---------------------------------------------------------------------------
