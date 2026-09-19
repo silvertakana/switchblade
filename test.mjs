@@ -4724,7 +4724,7 @@ async function main() {
       // characters `""`, say) is invisible to it. This mode reads the HTML that
       // renderCfgModal actually emits, the way a browser would, and then opens and
       // saves every entry of the real mirror config untouched.
-      const renderNeeded = ["cfgDeepCopy", "cfgParseMaybeJson", "cfgJsonText", "cfgMutate", "cfgCloseModal", "cfgEnvNames", "cfgField", "renderCfgModal", "cfgModalCollect", "cfgApplyModal", "countRefsTo"];
+      const renderNeeded = ["cfgDeepCopy", "cfgParseMaybeJson", "cfgJsonText", "cfgMutate", "cfgCloseModal", "cfgEnvNames", "cfgField", "renderProvList", "renderCfgModal", "cfgModalCollect", "cfgApplyModal", "countRefsTo"];
       const rBodies = [];
       const rBroken = [];
       const parses = (src) => { try { new vm.Script(src); return true; } catch { return false; } };
@@ -4787,7 +4787,6 @@ async function main() {
         renderConfig: () => {},
         ICONS: { warn: "" },
         document: { getElementById: (id) => (id === "cfgModalBody" ? rBody : rField(id)) },
-        renderProvList: () => {},
         renderPresetModelList: () => {},
       };
       let apiR = null;
@@ -4897,7 +4896,15 @@ async function main() {
       // move. The subject id and its provider shape are asserted FIRST, so a
       // mirror rename or a provider-less entry fails here loudly instead of
       // quietly testing some other id, or testing an empty list that cannot fail.
-      const u9Subject = "glm-5.3-flash";
+      // The subject is picked from whatever the mirror actually carries, so the
+      // block runs against a 17-model and a 20-model mirror alike. The dialect
+      // axis cannot ride on it: the committed mirror has no provider-level
+      // dialect key anywhere, so the fixture further down owns that axis and
+      // this pick only has to be a real entry the editor can round-trip.
+      const u9Subject = Object.keys((mirror && mirror.models) || {}).reduce((best, id) => {
+        const n = (mirror.models[id] && Array.isArray(mirror.models[id].providers) ? mirror.models[id].providers : []).length;
+        return n > (best.n || 0) ? { id, n } : best;
+      }, { id: null, n: 0 }).id;
       // servedIds is the rule the Task 7 harness also extracts, through the same
       // helper. The block pulls it again and fails loudly on its own, so the
       // surface comparison below can never run against a rule that silently
@@ -4925,18 +4932,22 @@ async function main() {
       const u9Entry = mirror && mirror.models ? mirror.models[u9Subject] : null;
       assert(
         !!u9Entry,
-        "u9b) the real mirror config.json carries the round-trip subject model '" + u9Subject + "'" +
+        "u9b) the round-trip subject is the mirror model with the most providers ('" + u9Subject + "')" +
           (u9Entry
-            ? " [the mirror carries " + Object.keys(mirror.models).length + " model(s)]"
+            ? " [picked from the " + Object.keys(mirror.models).length + " model(s) this mirror carries]"
             : mirror && mirror.models
-              ? " [the mirror carries " + Object.keys(mirror.models).length + " model(s) and the subject is ABSENT - a rename in the mirror must fail here, never silently test another id]"
+              ? " [the mirror carries " + Object.keys(mirror.models).length + " model(s) and the selection found none - the pick is content-dependent, so it has to come from the file]"
               : " [the config has no models object]")
       );
       const u9Provs = u9Entry && Array.isArray(u9Entry.providers) ? u9Entry.providers : null;
       const u9Dialect = u9Provs ? u9Provs.filter((p) => p && (Array.isArray(p.dropParams) || p.params || p.paramMap)).length : 0;
       assert(
-        !!u9Provs && u9Provs.length > 0 && u9Dialect > 0,
-        "u9c) the subject model carries " + (u9Provs ? u9Provs.length : 0) + " provider(s) and " + u9Dialect + " of them hold a dropParams/params/paramMap key (an empty provider list would make the round-trip assertions below vacuous)"
+        !!u9Provs && u9Provs.length > 0,
+        // An empty provider list is what makes the round-trip below vacuous, so
+        // that is what this guards. The mirror's own dialect-key count is an
+        // ANNOTATION - it is 0 on the committed config and cannot be asserted -
+        // and the dialect-key coverage is guaranteed by the fixture round-trip.
+        "u9c) the round-trip subject model carries " + (u9Provs ? u9Provs.length : 0) + " provider(s) (an empty provider list would make the round-trip assertions below vacuous, which is all this guarantees; this mirror's subject holds " + u9Dialect + " provider(s) with a dropParams/params/paramMap key, an annotation, not a check - the dialect axis is guaranteed by the fixture round-trip further down)"
       );
 
       if (!(u9Ok && u9Entry && u9Provs && u9Provs.length > 0)) {
@@ -4959,29 +4970,38 @@ async function main() {
         const u9Diff = firstDiff(u9Expect, u9Stored);
         assert(
           !!u9LabelField && u9Diff === "" && !!u9Stored && !!u9Stored.meta && u9Stored.meta.label === u9Label,
-          "u9d) the real render + collect + apply of a LABEL-ONLY edit stores the subject byte-identical to its input except meta.label ('" + u9Label + "')" +
+          "u9d) the real render + collect + apply of a LABEL-ONLY edit on the mirror's '" + u9Subject + "' stores it byte-identical to its input except meta.label ('" + u9Label + "')" +
             (u9LabelField ? "" : " [f_metaLabel was never rendered]") +
             (u9Stored && u9Stored.meta ? "" : " [meta missing after apply]") +
             (u9Diff === "" ? "" : " [first difference: " + u9Diff + "]")
         );
 
+        // Every provider-level dialect key the inputs carry, across both the real
+        // mirror subject and the fixture below, compared by value in the collected
+        // object and in the stored entry. The pairing is inside the helper because
+        // the fixture can be empty and an empty list must count as nothing rather
+        // than as a clean result.
+        const u9DialectRows = [];
         const u9KeyDiffs = [];
-        for (const pair of [["collected", u9Collected && u9Collected.providers], ["stored", u9Stored && u9Stored.providers]]) {
-          const where = pair[0];
-          const list = pair[1];
-          if (!Array.isArray(list) || list.length !== u9Provs.length) {
-            u9KeyDiffs.push(where + ": provider count " + (Array.isArray(list) ? list.length : "none") + " != " + u9Provs.length);
-            continue;
+        const u9DialectDiff = (subject, where, list, input) => {
+          if (!Array.isArray(list) || list.length !== input.length) {
+            u9KeyDiffs.push(subject + " " + where + ": provider count " + (Array.isArray(list) ? list.length : "none") + " != " + input.length);
+            return;
           }
-          u9Provs.forEach((want, i) => {
+          input.forEach((want, i) => {
             for (const k of ["dropParams", "params", "paramMap"]) {
-              if (rJson(list[i] && list[i][k]) !== rJson(want[k])) u9KeyDiffs.push(where + "[" + i + "]." + k + ": " + rJson(want[k]) + " -> " + rJson(list[i] && list[i][k]));
+              if (want && want[k] !== undefined) u9DialectRows.push(subject + "[" + i + "]." + k);
+              if (rJson(list[i] && list[i][k]) !== rJson(want && want[k])) {
+                u9KeyDiffs.push(subject + " " + where + "[" + i + "]." + k + ": " + rJson(want && want[k]) + " -> " + rJson(list[i] && list[i][k]));
+              }
             }
           });
-        }
+        };
+        u9DialectDiff("mirror", "collected", u9Collected && u9Collected.providers, u9Provs);
+        u9DialectDiff("mirror", "stored", u9Stored && u9Stored.providers, u9Provs);
         assert(
           u9KeyDiffs.length === 0,
-          "u9e) every provider's dropParams/params/paramMap is unchanged from the input, in the collected object and in the stored entry (" + u9KeyDiffs.length + " changed" + (u9KeyDiffs.length ? ": " + u9KeyDiffs.slice(0, 6).join(" | ") : "") + ")"
+          "u9e) every provider-level dialect key present in the input survives the round-trip unchanged, in the collected object and in the stored entry (" + u9KeyDiffs.length + " key value(s) moved, " + u9DialectRows.length + " dialect key(s) present to check here: " + u9DialectRows.join(", ") + ")"
         );
 
         // The validator requires every referenced apiKeyEnv to exist in THIS
@@ -4994,17 +5014,132 @@ async function main() {
         const u9Errors = u9Verdict ? u9Verdict.errors : null;
         assert(
           !!u9Errors && u9Errors.length === 0,
-          "u9f) the payload a label-only edit produces validates in SAVE mode with zero errors (" + (u9Errors ? u9Errors.length + " error(s)" : "no verdict") + ")" +
+          "u9f) the payload a label-only edit of the mirror subject produces validates in SAVE mode with zero errors (" + (u9Errors ? u9Errors.length + " error(s)" : "no verdict") + ")" +
             (u9Errors && u9Errors.length ? ": " + u9Errors.map((e) => e.path + ": " + e.message).join("; ") : "")
         );
 
+        // The dialect axis, guaranteed by construction --------------------------
+
+        // The mirror is real data and cannot be made to carry provider-level
+        // dialect keys: the committed config has none anywhere, and a future mirror
+        // is free to drop them again. So the axis is proven on a config this test
+        // builds, through the same REAL render -> form-value -> collect -> apply
+        // path the u6 real-render mode established: providers that carry every
+        // dialect key, a row whose upstream is emptied, and a model-level
+        // `deployments` list the form has no field for, so the merge-preserve claim
+        // is exercised on data whose shape is known rather than hoped for.
+        // The before/after surface lists are taken from the LIVE mirror here,
+        // ahead of the fixture rebuilding a draft of its own.
         const u9BeforeList = u9Api.servedIds(mirror);
+        const u9FxModel = "u9-fx-dialect-model";
+        const u9FxBackend = "u9-fx-backend";
+        const u9FxKeyEnv = "U9_FX_KEY";
+        const u9FxTail = [
+          { backend: u9FxBackend, upstream: "u9-up-2", dropParams: ["thinking"], params: { top_p: 1 }, paramMap: { max_tokens: "max_output_tokens" } },
+          { backend: u9FxBackend, upstream: "u9-up-3", dropParams: ["temperature"] },
+        ];
+        const u9FxInput = {
+          providers: [
+            { backend: u9FxBackend, upstream: "u9-up-1", dropParams: ["thinking"], params: { reasoning_effort: "high" }, paramMap: { top_p: "top_p" } },
+            { backend: u9FxBackend, upstream: "", dropParams: ["presence_penalty"] },
+          ].concat(u9FxTail.map((p) => JSON.parse(JSON.stringify(p)))),
+          affinityPool: 4,
+          params: { temperature: 0.7 },
+          retry: { maxRetries: 2, baseMs: 500, maxMs: 4000, multiplier: 2, totalMs: 20000 },
+          meta: { label: "U9 dialect fixture", contextWindow: 200000, unweightedMeta: "keep" },
+          exposed: false,
+          deployments: [{ backend: u9FxBackend, upstream: "u9-up-1", backupOnly: true }],
+        };
+        const u9FxDraft = JSON.parse(JSON.stringify(mirror));
+        u9FxDraft.backends = [{ id: u9FxBackend, baseURL: "http://127.0.0.1:9", apiKeyEnv: u9FxKeyEnv, model: "u9-default-upstream" }];
+        u9FxDraft.models = {};
+        u9FxDraft.models[u9FxModel] = JSON.parse(JSON.stringify(u9FxInput));
+        u9FxDraft.presets = { "u9-fx-preset": { strategy: "affinity", models: [u9FxModel], exposed: false } };
+        const u9FxLabel = "U9 dialect fixture (label edit)";
+        process.env[u9FxKeyEnv] = "u9-fx-placeholder";
+        try {
+          rCfg.draft = u9FxDraft;
+          rCfg.modal = { kind: "models", key: u9FxModel, data: Object.assign({ id: u9FxModel }, JSON.parse(JSON.stringify(u9FxInput))), index: null, provs: [], models: [] };
+          apiR.renderCfgModal();
+          const u9FxRowHtml = rField("f_provlist").innerHTML;
+          const u9FxRowCount = (u9FxRowHtml.match(/data-prov-upstream='/g) || []).length;
+          const u9FxUpstreams = u9FxInput.providers.filter((p) => p.upstream).filter((p) => u9FxRowHtml.includes("value='" + p.upstream + "'")).length;
+          const u9FxLabelField = rFields.get("f_metaLabel");
+          assert(
+            u9FxRowCount === u9FxInput.providers.length && u9FxUpstreams === u9FxInput.providers.length - 1 && !!u9FxLabelField,
+            "u9x1) the dialect fixture rendered every one of its " + u9FxInput.providers.length + " provider row(s) into the provider list, carrying the upstreams it was given (" + u9FxRowCount + " upstream input(s) emitted, " + u9FxUpstreams + " upstream value(s) present, label field " + (u9FxLabelField ? "present" : "MISSING") + ") - a render that emitted nothing would make the round-trip below vacuous"
+          );
+          if (u9FxLabelField) u9FxLabelField.value = u9FxLabel;
+          const u9FxCollected = apiR.cfgModalCollect();
+          apiR.cfgApplyModal();
+          const u9FxStored = rCfg.draft.models[u9FxModel];
+
+          // The whole entry, not just the label. Name the dialect keys explicitly:
+          // a helper bug that returns the input object itself would otherwise pass
+          // every value comparison here, and so would one that drops a key from
+          // both sides at once. The one intended difference is the fixture row
+          // whose upstream was emptied: the editor drops that key, and the backend
+          // carries a default model, so dropping it is the documented behavior
+          // rather than a loss.
+          const u9FxExpect = JSON.parse(JSON.stringify(u9FxInput));
+          delete u9FxExpect.providers[1].upstream;
+          u9FxExpect.meta.label = u9FxLabel;
+          const u9FxPending = [];
+          const u9FxCheck = (where, list) => {
+            if (!Array.isArray(list) || list.length !== u9FxInput.providers.length) {
+              u9FxPending.push(where + ": provider count " + (Array.isArray(list) ? list.length : "none") + " != " + u9FxInput.providers.length);
+              return;
+            }
+            u9FxInput.providers.forEach((want, i) => {
+              for (const k of ["dropParams", "params", "paramMap"]) {
+                if (want[k] !== undefined && rJson(list[i] && list[i][k]) !== rJson(want[k])) {
+                  u9FxPending.push(where + "[" + i + "]." + k + ": " + rJson(want[k]) + " -> " + rJson(list[i] && list[i][k]));
+                }
+              }
+            });
+          };
+          u9FxCheck("collected", u9FxCollected && u9FxCollected.providers);
+          u9FxCheck("stored", u9FxStored && u9FxStored.providers);
+          assert(
+            u9FxPending.length === 0,
+            "u9y1) all " + u9FxInput.providers.length + " fixture providers keep the dialect key they were given - dropParams, params and paramMap each present on the ones that carry them - through render -> collect -> apply, collected and stored (" + u9FxPending.length + " missing or changed" + (u9FxPending.length ? ": " + u9FxPending.slice(0, 6).join(" | ") : "") + ")"
+          );
+
+          u9DialectDiff("fixture", "collected", u9FxCollected && u9FxCollected.providers, u9FxInput.providers);
+          u9DialectDiff("fixture", "stored", u9FxStored && u9FxStored.providers, u9FxInput.providers);
+          assert(
+            u9KeyDiffs.length === 0 && u9DialectRows.length > 0,
+            "u9y2) the fixture carries " + u9DialectRows.length + " provider-level dialect key(s) in total and every one survives the round-trip by value (" + u9KeyDiffs.length + " moved" + (u9KeyDiffs.length ? ": " + u9KeyDiffs.slice(0, 6).join(" | ") : "") + ")"
+          );
+
+          const u9FxDiff = firstDiff(u9FxExpect, u9FxStored);
+          assert(
+            !!u9FxStored && u9FxDiff === "",
+            "u9y3) the fixture entry survives render -> collect -> apply byte-identical to its input except the label ('" + u9FxLabel + "') and the one provider whose upstream box was left empty" +
+              (u9FxDiff === "" ? "" : " [first difference: " + u9FxDiff + "]")
+          );
+          const u9FxVerdict = validateConfig(rCfg.draft, null, { mode: "save" });
+          assert(
+            u9FxVerdict.errors.length === 0,
+            "u9y4) the payload the fixture edit produces validates in SAVE mode with zero errors (" + u9FxVerdict.errors.length + " error(s)" + (u9FxVerdict.errors.length ? ": " + u9FxVerdict.errors.map((e) => e.path + ": " + e.message).join("; ") : "") + ")"
+          );
+        } finally {
+          delete process.env[u9FxKeyEnv];
+        }
+
+        // Back to the mirror draft the label-only edit produced: the served-surface
+        // assertions below are about that edit, not about the fixture. Rebuilt from
+        // the mirror rather than aliased, so the children cannot outlive a
+        // reference that is about to be replaced.
+        rCfg.draft = JSON.parse(JSON.stringify(mirror));
+        rCfg.draft.models[u9Subject].meta = Object.assign({}, rCfg.draft.models[u9Subject].meta, { label: u9Label });
+
         const u9AfterList = u9Api.servedIds(rCfg.draft);
         let u9FirstMove = -1;
         for (let i = 0; i < Math.max(u9BeforeList.length, u9AfterList.length) && u9FirstMove < 0; i++) if (u9BeforeList[i] !== u9AfterList[i]) u9FirstMove = i;
         assert(
           u9BeforeList.length > 0 && rJson(u9BeforeList) === rJson(u9AfterList),
-          "u9g) a models-only edit leaves the served-id surface alone - same ids in the same order (" + u9BeforeList.length + " -> " + u9AfterList.length + " id(s)" +
+          "u9g) a models-only edit leaves the served-id surface alone - the same ids in the same order before and after the edit, which is SURFACE stability only: most of these ids are presets shadowing a same-named model, so this does not show that a model entry itself survived (" + u9BeforeList.length + " -> " + u9AfterList.length + " id(s)" +
             (u9FirstMove < 0 ? "" : ", first move at index " + u9FirstMove + ": " + rJson(u9BeforeList[u9FirstMove]) + " -> " + rJson(u9AfterList[u9FirstMove])) + ")"
         );
 
@@ -5024,8 +5159,8 @@ async function main() {
           u9ServeError = e.message;
         }
         assert(
-          !!u9ServedBefore && !!u9ServedAfter && u9ServedBefore.length > 0 && rJson(u9ServedBefore) === rJson(u9ServedAfter) && rJson(u9ServedBefore) === rJson(u9AfterList),
-          "u9h) a real router's /v1/models is identical before and after the edit and matches the UI's served-id rule (" +
+          !!u9ServedBefore && !!u9ServedAfter && u9ServedBefore.length > 0 && rJson(u9ServedBefore) === rJson(u9ServedAfter) && rJson(u9ServedBefore) === rJson(u9BeforeList) && rJson(u9ServedAfter) === rJson(u9AfterList),
+          "u9h) a real router's /v1/models is identical before and after the edit and matches the UI's served-id rule before and after - the endpoint's surface, which is id and order stability only: the ids are mostly presets shadowing a same-named model, so this never proves a model entry survived (" +
             (u9ServedBefore ? u9ServedBefore.length : "none") + " -> " + (u9ServedAfter ? u9ServedAfter.length : "none") + " id(s), UI rule " + u9AfterList.length + " id(s))" +
             (u9ServeError ? " [child failed: " + u9ServeError + "]" : "")
         );
