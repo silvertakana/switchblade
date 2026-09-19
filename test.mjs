@@ -2792,20 +2792,20 @@ async function main() {
     assert(
       JSON.stringify(fo.models) === JSON.stringify(["m1", "m2", "m3", "m4"]) &&
       JSON.stringify(fo.ordered.map((o) => o.model)) === JSON.stringify(["m1", "m2", "m3", "m4"]),
-      "z21a) failover: nested presets expand in declared order, top-level strategy governs (" + JSON.stringify(fo.ordered.map((o) => o.model)) + ")"
+      "z21e) failover: nested presets expand in declared order, top-level strategy governs (" + JSON.stringify(fo.ordered.map((o) => o.model)) + ")"
     );
     // weighted: rng 0.01 -> glm band (weight 3) -> first model m1; rest weight
     // desc with declared-order tiebreak: m2 (glm's second), then os models.
     const cw = candidates(wcfg, "superW", "sess", () => 0.01);
     assert(
       JSON.stringify(cw.ordered.map((o) => o.model)) === JSON.stringify(["m1", "m2", "m3", "m4"]),
-      "z21b) weighted: nested preset refs carry top-level weight (" + JSON.stringify(cw.ordered.map((o) => o.model)) + ")"
+      "z21f) weighted: nested preset refs carry top-level weight (" + JSON.stringify(cw.ordered.map((o) => o.model)) + ")"
     );
     // nested preset's own strategy is ignored for ordering (os is affinity but
     // inside a failover parent it contributes declared order).
     assert(
       JSON.stringify(candidates(wcfg, "super", "sess").ordered.map((o) => o.backend)) === JSON.stringify(["b1", "b2", "b3", "b4"]),
-      "z21c) nested preset own strategy ignored: failover parent, declared order (" + JSON.stringify(candidates(wcfg, "super", "sess").ordered.map((o) => o.backend)) + ")"
+      "z21g) nested preset own strategy ignored: failover parent, declared order (" + JSON.stringify(candidates(wcfg, "super", "sess").ordered.map((o) => o.backend)) + ")"
     );
   }
 
@@ -2881,14 +2881,14 @@ async function main() {
       const b1a = await backendOf({ body: { ...baseOpts, session_id: "sy-body-1" } });
       const b1b = await backendOf({ body: { ...baseOpts, session_id: "sy-body-1" } });
       const b1c = await backendOf({ body: { ...baseOpts, session_id: "sy-body-1" } });
-      assert(b1a && b1a === b1b && b1b === b1c, "y1) body session_id binds one session to one backend (" + JSON.stringify([b1a, b1b, b1c]) + ")");
+      assert(b1a && b1a === b1b && b1b === b1c, "y10) body session_id binds one session to one backend (" + JSON.stringify([b1a, b1b, b1c]) + ")");
       const b2a = await backendOf({ body: { ...baseOpts, sessionId: "sy-case-1" } });
       const b2b = await backendOf({ body: { ...baseOpts, sessionId: "sy-case-1" } });
-      assert(b2a && b2a === b2b, "y2) body sessionId (camelCase) binds one session to one backend (" + JSON.stringify([b2a, b2b]) + ")");
+      assert(b2a && b2a === b2b, "y11) body sessionId (camelCase) binds one session to one backend (" + JSON.stringify([b2a, b2b]) + ")");
       const h1 = await backendOf({ body: { ...baseOpts, session_id: "sy-body-1" }, headers: { "x-session-id": "sy-head-1" } });
       const h2 = await backendOf({ body: { ...baseOpts, session_id: "sy-body-1" }, headers: { "x-session-id": "sy-head-1" } });
       const h3 = await backendOf({ body: { ...baseOpts }, headers: { "x-session-id": "sy-head-1" } });
-      assert(h1 && h1 === h2 && h2 === h3, "y3) x-session-id header wins over body session_id (" + JSON.stringify([h1, h2, h3]) + ")");
+      assert(h1 && h1 === h2 && h2 === h3, "y12) x-session-id header wins over body session_id (" + JSON.stringify([h1, h2, h3]) + ")");
     } finally {
       childSY.kill();
       srvA.srv.close(); srvB.srv.close();
