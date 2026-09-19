@@ -40,6 +40,7 @@ const CONSUMER_SPECIFIER = "./server.mjs";
 
 let ran = 0;
 let failed = 0;
+const results = [];
 
 // Output budget: a clean run is read for exactly two things, the PASS/FAIL
 // lines and the suite tail. The non-fatal validator notices repeat every run
@@ -56,12 +57,34 @@ function report(id, title, ok, evidence, notes) {
   if (!ok) failed++;
   console.log(`${ok ? "PASS" : "FAIL"} ${id} ${title}: ${evidence}`);
   const list = notes || [];
-  if (list.length && (!ok || SHOW_NOTICES)) {
-    for (const note of list) console.log(`  ${note}`);
-  } else if (list.length) {
-    console.log(`  ${list.length} notice(s) suppressed (informational only); re-run with --notices to list them`);
-  }
+  // A failing check prints its own notes immediately, where the reader is
+  // already looking. Everything else is held back and resolved at the end of
+  // the whole run, because the suppression rule is run-level, not per-check:
+  // see flushNotices().
+  const printed = list.length > 0 && (!ok || SHOW_NOTICES);
+  if (printed) for (const note of list) console.log(`  ${note}`);
+  results.push({ id, title, notes: list, printed });
   return ok;
+}
+
+// Quieting must never hide information. With nothing failed, notices are noise
+// and collapse to a single count; with ANYTHING failed, every notice from
+// EVERY check is printed, including checks that themselves passed - otherwise
+// a run where a late check fails leaves an early check's notices hidden, and
+// the reader has to know which check to interrogate.
+function flushNotices() {
+  const pending = results.filter((r) => r.notes.length > 0 && !r.printed);
+  if (pending.length === 0) return;
+  const total = pending.reduce((n, r) => n + r.notes.length, 0);
+  if (failed > 0) {
+    console.log(`  ${total} further notice(s) from ${pending.length} check(s), shown because the run failed:`);
+    for (const r of pending) {
+      console.log(`  ${r.id} ${r.title}:`);
+      for (const note of r.notes) console.log(`    ${note}`);
+    }
+    return;
+  }
+  console.log(`  ${total} notice(s) suppressed across ${pending.length} check(s) (informational only); re-run with --notices to list them`);
 }
 
 function rel(p) {
@@ -110,9 +133,15 @@ function checkSyntax() {
     if (res.error) broken.push(`${file}: ${res.error.message}`);
     else if (res.status !== 0) broken.push(`${file}: ${firstLines(res.stderr, 4)}`);
   }
+  const ok = broken.length === 0;
   return {
-    ok: broken.length === 0,
-    evidence: `${SYNTAX_FILES.length} files parsed via node --check`,
+    ok,
+    // The evidence line must never claim a success the verdict contradicts: a
+    // `FAIL S1 ... 2 files parsed` headline states the opposite of what
+    // happened, and it is the one line a CI log viewer shows first.
+    evidence: ok
+      ? `${SYNTAX_FILES.length} files parsed via node --check`
+      : `${broken.length} of ${SYNTAX_FILES.length} file(s) FAILED node --check`,
     notes: broken,
   };
 }
@@ -179,6 +208,76 @@ function isExternalAsset(value) {
   return /(cdnjs|unpkg|jsdelivr|gstatic|googleapis|bootstrapcdn|cloudflare|staticfile|cdn\.)/i.test(value);
 }
 
+// `url(...)` inside CSS. Deliberately scanned only in CSS contexts (a <style>
+// body, or a style="" attribute) and never in a <script> body, so the
+// JavaScript `URL(...)` constructor and `URL.createObjectURL(...)` cannot be
+// mistaken for an asset reference.
+const CSS_URL_PATTERN = /url\(\s*(?:"([^"]*)"|'([^']*)'|([^)'"]*))\s*\)/gi;
+
+function scanCssUrls(text, baseLine, where, notes) {
+  CSS_URL_PATTERN.lastIndex = 0;
+  let m;
+  let found = 0;
+  while ((m = CSS_URL_PATTERN.exec(text)) !== null) {
+    const value = (m[1] ?? m[2] ?? m[3] ?? "").trim();
+    if (!value) continue;
+    found++;
+    if (isExternalAsset(value)) {
+      const at = baseLine + (text.slice(0, m.index).split("\n").length - 1);
+      notes.push(`index.html:${at}: external asset reference '${value}' ${where} (the UI is single-file: no http(s), protocol-relative, or CDN assets)`);
+    }
+  }
+  return found;
+}
+
+// The inline <script> bodies are part of the single-file contract: a bare
+// specifier there is an undeclared dependency exactly like one in server.mjs.
+// The same four patterns are reused, so a static re-export, a side-effect-only
+// import, a literal dynamic import and a require call are all covered, in
+// classic and module bodies alike. (Keep this comment free of literal
+// specifier shapes: this file is itself one of the scan targets, and a quoted
+// example here would be reported as a real dependency.)
+function scanInlineScripts(html, notes) {
+  const re = /<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi;
+  let blocks = 0;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    blocks++;
+    const body = m[2];
+    const bodyLine = lineOf(html, m.index + m[0].indexOf(">") + 1);
+    for (const pattern of SPECIFIER_PATTERNS) {
+      pattern.lastIndex = 0;
+      let hit;
+      while ((hit = pattern.exec(body)) !== null) {
+        if (!isBareSpecifier(hit[1])) continue;
+        const at = bodyLine + (body.slice(0, hit.index).split("\n").length - 1);
+        notes.push(`index.html:${at}: bare specifier '${hit[1]}' in inline <script> ${blocks} (the UI is single-file: no bundled or CDN dependencies)`);
+      }
+    }
+  }
+  return blocks;
+}
+
+function scanSrcset(html, notes) {
+  const re = /(?<!\.)srcset\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'`=<>]+))/gi;
+  let refs = 0;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const value = m[1] ?? m[2] ?? m[3] ?? "";
+    // A srcset is a comma-separated candidate list; only the URL part of each
+    // candidate is an asset reference.
+    for (const candidate of value.split(",")) {
+      const url = candidate.trim().split(/\s+/)[0];
+      if (!url) continue;
+      refs++;
+      if (isExternalAsset(url)) {
+        notes.push(`index.html:${lineOf(html, m.index)}: external asset reference '${url}' in srcset (the UI is single-file: no http(s), protocol-relative, or CDN assets)`);
+      }
+    }
+  }
+  return refs;
+}
+
 function checkExternalAssets() {
   const file = join(ROOT, "index.html");
   if (!existsSync(file)) return { notes: ["index.html is missing; external-asset check cannot run"] };
@@ -199,7 +298,25 @@ function checkExternalAssets() {
       notes.push(`index.html:${lineOf(html, m.index)}: external asset reference '${value}' (the UI is single-file: no http(s), protocol-relative, or CDN assets)`);
     }
   }
-  return { refs, notes };
+
+  // Inline CSS, then inline style attributes.
+  const styleRe = /<style\b([^>]*)>([\s\S]*?)<\/style\s*>/gi;
+  let style;
+  while ((style = styleRe.exec(html)) !== null) {
+    const bodyStart = style.index + style[0].indexOf(">") + 1;
+    refs += scanCssUrls(style[2], lineOf(html, bodyStart), "in inline CSS", notes);
+  }
+  const styleAttrRe = /(?<!\.)style\s*=\s*(?:"([^"]*)"|'([^']*)')/gi;
+  let attr;
+  while ((attr = styleAttrRe.exec(html)) !== null) {
+    const value = attr[1] ?? attr[2] ?? "";
+    if (!/url\s*\(/i.test(value)) continue;
+    refs += scanCssUrls(value, lineOf(html, attr.index), "in an inline style attribute", notes);
+  }
+
+  const scripts = scanInlineScripts(html, notes);
+  refs += scanSrcset(html, notes);
+  return { refs, scripts, notes };
 }
 
 function checkDependencies() {
@@ -230,7 +347,7 @@ function checkDependencies() {
 
   return {
     ok: notes.length === 0,
-    evidence: `${declared} dependency block(s), ${imports.scanned} import-scanned file(s), ${assets.refs ?? 0} index.html asset ref(s)`,
+    evidence: `${declared} dependency block(s), ${imports.scanned} import-scanned file(s), ${assets.scripts ?? 0} inline <script> block(s), ${assets.refs ?? 0} index.html asset ref(s)`,
     notes,
   };
 }
@@ -380,9 +497,17 @@ async function checkConfigShape() {
     }
   }
 
+  const ok = fatalFiles.length === 0 && !notes.some((n) => n.includes("does not export it"));
+  const loaded = CONFIG_FILES.filter((name) => !fatalFiles.includes(name)).length;
+  const exportChecked = !fatalFiles.includes(CONSUMER_FILE) && !notes.some((n) => n.includes("no longer imports named exports"));
   return {
-    ok: fatalFiles.length === 0 && !notes.some((n) => n.includes("does not export it")),
-    evidence: `${CONFIG_FILES.length} config(s) loaded, export surface checked against ${CONSUMER_FILE}`,
+    ok,
+    // Same rule as S1: on a FAIL the line has to describe the failure, not
+    // restate a success (an unparseable config pair once read "2 config(s)
+    // loaded", and a missing test.mjs claimed the export surface was checked).
+    evidence: ok
+      ? `${CONFIG_FILES.length} config(s) loaded, export surface checked against ${CONSUMER_FILE}`
+      : `${loaded}/${CONFIG_FILES.length} config(s) loaded, export surface ${exportChecked ? "checked" : "NOT checked"} against ${CONSUMER_FILE}`,
     notes,
   };
 }
@@ -667,6 +792,7 @@ async function main() {
   }
   if (MODE !== "suite") await runStatic();
   if (MODE !== "static") runSuite();
+  flushNotices();
   console.log(`CI RESULT: ${failed ? "FAIL" : "PASS"} (${failed} of ${ran} checks failed)`);
   process.exit(failed ? 1 : 0);
 }
