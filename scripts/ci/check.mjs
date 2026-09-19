@@ -101,11 +101,23 @@ function firstLines(text, count) {
   return (text || "").trim().split(/\r?\n/).slice(0, count).join(" | ");
 }
 
-// Blank `/* ... */` and `<!-- ... -->` regions before scanning, so an
-// import-shaped line or a `url(...)` written inside a comment is not reported
-// as a dependency. Every blanked character becomes a space (newlines are kept),
-// so match offsets - and the line numbers derived from them - stay valid
-// against the original text.
+// What `<!--` means depends on the language context, and guessing wrong hides
+// real code, so the caller states which context applies:
+//   "module"  - an ES module. `<!--` is a SyntaxError there, not a comment.
+//   "classic" - a classic script. `<!--` at the start of a line is an
+//               HTML-like LINE comment (Annex B): only THAT line is ignored,
+//               never the region up to `-->`. `-->` in the same position is the
+//               matching line comment and is treated the same way.
+//   "css"     - `<style>` CSS. `<!--` and `-->` are legacy CDO/CDC tokens that
+//               a CSS parser IGNORES without opening a comment, so the rules
+//               between them are live CSS and must still be scanned.
+// Blanking nothing when a form cannot be modelled exactly is deliberate:
+// over-reporting an asset is survivable, silently missing one is not.
+//
+// Blank `/* ... */` regions before scanning, so an import-shaped line or a
+// `url(...)` written inside a comment is not reported as a dependency. Every
+// blanked character becomes a space (newlines are kept), so match offsets - and
+// the line numbers derived from them - stay valid against the original text.
 //
 // This walks the text instead of running `/\*[\s\S]*?\*\//` over it, because
 // the repo is full of prose like `// Master key for /admin/* and /api/keys`:
@@ -119,13 +131,24 @@ function firstLines(text, count) {
 //   * a specifier-shaped line, a `url(...)` or an `@import "..."` at the start
 //     of a line inside a multi-line TEMPLATE LITERAL (and, because its body is
 //     not modelled, a multi-line template literal also cannot open a comment);
-//   * a `/*` with no closing `*/`, or a `<!--` with no closing `-->`: left
-//     alone rather than blanked to end of file, so a truncated marker cannot
-//     swallow the rest of the source.
+//   * a `/*` with no closing `*/`: left alone rather than blanked to end of
+//     file, so a truncated marker cannot swallow the rest of the source;
+//   * `<!--`/`-->` NOT at the start of a line in a classic script, where the
+//     HTML-like comment grammar does not apply and the text is real operators.
 // Blanking template literals would need nesting and `${...}` handling that this
 // scanner does not attempt; a false positive on one is the safer failure.
-function blankComments(src) {
+function blankComments(src, mode = "module") {
   const blank = (text) => text.replace(/[^\n]/g, " ");
+  // Annex B only honours the HTML-like forms where a statement could begin, so
+  // `a <!-- b` stays real code and is left alone.
+  const atLineStart = (i) => {
+    const start = src.lastIndexOf("\n", i - 1) + 1;
+    return /^[ \t]*$/.test(src.slice(start, i));
+  };
+  const htmlLine =
+    mode === "classic"
+      ? (i) => (src.startsWith("<!--", i) || src.startsWith("-->", i)) && atLineStart(i)
+      : () => false;
   let out = "";
   let plain = 0;
   let i = 0;
@@ -159,9 +182,9 @@ function blankComments(src) {
     if (c === "/" && src[i + 1] === "*") {
       const end = src.indexOf("*/", i + 2);
       if (end >= 0) stop = end + 2;
-    } else if (c === "<" && src.startsWith("<!--", i)) {
-      const end = src.indexOf("-->", i + 4);
-      if (end >= 0) stop = end + 3;
+    } else if (htmlLine(i)) {
+      const nl = src.indexOf("\n", i);
+      stop = nl < 0 ? src.length : nl;
     }
     if (stop < 0) {
       i++;
@@ -263,8 +286,9 @@ function checkBareImports() {
       scanned++;
       // Comments are blanked first: an import-shaped line in a block comment
       // (this file's own documentation is a live example of the hazard) is not
-      // a dependency.
-      const src = blankComments(readFileSync(file, "utf8"));
+      // a dependency. Only `.cjs` is a classic script; the package is ESM, so
+      // every other scanned file is a module.
+      const src = blankComments(readFileSync(file, "utf8"), file.endsWith(".cjs") ? "classic" : "module");
       for (const pattern of SPECIFIER_PATTERNS) {
         pattern.lastIndex = 0;
         let m;
@@ -331,8 +355,11 @@ function scanInlineScripts(html, notes) {
   while ((m = re.exec(html)) !== null) {
     blocks++;
     // Blanked so an import-shaped line in a JavaScript block comment is not
-    // read as a dependency; template literals are the documented boundary.
-    const body = blankComments(m[2]);
+    // read as a dependency. Context matters for `<!--`: a classic script body
+    // gets the HTML-like LINE comment, a module body and CSS get nothing (see
+    // blankComments). Template literals remain the documented boundary.
+    const classic = !/\btype\s*=\s*["']?\s*module/i.test(m[1]);
+    const body = blankComments(m[2], classic ? "classic" : "module");
     const bodyLine = lineOf(html, m.index + m[0].indexOf(">") + 1);
     for (const pattern of SPECIFIER_PATTERNS) {
       pattern.lastIndex = 0;
@@ -389,19 +416,21 @@ function checkExternalAssets() {
   }
 
   // Inline CSS, then inline style attributes. Comments are blanked in both, so
-  // a commented-out `url(...)` or `@import` is not read as a live reference.
+  // a commented-out `url(...)` or `@import` is not read as a live reference -
+  // but `<!--` and `-->` are NOT blanked here: a CSS parser ignores those legacy
+  // tokens and keeps the rules between them, so that text must still be scanned.
   const styleRe = /<style\b([^>]*)>([\s\S]*?)<\/style\s*>/gi;
   let style;
   while ((style = styleRe.exec(html)) !== null) {
     const bodyStart = style.index + style[0].indexOf(">") + 1;
-    refs += scanCss(blankComments(style[2]), lineOf(html, bodyStart), "in inline CSS", notes);
+    refs += scanCss(blankComments(style[2], "css"), lineOf(html, bodyStart), "in inline CSS", notes);
   }
   const styleAttrRe = /(?<!\.)style\s*=\s*(?:"([^"]*)"|'([^']*)')/gi;
   let attr;
   while ((attr = styleAttrRe.exec(html)) !== null) {
     const value = attr[1] ?? attr[2] ?? "";
     if (!/(?:url\s*\(|@import)/i.test(value)) continue;
-    refs += scanCss(blankComments(value), lineOf(html, attr.index), "in an inline style attribute", notes);
+    refs += scanCss(blankComments(value, "css"), lineOf(html, attr.index), "in an inline style attribute", notes);
   }
 
   const scripts = scanInlineScripts(html, notes);
@@ -598,7 +627,10 @@ async function checkConfigShape() {
       fatalFiles.push(CONSUMER_FILE);
     }
     for (const name of names) {
-      if (name === "default" || !(name in server)) notes.push(`${CONSUMER_FILE} imports '${name}' from ${CONSUMER_SPECIFIER}, which does not export it`);
+      // A namespace object reports "default" correctly when server.mjs has a
+      // default export, so the name needs no special case: it is checked for
+      // existence like any other.
+      if (!(name in server)) notes.push(`${CONSUMER_FILE} imports '${name}' from ${CONSUMER_SPECIFIER}, which does not export it`);
     }
   }
 
