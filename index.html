@@ -5007,7 +5007,8 @@ function cfgApplyModal() {
   cfgMutate((d) => {
     if (kind === "backends") {
       const idx = isNew ? d.backends.length : index;
-      delete obj.id;
+      // backends is an array, so the id IS the element's identity: it stays on the
+      // stored object. The maps below carry it in the KEY and drop the field.
       if (isNew) d.backends.push(obj);
       else d.backends[idx] = obj;
       if (!isNew && rewrite && key !== newId) {

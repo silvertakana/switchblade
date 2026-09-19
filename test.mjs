@@ -4646,6 +4646,50 @@ async function main() {
         rowMerged.providers.length === 2 && same(rowMerged.providers[0], { backend: "go", dropParams: ["z"], unownedRowKey: 1 }) && same(rowMerged.providers[1], { backend: "cc", upstream: "new-upstream" }),
         "u6k) an emptied upstream is deleted, unowned row keys survive, a backend-less row is dropped, and a new row stays clean"
       );
+
+      // A backend's id lives INSIDE its element (draft.backends is an array), so
+      // apply has to leave it there; models and presets are keyed maps and drop it.
+      // A config that lost the id does not merely look wrong - it fails validation.
+      const ENV_KEY = "U6_BACKEND_ID_KEY";
+      process.env[ENV_KEY] = "set-for-validation";
+      const vDraft = () => ({
+        port: 8787,
+        backends: [{ id: "go", baseURL: "http://go", apiKeyEnv: ENV_KEY, idleTimeoutMs: 120000 }, { id: "cc", baseURL: "http://cc", apiKeyEnv: ENV_KEY }],
+        models: { m1: { providers: [{ backend: "go", upstream: "u1", dropParams: ["z"] }] } },
+        presets: { p1: { strategy: "affinity", models: ["m1"] } },
+      });
+      const backendFields = (over) =>
+        Object.assign({ f_id: "go", f_baseURL: "http://go", f_apiKeyEnv: ENV_KEY, f_timeoutMs: "90000", f_translateDeveloperRole: true, f_model: "deepseek-v4-flash", f_params: '{"temperature":0.2}' }, over || {});
+      const saveErrors = () => validateConfig(cfg.draft, null, { mode: "save" }).errors || [];
+
+      cfg.draft = vDraft();
+      open("backends", "go", api.cfgDeepCopy(cfg.draft.backends[0]), 0);
+      mountFields(backendFields());
+      api.renderCfgModal();
+      api.cfgApplyModal();
+      assert(!!cfg.draft.backends[0] && cfg.draft.backends[0].id === "go", "u6l1) editing a backend stores the element with its id intact");
+      assert(saveErrors().length === 0, "u6l2) the config a backend edit produces validates in save mode" + (saveErrors().length ? " - " + saveErrors().map((e) => e.path + ": " + e.message).join("; ") : ""));
+
+      cfg.draft = vDraft();
+      open("backends", null, {});
+      mountFields(backendFields({ f_id: "fresh-backend" }));
+      api.renderCfgModal();
+      api.cfgApplyModal();
+      const pushedBackend = cfg.draft.backends[cfg.draft.backends.length - 1];
+      assert(!!pushedBackend && pushedBackend.id === "fresh-backend", "u6l3) adding a backend stores the pushed element with its id intact");
+      assert(saveErrors().length === 0, "u6l4) the config a backend add produces validates in save mode");
+
+      cfg.draft = vDraft();
+      confirmLog.length = 0;
+      confirmAnswer = true;
+      open("backends", "go", api.cfgDeepCopy(cfg.draft.backends[0]), 0);
+      mountFields(backendFields({ f_id: "go-renamed" }));
+      api.renderCfgModal();
+      api.cfgApplyModal();
+      assert(!!cfg.draft.backends[0] && cfg.draft.backends[0].id === "go-renamed", "u6l5) accepting a backend rename stores the element under the new id");
+      assert(cfg.draft.models.m1.providers[0].backend === "go-renamed", "u6l6) a backend rename still rewrites the provider references");
+      assert(confirmLog.length === 1 && /Rename 'go' to 'go-renamed'\?/.test(confirmLog[0]), "u6l7) the rename prompt is still offered for a backend id change");
+      delete process.env[ENV_KEY];
     }
   }
 
