@@ -4737,9 +4737,13 @@ function cfgField(label, id, opts) {
   const value = o.value == null ? "" : o.value;
   const sub = o.sub ? "<span class='sub'>" + esc(o.sub) + "</span>" : "";
   if (type === "textarea") {
+    // An absent value renders as an EMPTY box. The coercion above turns null into
+    // "", and JSON-encoding that "" would print the two characters `""` - a value
+    // with no input behind it, which collect then parses back as the empty string.
+    const text = o.textValue != null ? o.textValue : o.value == null ? "" : cfgJsonText(o.value);
     return (
       "<div class='cfg-field'><label for='" + id + "'><b>" + esc(label) + "</b></label>" +
-      "<textarea id='" + id + "' spellcheck='false' placeholder='" + esc(o.placeholder || "") + "'>" + esc(o.textValue == null ? cfgJsonText(value) : o.textValue) + "</textarea>" +
+      "<textarea id='" + id + "' spellcheck='false' placeholder='" + esc(o.placeholder || "") + "'>" + esc(text) + "</textarea>" +
       sub + "</div>"
     );
   }
@@ -4827,7 +4831,10 @@ function renderCfgModal() {
       cfgField("Affinity pool (optional)", "f_affinityPool", { type: "number", value: data.affinityPool == null ? "" : data.affinityPool }) +
       cfgField("Label", "f_metaLabel", { value: data.meta && data.meta.label }) +
       cfgField("Tier", "f_metaTier", { value: data.meta && data.meta.tier, sub: "UI grouping only, e.g. fast / balanced / strong." }) +
-      cfgField("When to use", "f_metaWhen", { type: "textarea", value: data.meta && data.meta.whenToUse }) +
+      // Prose, not JSON: textValue keeps the box from being JSON-quoted, which
+      // would show the field wearing quotes and then save those quotes as part of
+      // the value - a fresh pair on every save.
+      cfgField("When to use", "f_metaWhen", { type: "textarea", textValue: (data.meta && data.meta.whenToUse) || "" }) +
       cfgField("Extra params (JSON, optional)", "f_params", { type: "textarea", value: data.params });
     cfg.modal.models = (Array.isArray(data.models) ? data.models : []).map((e) =>
       typeof e === "string" ? { model: e, weight: null } : { model: (e && e.model) || "", weight: (e && e.weight) == null ? null : e.weight }
@@ -4917,7 +4924,7 @@ function cfgModalCollect() {
   };
   const setText = (o, key, id) => { const v = String(val(id)).trim(); if (v) o[key] = v; else delete o[key]; };
   const setNum = (o, key, id) => { const n = num(id); if (n !== undefined && !Number.isNaN(n)) o[key] = n; else delete o[key]; };
-  const setJson = (o, key, id) => { const v = cfgParseMaybeJson(val(id)); if (v !== undefined) o[key] = v; else delete o[key]; };
+  const setJson = (o, key, id) => { const raw = String(val(id)).trim(); if (!raw) { delete o[key]; return; } const v = cfgParseMaybeJson(raw); if (v !== undefined) o[key] = v; else delete o[key]; };
 
   if (kind === "backends") {
     const b = prevEntry("backends");
@@ -4966,7 +4973,12 @@ function cfgModalCollect() {
     p.strategy = val("f_strategy") || "affinity";
     p.models = (cfg.modal.models || [])
       .filter((e) => e.model)
-      .map((e) => (e.weight == null || e.weight === "" ? e.model : { model: e.model, weight: Number(e.weight) }));
+      .map((e) => {
+        // A blank or unparseable weight is an absence, not 0 and not NaN: the row
+        // stays a bare id reference.
+        const w = String(e.weight == null ? "" : e.weight).trim();
+        return !w || !Number.isFinite(Number(w)) ? e.model : { model: e.model, weight: Number(w) };
+      });
     setNum(p, "affinityPool", "f_affinityPool");
     const meta = Object.assign({}, p.meta && typeof p.meta === "object" && !Array.isArray(p.meta) ? p.meta : {});
     setText(meta, "label", "f_metaLabel");
@@ -4995,6 +5007,16 @@ function cfgApplyModal() {
   const obj = cfgModalCollect();
   const isNew = key === null;
   const newId = obj.id;
+  if (!newId) {
+    // An id is how the entry is addressed, so an emptied one has nothing to store
+    // under and every field the user did touch would be thrown away. Say so and
+    // keep the modal open instead of offering a rename to "undefined".
+    const what = kind === "backends" ? "Backend" : kind === "models" ? "Model" : "Preset";
+    const issues = $("cfgModalIssues");
+    issues.className = "cfg-issues error";
+    issues.innerHTML = ICONS.warn + "<div><b>" + what + " id is required.</b> Give it one, or Cancel to leave the entry as it was.</div>";
+    return;
+  }
   let rewrite = true;
   if (!isNew && newId !== key) {
     const refs = countRefsTo(kind, key);

@@ -4394,6 +4394,7 @@ async function main() {
       console,
       confirm: (msg) => { confirmLog.push(msg); return confirmAnswer; },
       renderConfig: () => {},
+      ICONS: { warn: "" },
       document: { getElementById: (id) => { if (!fields.has(id)) fields.set(id, stubField("")); return fields.get(id); } },
       esc: (v) => String(v == null ? "" : v),
       cfgField: () => "",
@@ -4690,6 +4691,203 @@ async function main() {
       assert(cfg.draft.models.m1.providers[0].backend === "go-renamed", "u6l6) a backend rename still rewrites the provider references");
       assert(confirmLog.length === 1 && /Rename 'go' to 'go-renamed'\?/.test(confirmLog[0]), "u6l7) the rename prompt is still offered for a backend id change");
       delete process.env[ENV_KEY];
+
+      // A form value the user never filled in must not become a value: an emptied
+      // id has no identity to store under, so apply refuses it with a message
+      // instead of offering "Rename 'go' to 'undefined'?" and then a 400.
+      cfg.draft = vDraft();
+      confirmLog.length = 0;
+      open("backends", "go", api.cfgDeepCopy(cfg.draft.backends[0]), 0);
+      mountFields(backendFields({ f_id: "" }));
+      api.renderCfgModal();
+      api.cfgApplyModal();
+      assert(
+        cfg.draft.backends[0].id === "go" && confirmLog.length === 0 && /id is required/.test(fields.get("cfgModalIssues").innerHTML || ""),
+        "u6n1) an emptied backend id is refused with a message instead of a rename to undefined"
+      );
+      cfg.draft = freshDraft();
+      confirmLog.length = 0;
+      open("models", "glm-5.3-flash", Object.assign({ id: "glm-5.3-flash" }, api.cfgDeepCopy(modelEntry)), 0);
+      mountFields(modelFields({ f_id: "" }));
+      api.renderCfgModal();
+      api.cfgApplyModal();
+      assert(
+        confirmLog.length === 0 && /id is required/.test(fields.get("cfgModalIssues").innerHTML || ""),
+        "u6n2) an emptied model id is refused too (one rule across the three kinds)"
+      );
+
+      // ---- real-render mode ----------------------------------------------------
+      // The block above hand-feeds every scalar form value, so it cannot see the
+      // render -> form-value -> collect half: a field helper that manufactures a
+      // value nobody typed (cfgField JSON-encoding an ABSENT textarea into the two
+      // characters `""`, say) is invisible to it. This mode reads the HTML that
+      // renderCfgModal actually emits, the way a browser would, and then opens and
+      // saves every entry of the real mirror config untouched.
+      const renderNeeded = ["cfgDeepCopy", "cfgParseMaybeJson", "cfgJsonText", "cfgMutate", "cfgCloseModal", "cfgEnvNames", "cfgField", "renderCfgModal", "cfgModalCollect", "cfgApplyModal", "countRefsTo"];
+      const rBodies = [];
+      const rBroken = [];
+      const parses = (src) => { try { new vm.Script(src); return true; } catch { return false; } };
+      for (const name of renderNeeded) {
+        const body = sliceFunction(htmlSource, name);
+        if (!body || !parses(body)) {
+          rBroken.push(name);
+          continue;
+        }
+        rBodies.push(body);
+      }
+      const rDollar = (htmlSource.match(/\nconst \$ = [^\n]*\n/) || [])[0];
+      const rEsc = (htmlSource.match(/\nconst esc = [^\n]*\n/) || [])[0];
+      for (const pair of [["$", rDollar], ["esc", rEsc]]) if (!pair[1] || !parses(pair[1])) rBroken.push(pair[0]);
+
+      // A fake DOM fed by the emitted HTML: <input value='..'>, <textarea>..</textarea>
+      // and the selected <select> option, unescaped through the same five entities
+      // esc writes. cfgModalBody.innerHTML is the seam the renderer writes through.
+      const rFields = new Map();
+      const rField = (id) => {
+        if (!rFields.has(id)) rFields.set(id, { value: "", checked: false, style: {}, innerHTML: "", textContent: "" });
+        return rFields.get(id);
+      };
+      const rUnesc = (s) => String(s).replace(/&#39;/g, "'").replace(/&quot;/g, "\"").replace(/&gt;/g, ">").replace(/&lt;/g, "<").replace(/&amp;/g, "&");
+      const rAttrs = (s) => {
+        const out = {};
+        for (const m of s.matchAll(/([A-Za-z0-9_-]+)(?:='([^']*)')?/g)) out[m[1]] = m[2] === undefined ? "" : rUnesc(m[2]);
+        return out;
+      };
+      const rParse = (html) => {
+        rFields.clear();
+        for (const m of html.matchAll(/<input\b([^>]*)>/g)) {
+          const a = rAttrs(m[1]);
+          if (a.id) rFields.set(a.id, { value: a.value || "", checked: "checked" in a, style: {}, innerHTML: "", textContent: "" });
+        }
+        for (const m of html.matchAll(/<textarea\b([^>]*)>([\s\S]*?)<\/textarea>/g)) {
+          const a = rAttrs(m[1]);
+          if (a.id) rFields.set(a.id, { value: rUnesc(m[2]), checked: false, style: {}, innerHTML: "", textContent: "" });
+        }
+        for (const m of html.matchAll(/<select\b([^>]*)>([\s\S]*?)<\/select>/g)) {
+          const a = rAttrs(m[1]);
+          if (!a.id) continue;
+          const opt = /<option value='([^']*)' selected>/.exec(m[2]);
+          rFields.set(a.id, { value: opt ? rUnesc(opt[1]) : "", checked: false, style: {}, innerHTML: "", textContent: "" });
+        }
+      };
+      const rBody = {
+        value: "",
+        checked: false,
+        style: {},
+        textContent: "",
+        get innerHTML() { return ""; },
+        set innerHTML(html) { rParse(html); },
+      };
+      const rCfg = { draft: null, modal: null, dirty: false, envNames: [], loaded: false };
+      const rSandbox = {
+        cfg: rCfg,
+        console,
+        confirm: () => true,
+        renderConfig: () => {},
+        ICONS: { warn: "" },
+        document: { getElementById: (id) => (id === "cfgModalBody" ? rBody : rField(id)) },
+        renderProvList: () => {},
+        renderPresetModelList: () => {},
+      };
+      let apiR = null;
+      let rEvalError = null;
+      if (rBroken.length === 0) {
+        const program = [rDollar, rEsc]
+          .concat(rBodies, ["({ $, esc, cfgField, cfgJsonText, cfgEnvNames, renderCfgModal, cfgModalCollect, cfgApplyModal, cfgDeepCopy })"])
+          .join("\n");
+        try {
+          apiR = vm.runInContext(program, vm.createContext(rSandbox));
+        } catch (e) {
+          rEvalError = e.message;
+        }
+      }
+      const renderOk = rBroken.length === 0 && !rEvalError && !!apiR && typeof apiR.renderCfgModal === "function" && typeof apiR.cfgApplyModal === "function" && typeof apiR.cfgField === "function";
+      assert(
+        renderOk,
+        "u6m1) the real-render harness extracted " + rBodies.length + "/" + renderNeeded.length + " function(s) plus $ and esc" +
+          (rBroken.length ? " [NOT FOUND OR UNPARSEABLE: " + rBroken.join(", ") + "]" : "") +
+          (rEvalError ? " [evaluation failed: " + rEvalError + "]" : "")
+      );
+
+      let mirror = null;
+      let mirrorError = null;
+      try {
+        mirror = JSON.parse(await readFile(join(import.meta.dirname, "config.json"), "utf8"));
+      } catch (e) {
+        mirrorError = e.message;
+      }
+      assert(!!mirror && Array.isArray(mirror.backends) && !!mirror.models && !!mirror.presets, "u6m2) the mirror config.json was read for the round-trip check" + (mirrorError ? " [unreadable: " + mirrorError + "]" : ""));
+
+      const rJson = (v) => JSON.stringify(v);
+      const firstDiff = (a, b, path) => {
+        const p = path || "";
+        if (Array.isArray(a) || Array.isArray(b)) {
+          if (!Array.isArray(a) || !Array.isArray(b)) return p + " " + rJson(a) + " -> " + rJson(b);
+          for (let i = 0; i < Math.max(a.length, b.length); i++) if (rJson(a[i]) !== rJson(b[i])) return firstDiff(a[i], b[i], p + "[" + i + "]");
+          return p;
+        }
+        if (a && b && typeof a === "object" && typeof b === "object") {
+          for (const k of Array.from(new Set(Object.keys(a).concat(Object.keys(b))))) {
+            if (!(k in a)) return p + "." + k + " added: " + rJson(b[k]);
+            if (!(k in b)) return p + "." + k + " LOST: " + rJson(a[k]);
+            if (rJson(a[k]) !== rJson(b[k])) return firstDiff(a[k], b[k], p + "." + k);
+          }
+          return p;
+        }
+        return p + " " + rJson(a) + " -> " + rJson(b);
+      };
+
+      const rDiffs = [];
+      const rErrs = [];
+      let rCount = 0;
+      let rDiffer = 0;
+      let rIdFields = 0;
+      let rInvalid = 0;
+      const rSaveUntouched = (kind, key, entry, index) => {
+        rCount++;
+        rCfg.draft = JSON.parse(JSON.stringify(mirror));
+        // The tab opens a map entry with its key injected as the id (index.html:5179),
+        // which is what puts the id in the ID box; a backend already carries its own.
+        const data = kind === "backends" ? entry : Object.assign({ id: key }, entry);
+        rCfg.modal = { kind, key, data: JSON.parse(JSON.stringify(data)), index: index == null ? null : index, provs: [], models: [] };
+        apiR.renderCfgModal();
+        if (rFields.has("f_id")) rIdFields++;
+        apiR.cfgApplyModal();
+        const stored = kind === "backends" ? rCfg.draft.backends[index] : rCfg.draft[kind][key];
+        if (rJson(stored) !== rJson(entry)) {
+          rDiffer++;
+          if (rDiffs.length < 8) rDiffs.push(kind + "." + key + ": " + firstDiff(entry, stored));
+        }
+        const verdict = validateConfig(rCfg.draft, null, { mode: "save" });
+        if (verdict.errors.length) {
+          rInvalid++;
+          if (rErrs.length < 6) rErrs.push(kind + "." + key + ": " + verdict.errors.map((e) => e.path + ": " + e.message).join("; "));
+        }
+      };
+      if (renderOk && mirror) {
+        // The validator requires every referenced apiKeyEnv to exist in THIS
+        // process; that is about the machine, not about the payload, so stand the
+        // names up for the duration and take them back down.
+        const stoodUp = new Set();
+        for (const b of mirror.backends) if (b && b.apiKeyEnv && !(b.apiKeyEnv in process.env)) stoodUp.add(b.apiKeyEnv);
+        for (const n of stoodUp) process.env[n] = "u6m-placeholder";
+        for (const [id, m] of Object.entries(mirror.models)) rSaveUntouched("models", id, m);
+        for (const [id, p] of Object.entries(mirror.presets)) rSaveUntouched("presets", id, p);
+        mirror.backends.forEach((b, i) => rSaveUntouched("backends", b.id, b, i));
+        for (const n of stoodUp) delete process.env[n];
+      }
+      assert(
+        rCount > 0 && rIdFields === rCount,
+        "u6m3) all " + rCount + " mirror entries rendered a real id field out of the emitted HTML (" + rIdFields + " did) - a silent no-op would pass the round-trip vacuously"
+      );
+      assert(
+        rDiffer === 0,
+        "u6m4) a no-op open+save of all " + rCount + " mirror entries through the REAL render path is byte-identical (" + rDiffer + " differ)" + (rDiffs.length ? ": " + rDiffs.join(" | ") : "")
+      );
+      assert(
+        rInvalid === 0,
+        "u6m5) every payload the real render path produces validates in save mode (" + rInvalid + " of " + rCount + " entry saves were rejected)" + (rErrs.length ? ": " + rErrs.join(" | ") : "")
+      );
     }
   }
 
