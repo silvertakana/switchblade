@@ -501,6 +501,11 @@ function checkTestIds() {
   const duplicates = [...counts].filter(([, n]) => n > 1).sort((a, b) => b[1] - a[1]);
 
   const notes = [];
+  notes.push(
+    "STATIC scan: only literal labels written in the source are read. A label a loop or a shared " +
+      "helper emits more than once under one id is not visible here, so \"0 duplicate(s)\" is a claim " +
+      "about statically written ids, not about the runtime PASS stream."
+  );
   for (const [id, n] of duplicates) notes.push(`duplicate test id '${id})' used ${n} times`);
   if (ids.length < TEST_ID_FLOOR) {
     notes.push(`extracted only ${ids.length} test id(s), below the sanity floor of ${TEST_ID_FLOOR}; the extractor is probably broken`);
@@ -514,7 +519,7 @@ function checkTestIds() {
 
   return {
     ok: duplicates.length === 0 && ids.length >= TEST_ID_FLOOR,
-    evidence: `${ids.length} test id(s) from ${sites.length} assert call site(s) (${names.length} named), ${duplicates.length} duplicate(s)`,
+    evidence: `${ids.length} static test id(s) from ${sites.length} assert call site(s) (${names.length} named), ${duplicates.length} duplicate(s) among literal labels`,
     notes,
   };
 }
@@ -637,7 +642,7 @@ function runStatic() {
     report("S4", "config shape + export surface", s4.ok, s4.evidence, s4.notes);
 
     const s5 = checkTestIds();
-    report("S5", "test id hygiene", s5.ok, s5.evidence, s5.notes);
+    report("S5", "test id hygiene (static scan)", s5.ok, s5.evidence, s5.notes);
 
     const s7 = checkTrackedJunk();
     report("S7", "tracked junk", s7.ok, s7.evidence, s7.notes);
