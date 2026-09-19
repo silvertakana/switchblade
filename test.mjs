@@ -1071,6 +1071,47 @@ async function main() {
     }
   }
 
+  {
+    // v34f) BOOT abort for a NON-OBJECT ROOT: the other half of the fatal class
+    //       v34d pins. The `e.path === ""` branch is the only thing that stops
+    //       this shape; without it the run falls through to normalizeConfig and
+    //       ensureBackends and dies as an incidental TypeError (exit 1 with no
+    //       banner in BOTH directions), so the assertion discriminates on the
+    //       FAILURE MODE, exactly as v34d does for a missing `backends`.
+    const dir = await mkdtemp(join(tmpdir(), "lmr-v34f-"));
+    const cfgPath = join(dir, "config.json");
+    const envPath = join(dir, ".env");
+    await writeFile(cfgPath, JSON.stringify([{ id: "v34f" }], null, 2) + "\n");
+    await writeFile(envPath, "KEY_V34F=k\n");
+    const child = spawn(process.execPath, ["server.mjs"], {
+      cwd: join(import.meta.dirname),
+      env: { ...process.env, ROUTER_CONFIG: cfgPath, ROUTER_ENV: envPath },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let banner = false;
+    let err = "";
+    child.stderr.on("data", (d) => {
+      const s = d.toString();
+      err += s;
+      if (/listening on http:\/\/127\.0\.0\.1:\d+/.test(s)) banner = true;
+    });
+    const exited = await new Promise((resolve) => {
+      const t = setTimeout(() => resolve("timeout"), 15000);
+      child.on("exit", (code) => { clearTimeout(t); resolve(code); });
+    });
+    try {
+      assert(
+        exited !== "timeout" && exited !== 0 && banner === false &&
+        /config invalid:/.test(err) && /\(root\)/.test(err) &&
+        !/TypeError/.test(err),
+        "v34f) a non-object config root aborts startup with the validator's (root) message, not an incidental TypeError (exit=" + exited + ", banner=" + banner + ", stderr=" + JSON.stringify(err.slice(-240)) + ")"
+      );
+    } finally {
+      child.kill();
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
   // ---- z-series: three-layer routing (new-shape configs, mock backends) ----
 
   const BO = { rateLimitBaseMs: 50, rateLimitMaxMs: 200, serverBaseMs: 50, serverMaxMs: 200, authBaseMs: 50, authMaxMs: 200, weeklyDefaultMs: 1000 };
