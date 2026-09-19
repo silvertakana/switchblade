@@ -782,6 +782,32 @@ async function main() {
     delete process.env.KEY_B1;
   }
 
+  // v33) save/load validation split: an unknown preset ref is an ERROR at save
+  //      (existing behavior, unchanged) and a warn-and-drop at load. The
+  //      unknown-strategy and unknown-top-level-key branches are characterized
+  //      here as-is: both stay warning-class in BOTH modes.
+  {
+    process.env.KEY_B1 = "x";
+    const cfg = {
+      backends: [{ id: "b1", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_B1" }],
+      models: { "m1": { providers: [{ backend: "b1", upstream: "u1" }] } },
+      presets: {
+        "p1": { strategy: "affinity", models: ["ghost"] },
+        "p2": { strategy: "sideways", models: ["m1"] }
+      },
+      extraFuture: { keep: true }
+    };
+    const v = validateConfig(cfg, cfg);
+    assert(v.errors.some((e) => e.path === "presets.p1.models[0]"), "v33a) unknown preset ref is an error (" + JSON.stringify(v.errors) + ")");
+    assert(v.warnings.some((w) => w.path === "presets.p2.strategy"), "v33b) unknown strategy warns and falls back (" + JSON.stringify(v.warnings) + ")");
+    assert(v.warnings.some((w) => w.path === "extraFuture"), "v33c) unknown top-level key warns");
+    // Save/load split: load tolerates the dangling ref (warn+drop), save refuses it.
+    const vl = validateConfig(cfg, cfg, { mode: "load" });
+    assert(vl.errors.every((e) => e.path !== "presets.p1.models[0]"), "v33d) load mode downgrades the dangling ref to warn (" + JSON.stringify(vl.errors) + ")");
+    assert(vl.warnings.some((w) => w.path === "presets.p1.models[0]"), "v33e) load warn carries the ref path");
+    delete process.env.KEY_B1;
+  }
+
   // ---- z-series: three-layer routing (new-shape configs, mock backends) ----
 
   const BO = { rateLimitBaseMs: 50, rateLimitMaxMs: 200, serverBaseMs: 50, serverMaxMs: 200, authBaseMs: 50, authMaxMs: 200, weeklyDefaultMs: 1000 };

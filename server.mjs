@@ -302,11 +302,15 @@ function envNames() {
 
 // Validate a candidate config. Returns { errors, warnings }; a non-empty
 // errors array means the save is refused and the file is left untouched.
-function validateConfig(candidate, current) {
+function validateConfig(candidate, current, opts) {
   const errors = [];
   const warnings = [];
   const err = (path, message) => errors.push({ path, message });
   const warn = (path, message) => warnings.push({ path, message });
+  // 'save' is the default so every existing two-argument caller keeps the
+  // save-time strictness; the load path opts in explicitly to tolerant
+  // handling of a config that is already on disk.
+  const mode = (opts && opts.mode) || "save";
 
   if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
     err("", "config must be a JSON object");
@@ -443,7 +447,11 @@ function validateConfig(candidate, current) {
         if (typeof entry !== "string" && (!entry || typeof entry !== "object")) return err(sat, "must be a string or {model, weight}");
         if (!ref) return err(sat, "model id is required");
         if (!modelIds.has(ref) && !presetIds.has(ref)) {
-          err(sat, `unknown model or preset '${ref}'`);
+          if (mode === "load") {
+            warn(sat, `unknown model or preset '${ref}'; ref dropped at load`);
+          } else {
+            err(sat, `unknown model or preset '${ref}'`);
+          }
         }
         if (!modelIds.has(ref) && presetIds.has(ref) && ref === id) {
           err(sat, `preset '${id}' references itself`);
