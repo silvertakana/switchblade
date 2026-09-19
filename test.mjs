@@ -4890,6 +4890,146 @@ async function main() {
         "u6m5) every payload the real render path produces validates in save mode (" + rInvalid + " of " + rCount + " entry saves were rejected)" + (rErrs.length ? ": " + rErrs.join(" | ") : "")
       );
 
+      // ---- Task 9: the editor round-trips the REAL mirror config --------------
+      // One model's LABEL is the only thing a user changed. Everything else has
+      // to come back as it went in - every provider's dialect keys above all -
+      // the payload has to still validate, and the served-id surface must not
+      // move. The subject id and its provider shape are asserted FIRST, so a
+      // mirror rename or a provider-less entry fails here loudly instead of
+      // quietly testing some other id, or testing an empty list that cannot fail.
+      const u9Subject = "glm-5.3-flash";
+      // servedIds is the rule the Task 7 harness also extracts, through the same
+      // helper. The block pulls it again and fails loudly on its own, so the
+      // surface comparison below can never run against a rule that silently
+      // vanished from index.html.
+      const u9Needed = ["servedIds"];
+      const u9Bodies = [];
+      const u9Broken = [];
+      for (const name of u9Needed) {
+        const body = sliceFunction(htmlSource, name);
+        if (!body || !parses(body)) { u9Broken.push(name); continue; }
+        u9Bodies.push(body);
+      }
+      let u9Api = null;
+      let u9EvalError = null;
+      if (u9Broken.length === 0) {
+        try { u9Api = vm.runInContext(u9Bodies.concat(["({ servedIds })"]).join("\n"), vm.createContext({})); } catch (e) { u9EvalError = e.message; }
+      }
+      const u9Ok = u9Broken.length === 0 && !u9EvalError && !!u9Api && typeof u9Api.servedIds === "function";
+      assert(
+        u9Ok,
+        "u9a) the served-id rule was extracted from index.html (" + u9Bodies.length + "/" + u9Needed.length + ") and evaluated for the before/after comparison" +
+          (u9Broken.length ? " [NOT FOUND OR UNPARSEABLE: " + u9Broken.join(", ") + "]" : "") +
+          (u9EvalError ? " [evaluation failed: " + u9EvalError + "]" : "")
+      );
+      const u9Entry = mirror && mirror.models ? mirror.models[u9Subject] : null;
+      assert(
+        !!u9Entry,
+        "u9b) the real mirror config.json carries the round-trip subject model '" + u9Subject + "'" +
+          (u9Entry
+            ? " [the mirror carries " + Object.keys(mirror.models).length + " model(s)]"
+            : mirror && mirror.models
+              ? " [the mirror carries " + Object.keys(mirror.models).length + " model(s) and the subject is ABSENT - a rename in the mirror must fail here, never silently test another id]"
+              : " [the config has no models object]")
+      );
+      const u9Provs = u9Entry && Array.isArray(u9Entry.providers) ? u9Entry.providers : null;
+      const u9Dialect = u9Provs ? u9Provs.filter((p) => p && (Array.isArray(p.dropParams) || p.params || p.paramMap)).length : 0;
+      assert(
+        !!u9Provs && u9Provs.length > 0 && u9Dialect > 0,
+        "u9c) the subject model carries " + (u9Provs ? u9Provs.length : 0) + " provider(s) and " + u9Dialect + " of them hold a dropParams/params/paramMap key (an empty provider list would make the round-trip assertions below vacuous)"
+      );
+
+      if (!(u9Ok && u9Entry && u9Provs && u9Provs.length > 0)) {
+        assert(false, "u9c2) the label-only round-trip could not be exercised: the subject model or the served-id rule is missing");
+      } else {
+        const u9Label = "GLM 5.3 Flash (task 9 edit)";
+        rCfg.draft = JSON.parse(JSON.stringify(mirror));
+        rCfg.modal = { kind: "models", key: u9Subject, data: Object.assign({ id: u9Subject }, JSON.parse(JSON.stringify(u9Entry))), index: null, provs: [], models: [] };
+        apiR.renderCfgModal();
+        const u9LabelField = rFields.get("f_metaLabel");
+        if (u9LabelField) u9LabelField.value = u9Label;
+        const u9Collected = apiR.cfgModalCollect();
+        apiR.cfgApplyModal();
+        const u9Stored = rCfg.draft.models[u9Subject];
+
+        // The whole entry, not just the label: a save that quietly drops a key
+        // the form does not own is the defect this pins.
+        const u9Expect = JSON.parse(JSON.stringify(u9Entry));
+        u9Expect.meta.label = u9Label;
+        const u9Diff = firstDiff(u9Expect, u9Stored);
+        assert(
+          !!u9LabelField && u9Diff === "" && !!u9Stored && !!u9Stored.meta && u9Stored.meta.label === u9Label,
+          "u9d) the real render + collect + apply of a LABEL-ONLY edit stores the subject byte-identical to its input except meta.label ('" + u9Label + "')" +
+            (u9LabelField ? "" : " [f_metaLabel was never rendered]") +
+            (u9Stored && u9Stored.meta ? "" : " [meta missing after apply]") +
+            (u9Diff === "" ? "" : " [first difference: " + u9Diff + "]")
+        );
+
+        const u9KeyDiffs = [];
+        for (const pair of [["collected", u9Collected && u9Collected.providers], ["stored", u9Stored && u9Stored.providers]]) {
+          const where = pair[0];
+          const list = pair[1];
+          if (!Array.isArray(list) || list.length !== u9Provs.length) {
+            u9KeyDiffs.push(where + ": provider count " + (Array.isArray(list) ? list.length : "none") + " != " + u9Provs.length);
+            continue;
+          }
+          u9Provs.forEach((want, i) => {
+            for (const k of ["dropParams", "params", "paramMap"]) {
+              if (rJson(list[i] && list[i][k]) !== rJson(want[k])) u9KeyDiffs.push(where + "[" + i + "]." + k + ": " + rJson(want[k]) + " -> " + rJson(list[i] && list[i][k]));
+            }
+          });
+        }
+        assert(
+          u9KeyDiffs.length === 0,
+          "u9e) every provider's dropParams/params/paramMap is unchanged from the input, in the collected object and in the stored entry (" + u9KeyDiffs.length + " changed" + (u9KeyDiffs.length ? ": " + u9KeyDiffs.slice(0, 6).join(" | ") : "") + ")"
+        );
+
+        // The validator requires every referenced apiKeyEnv to exist in THIS
+        // process; that is about the machine, not the payload.
+        const u9StoodUp = new Set();
+        for (const b of rCfg.draft.backends || []) if (b && b.apiKeyEnv && !(b.apiKeyEnv in process.env)) u9StoodUp.add(b.apiKeyEnv);
+        for (const n of u9StoodUp) process.env[n] = "u9-placeholder";
+        let u9Verdict = null;
+        try { u9Verdict = validateConfig(rCfg.draft, null, { mode: "save" }); } finally { for (const n of u9StoodUp) delete process.env[n]; }
+        const u9Errors = u9Verdict ? u9Verdict.errors : null;
+        assert(
+          !!u9Errors && u9Errors.length === 0,
+          "u9f) the payload a label-only edit produces validates in SAVE mode with zero errors (" + (u9Errors ? u9Errors.length + " error(s)" : "no verdict") + ")" +
+            (u9Errors && u9Errors.length ? ": " + u9Errors.map((e) => e.path + ": " + e.message).join("; ") : "")
+        );
+
+        const u9BeforeList = u9Api.servedIds(mirror);
+        const u9AfterList = u9Api.servedIds(rCfg.draft);
+        let u9FirstMove = -1;
+        for (let i = 0; i < Math.max(u9BeforeList.length, u9AfterList.length) && u9FirstMove < 0; i++) if (u9BeforeList[i] !== u9AfterList[i]) u9FirstMove = i;
+        assert(
+          u9BeforeList.length > 0 && rJson(u9BeforeList) === rJson(u9AfterList),
+          "u9g) a models-only edit leaves the served-id surface alone - same ids in the same order (" + u9BeforeList.length + " -> " + u9AfterList.length + " id(s)" +
+            (u9FirstMove < 0 ? "" : ", first move at index " + u9FirstMove + ": " + rJson(u9BeforeList[u9FirstMove]) + " -> " + rJson(u9AfterList[u9FirstMove])) + ")"
+        );
+
+        // The surface as a REAL router reports it, before and after, and against
+        // the UI's own rule - the editor's view and the endpoint's must agree.
+        // `port` is the one field overridden: a child has to bind an ephemeral
+        // port, and /v1/models does not read it.
+        let u9ServedBefore = null;
+        let u9ServedAfter = null;
+        let u9ServeError = null;
+        try {
+          const u9BeforeChild = await startRouterCfg(Object.assign({}, mirror, { port: 0 }), "");
+          try { u9ServedBefore = (await (await fetch(u9BeforeChild.base + "/v1/models")).json()).data.map((x) => x.id); } finally { u9BeforeChild.child.kill(); await rm(u9BeforeChild.dir, { recursive: true, force: true }); }
+          const u9AfterChild = await startRouterCfg(Object.assign({}, rCfg.draft, { port: 0 }), "");
+          try { u9ServedAfter = (await (await fetch(u9AfterChild.base + "/v1/models")).json()).data.map((x) => x.id); } finally { u9AfterChild.child.kill(); await rm(u9AfterChild.dir, { recursive: true, force: true }); }
+        } catch (e) {
+          u9ServeError = e.message;
+        }
+        assert(
+          !!u9ServedBefore && !!u9ServedAfter && u9ServedBefore.length > 0 && rJson(u9ServedBefore) === rJson(u9ServedAfter) && rJson(u9ServedBefore) === rJson(u9AfterList),
+          "u9h) a real router's /v1/models is identical before and after the edit and matches the UI's served-id rule (" +
+            (u9ServedBefore ? u9ServedBefore.length : "none") + " -> " + (u9ServedAfter ? u9ServedAfter.length : "none") + " id(s), UI rule " + u9AfterList.length + " id(s))" +
+            (u9ServeError ? " [child failed: " + u9ServeError + "]" : "")
+        );
+      }
       // ---- served-id pickers (Task 7) -----------------------------------------
       // The Playground selector, the Compare checkboxes and the persisted-selection
       // restore must all list what the router serves: exposed presets first, then
@@ -5147,6 +5287,7 @@ async function main() {
           "u7k) a served model is still posted with its own id, so the empty-id guard is not a dead send path (posted " + aSent.length + ")"
         );
       }
+
 
       // ---- post-save and post-env-write refresh (Task 8) ----------------------
       // Two pieces of state the page kept from an earlier render: the config viewer
