@@ -852,26 +852,62 @@ async function main() {
       stdio: ["ignore", "pipe", "pipe"]
     });
     let base = null;
+    let v34Err = "";
     await new Promise((resolve, reject) => {
       const t = setTimeout(() => reject(new Error("no start")), 8000);
       child.stderr.on("data", (d) => {
+        v34Err += d.toString();
         const m = /listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(d.toString());
         if (m) { base = "http://127.0.0.1:" + parseInt(m[1], 10); clearTimeout(t); resolve(); }
       });
     });
     try {
       await new Promise((r) => setTimeout(r, 300));
+      // v34a) THE SAFETY GUARANTEE: a config the router judges BROKEN is never
+      // adopted and the previous config keeps running. RE-PINNED by Task 11 from
+      // a legacy `retry: ""` payload (old label: "bad reload keeps the previous
+      // config running", with meta.label as the probe) to a V3-shaped payload
+      // the converter does NOT repair: the load pipeline now converts an
+      // old-shape file first, and conversion repairs `retry: ""` (and deletes
+      // it) before the validator sees it, so that payload is legitimately
+      // ADOPTED - pinned separately below as v34a3. The guarantee itself is
+      // unchanged and must stay proven, so the probe is a v3 payload with an
+      // unknown deployment backend, which no repair touches.
       // meta.label SURVIVES normalizeConfig verbatim (normalize never touches
       // meta), so flipping it proves whether the broken reload was rejected or
-      // loaded: retry:"" would be silently dropped by normalize and is useless
-      // as a probe here.
-      const bad = JSON.parse(JSON.stringify(good));
-      bad.models.v34m.retry = "";
-      bad.models.v34m.meta.label = "broken-write";
-      await writeFile(cfgPath, JSON.stringify(bad, null, 2));
+      // loaded.
+      const badV3 = JSON.parse(JSON.stringify(good));
+      badV3.models.v34m = { deployments: [{ backend: "v34-does-not-exist", upstream: "u" }], meta: { label: "broken-write" } };
+      await writeFile(cfgPath, JSON.stringify(badV3, null, 2));
       await new Promise((r) => setTimeout(r, 900));
       const live = await (await fetch(base + "/api/config")).json();
-      assert(live.models.v34m && live.models.v34m.meta.label === "good", "v34a) bad reload keeps the previous config running (label=" + (live.models.v34m && live.models.v34m.meta.label) + ")");
+      assert(
+        !!live.models.v34m && live.models.v34m.meta && live.models.v34m.meta.label === "good",
+        "v34a) a reload the router judges broken is not adopted and the previous config keeps running (label=" + (live.models.v34m && live.models.v34m.meta && live.models.v34m.meta.label) + ")"
+      );
+      assert(
+        /config reload rejected/.test(v34Err) && /unknown deployment backend/.test(v34Err),
+        "v34a2) the rejection is logged with the validator's own reason (" + JSON.stringify(v34Err.split("\n").filter((l) => /rejected/.test(l)).join(" | ").slice(0, 300)) + ")"
+      );
+
+      // v34a3) THE NEW OBSERVABLE Task 11 introduces, pinned rather than merely
+      // noted: a LEGACY payload whose only defect is a repaired value (`retry:
+      // ""`) now reloads ADOPTED, because the bridge repairs it before the
+      // validator runs. The reload-rejection boundary therefore does NOT move
+      // for this class, and the repair is reported.
+      const legacyReload = JSON.parse(JSON.stringify(good));
+      legacyReload.models.v34m = { providers: [{ backend: "v34", upstream: "u" }], retry: "", meta: { label: "legacy-repaired" } };
+      await writeFile(cfgPath, JSON.stringify(legacyReload, null, 2));
+      await new Promise((r) => setTimeout(r, 900));
+      const live2 = await (await fetch(base + "/api/config")).json();
+      assert(
+        !!live2.models.v34m && live2.models.v34m.meta && live2.models.v34m.meta.label === "legacy-repaired",
+        "v34a3) a legacy reload whose only defect is a repaired value is repaired and ADOPTED (label=" + (live2.models.v34m && live2.models.v34m.meta && live2.models.v34m.meta.label) + ")"
+      );
+      assert(
+        /models\.v34m\.retry was an empty string/.test(v34Err) && /bridge:/.test(v34Err),
+        "v34a4) and the repair is reported by the bridge's own warning (" + JSON.stringify(v34Err.split("\n").filter((l) => /bridge:/.test(l)).join(" | ").slice(0, 300)) + ")"
+      );
     } finally {
       child.kill();
       await rm(dir, { recursive: true, force: true });
@@ -1427,8 +1463,9 @@ async function main() {
     }
   }
 
-  // z10) same-key precedence + reserved model: preset 0.2 > model 0.5, body 0.9
-  //      wins; params-layer `model` keys ignored; forwarded model = upstream.
+  // z10) same-key precedence + reserved model: the MODEL layer applies (0.5),
+  //      body 0.9 wins, params-layer `model` keys ignored, forwarded model =
+  //      upstream. The preset layer is gone: see the re-pin note below.
   {
     const z10 = mockBackend("z10", {});
     const portZ10 = await listen(z10.srv);
@@ -1442,16 +1479,49 @@ async function main() {
       presets: { "p10": { strategy: "affinity", models: ["m10"], params: { temperature: 0.2, model: "evil-preset" } } },
       backoff: BO,
     };
-    const { child: childZ10, base: baseZ10, dir: dirZ10 } = await startRouterCfg(cfgZ10, "KEY_Z10=test-key-z10\n");
+    // Spawned directly rather than through startRouterCfg so the child's stderr
+    // is available: the dropped preset params must be REPORTED, and reading that
+    // warning is half of what this block now pins.
+    const dirZ10 = await mkdtemp(join(tmpdir(), "lmr-z10-"));
+    const cfgZ10Path = join(dirZ10, "config.json");
+    const envZ10Path = join(dirZ10, ".env");
+    await writeFile(cfgZ10Path, JSON.stringify(cfgZ10, null, 2));
+    await writeFile(envZ10Path, "KEY_Z10=test-key-z10\n");
+    const childZ10 = spawn(process.execPath, ["server.mjs"], {
+      cwd: join(import.meta.dirname),
+      env: { ...process.env, ROUTER_CONFIG: cfgZ10Path, ROUTER_ENV: envZ10Path },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const z10Warnings = [];
+    let baseZ10 = null;
+    await new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error("z10 server did not start")), 8000);
+      childZ10.stderr.on("data", (d) => {
+        const s = d.toString();
+        z10Warnings.push(s);
+        const m = /listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(s);
+        if (m) { baseZ10 = "http://127.0.0.1:" + parseInt(m[1], 10); clearTimeout(t); resolve(); }
+      });
+    });
     try {
       await api(baseZ10, "/v1/chat/completions", { body: { model: "p10", messages: [], temperature: 0.9 } });
       const bodyWin = JSON.parse(z10.hits[z10.hits.length - 1].body);
       await api(baseZ10, "/v1/chat/completions", { body: { model: "p10", messages: [] } });
       const presetWin = JSON.parse(z10.hits[z10.hits.length - 1].body);
+      // RE-PINNED by Task 11 (dispatch ruling C): a SURVIVING non-identity preset
+      // carrying `params` has no v3 layer to merge it at, so the load pipeline's
+      // bridge drops it and says so. The old expectation here (preset 0.2 beats
+      // model 0.5) was the pre-bridge behaviour. The model layer still applies,
+      // the reserved `model` key is still ignored, and the loss is reported by
+      // the converter's own warning, which is asserted below rather than noted.
       assert(
         bodyWin.temperature === 0.9 && bodyWin.model === "deepseek-v4-flash" &&
-        presetWin.temperature === 0.2 && presetWin.model === "deepseek-v4-flash",
-        "z10) precedence body>preset>model; params-layer model ignored (" + JSON.stringify({ bodyWin, presetWin }) + ")"
+        presetWin.temperature === 0.5 && presetWin.model === "deepseek-v4-flash",
+        "z10) precedence body>model after the bridge (a preset-level params layer no longer exists in v3); params-layer model ignored (" + JSON.stringify({ bodyWin, presetWin }) + ")"
+      );
+      assert(
+        z10Warnings.some((w) => w.includes("p10") && /params dropped/.test(w)),
+        "z10b) the dropped preset params are REPORTED, naming the preset, not silently lost (" + JSON.stringify(z10Warnings.join("").split("\n").filter((l) => /warning/.test(l))) + ")"
       );
     } finally {
       childZ10.kill();
@@ -4188,6 +4258,279 @@ async function main() {
     }
   }
 
+  // ---- v37) the DUAL-SHAPE load pipeline -----------------------------------
+  // loadConfig must convert an old-shape file in memory BEFORE validating and
+  // normalizing it, so one loader serves both eras. Every assertion below runs
+  // on a config THIS BLOCK builds and hands to a child process or calls
+  // directly; none of them reads config.json, so the working-tree mirror and
+  // the committed mirror cannot change a result.
+  {
+    // v37a)-v37d) the real load path: an old-shape temp config is served as v3
+    // by /api/config, which is what proves `cfg = effective` (the router, not
+    // just the converter, holds the converted form).
+    const dir = await mkdtemp(join(tmpdir(), "lmr-v37-"));
+    const cfgPath = join(dir, "config.json");
+    const envPath = join(dir, ".env");
+    const old = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "v37a", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_V37" },
+        { id: "v37b", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_V37" },
+        { id: "v37c", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_V37" }
+      ],
+      models: {
+        v37m: {
+          providers: [
+            { backend: "v37a", upstream: "u1", params: { temperature: 0.5 }, dropParams: ["logit_bias"], paramMap: { max_tokens: "max_output_tokens" } },
+            { backend: "v37b", upstream: "u2", weight: 3 },
+            { backend: "v37c", upstream: "u3" }
+          ],
+          affinityPool: 2
+        }
+      },
+      presets: { v37p: { strategy: "affinity", models: ["v37m"] } }
+    };
+    await writeFile(cfgPath, JSON.stringify(old, null, 2));
+    await writeFile(envPath, "KEY_V37=k\n");
+    const child = spawn(process.execPath, ["server.mjs"], {
+      cwd: join(import.meta.dirname),
+      env: { ...process.env, ROUTER_CONFIG: cfgPath, ROUTER_ENV: envPath },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let base = null;
+    let childErr = "";
+    await new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error("v37 child did not start (stderr tail: " + JSON.stringify(childErr.slice(-400)) + ")")), 8000);
+      child.stderr.on("data", (d) => {
+        const s = d.toString();
+        childErr += s;
+        const m = /listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(s);
+        if (m) { base = "http://127.0.0.1:" + parseInt(m[1], 10); clearTimeout(t); resolve(); }
+      });
+    });
+    try {
+      const live = await (await fetch(base + "/api/config")).json();
+      const deps = live.models && live.models.v37m ? live.models.v37m.deployments : null;
+      assert(
+        Array.isArray(deps) && deps.length === 3 && deps.map((d) => d.backend).join(",") === "v37a,v37b,v37c" &&
+          deps[0].upstream === "u1" && deps[1].upstream === "u2" && deps[2].upstream === "u3",
+        "v37a) the ROUTER holds the converted v3 form: /api/config serves models.v37m as 3 deployments in declared order (" + JSON.stringify(live.models && live.models.v37m) + ")"
+      );
+      assert(
+        live.models.v37m.providers === undefined && live.models.v37m.affinityPool === undefined,
+        "v37b) the legacy keys are gone from the served model, not merged alongside the deployments"
+      );
+      assert(
+        deps && deps[2].backupOnly === true && deps[0].backupOnly === undefined && deps[1].backupOnly === undefined,
+        "v37c) affinityPool 2 marks only the providers past the pool as backupOnly (" + JSON.stringify(deps && deps.map((d) => d.backupOnly)) + ")"
+      );
+      assert(
+        deps && deps[1].weight === 3 && deps[0].weight === undefined &&
+          JSON.stringify(deps[0].params) === "{\"temperature\":0.5}" &&
+          JSON.stringify(deps[0].dropParams) === "[\"logit_bias\"]" &&
+          JSON.stringify(deps[0].paramMap) === "{\"max_tokens\":\"max_output_tokens\"}",
+        "v37d) per-provider weight/params/dropParams/paramMap carry onto the deployments (" + JSON.stringify(deps && deps[0]) + ")"
+      );
+      assert(
+        live.presets.v37p.strategy === "fallback",
+        "v37e) the served preset strategy is the v3 'fallback' AFTER normalizeConfig, not rewritten to a legacy value (" + JSON.stringify(live.presets.v37p) + ")"
+      );
+      assert(
+        live.presets.v37p.models.length === 1 && live.presets.v37p.models[0].model === "v37m",
+        "v37f) the served preset still resolves to the same model id (" + JSON.stringify(live.presets.v37p.models) + ")"
+      );
+    } finally {
+      child.kill();
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  {
+    // v37g) R8(b): `providers: []` becomes `deployments: []`, which the v3
+    // validator refuses in SAVE mode (the pre-v3 path only WARNED). The bridge
+    // therefore moves this case across the reload-rejection boundary, and the
+    // boot path must stay NON-FATAL for it (path models.<id>.deployments is not
+    // in the loader's fatal set), so the router still starts.
+    const dir = await mkdtemp(join(tmpdir(), "lmr-v37e-"));
+    const cfgPath = join(dir, "config.json");
+    const envPath = join(dir, ".env");
+    const empty = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "v37e", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_V37E" }],
+      models: { v37em: { providers: [] } },
+      presets: { v37ep: { strategy: "failover", models: ["v37em"] } }
+    };
+    await writeFile(cfgPath, JSON.stringify(empty, null, 2));
+    await writeFile(envPath, "KEY_V37E=k\n");
+    const conv = convertLegacyConfig(empty);
+    const saveVerdict = validateConfig(conv.config, conv.config, { mode: "save" });
+    assert(
+      Array.isArray(conv.config.models.v37em.deployments) && conv.config.models.v37em.deployments.length === 0 &&
+        saveVerdict.errors.some((e) => e.path === "models.v37em.deployments"),
+      "v37g) an empty providers array converts to an empty deployments array that SAVE mode refuses (" + JSON.stringify(saveVerdict.errors.map((e) => e.path)) + ")"
+    );
+    const child = spawn(process.execPath, ["server.mjs"], {
+      cwd: join(import.meta.dirname),
+      env: { ...process.env, ROUTER_CONFIG: cfgPath, ROUTER_ENV: envPath },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let base = null;
+    let childErr = "";
+    try {
+      await new Promise((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error("v37g child did not start (stderr tail: " + JSON.stringify(childErr.slice(-400)) + ")")), 8000);
+        child.stderr.on("data", (d) => {
+          const s = d.toString();
+          childErr += s;
+          const m = /listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(s);
+          if (m) { base = "http://127.0.0.1:" + parseInt(m[1], 10); clearTimeout(t); resolve(); }
+        });
+      });
+      assert(
+        /not fatal at boot\): models\.v37em\.deployments: /.test(childErr),
+        "v37g2) BOOT stays non-fatal for the empty-deployments error and names its path (stderr tail: " + JSON.stringify(childErr.slice(-300)) + ")"
+      );
+      const live = await (await fetch(base + "/api/config")).json();
+      assert(!!live.backends.find((b) => b.id === "v37e"), "v37g3) the router really is up and serving the config after that non-fatal error");
+    } finally {
+      child.kill();
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  {
+    // v37h)-v37j) R6: normalizeConfig is DUAL-SHAPE. A v3 model must not be
+    // synthesized into `providers`, must not acquire `affinityPool`, and its
+    // preset must keep the v3 'fallback' strategy; a legacy model in the same
+    // config keeps its exact current treatment.
+    const v3 = {
+      backends: [{ id: "v37n" }],
+      models: {
+        v37nm: { deployments: [{ backend: "v37n", upstream: "u", weight: 2 }], exposed: false },
+        v37lm: { providers: [{ backend: "v37n", upstream: "u" }], affinityPool: 2 }
+      },
+      presets: {
+        v37np: { strategy: "fallback", models: ["v37nm"], exposed: true },
+        v37lp: { strategy: "failover", models: ["v37lm"] }
+      }
+    };
+    normalizeConfig(v3);
+    assert(
+      v3.models.v37nm.deployments.length === 1 && v3.models.v37nm.deployments[0].weight === 2 &&
+        v3.models.v37nm.deployments[0].backend === "v37n" && v3.models.v37nm.exposed === false,
+      "v37h) the v3 model survives normalize byte-for-byte (" + JSON.stringify(v3.models.v37nm) + ")"
+    );
+    assert(
+      v3.models.v37nm.providers === undefined && v3.models.v37nm.affinityPool === undefined,
+      "v37i) normalize writes NO legacy key onto a v3 model (" + JSON.stringify(Object.keys(v3.models.v37nm)) + ")"
+    );
+    assert(
+      v3.presets.v37np.strategy === "fallback" && v3.presets.v37np.models.length === 1 &&
+        v3.presets.v37np.models[0].model === "v37nm" && v3.presets.v37np.models[0].weight === 1 &&
+        v3.presets.v37np.exposed === true,
+      "v37j) the v3 preset keeps 'fallback' and its ref, with the ref normalized to {model, weight} (" + JSON.stringify(v3.presets.v37np) + ")"
+    );
+    assert(
+      Array.isArray(v3.models.v37lm.providers) && v3.models.v37lm.providers.length === 1 && v3.models.v37lm.providers[0].backend === "v37n" &&
+        v3.models.v37lm.affinityPool === 2 && v3.models.v37lm.deployments === undefined &&
+        v3.presets.v37lp.strategy === "failover",
+      "v37j2) the LEGACY entry in the same config keeps its current treatment (dual-shape, not v3-only) (" + JSON.stringify(v3.models.v37lm) + ")"
+    );
+  }
+
+  {
+    // v37k)-v37m) R5, the M-4 obligation: three structurally malformed entries
+    // used to raise a RAW TypeError out of the converter, which the new load
+    // path would turn into a router crash instead of a refusal. Each must PASS
+    // THROUGH UNTOUCHED so the VALIDATOR names it, and the load verdict (which
+    // is what loadConfig logs and what decides boot-vs-reject) must carry that
+    // path.
+    const malformed = (models, presets) => ({
+      backends: [{ id: "v37k", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_V37K" }],
+      models,
+      presets
+    });
+    const cases = [
+      ["presets: {x: null}", malformed({ v37km: { providers: [{ backend: "v37k", upstream: "u" }] } }, { x: null }), "presets.x"],
+      ["presets: {x: 5}", malformed({ v37km: { providers: [{ backend: "v37k", upstream: "u" }] } }, { x: 5 }), "presets.x"],
+      ["providers: [null]", malformed({ v37km: { providers: [null] } }, { v37kp: { strategy: "affinity", models: ["v37km"] } }), "models.v37km.deployments[0]"]
+    ];
+    for (const [label, raw, path] of cases) {
+      let conv = null;
+      let threw = null;
+      try {
+        conv = convertLegacyConfig(raw);
+      } catch (e) {
+        threw = e;
+      }
+      const verdict = conv ? validateConfig(conv.config, conv.config, { mode: "load" }) : { errors: [] };
+      assert(
+        threw === null && verdict.errors.some((e) => e.path === path),
+        "v37k) " + label + " converts without throwing and the LOAD verdict names " + path +
+          " (threw " + (threw ? threw.constructor.name + ": " + threw.message : "no") + "; errors " + JSON.stringify(verdict.errors.map((e) => e.path)) + ")"
+      );
+    }
+    // The malformed entry is not DROPPED either: the operator's bytes survive
+    // into the payload the validator judges, and the boot abort set (a non-object
+    // root, or a missing/non-array backends) does not include any of these paths.
+    const kept = convertLegacyConfig(malformed({ v37km: { providers: [{ backend: "v37k", upstream: "u" }] } }, { x: null }));
+    const nonFatal = validateConfig(kept.config, kept.config, { mode: "load" }).errors.every((e) => e.path !== "" && e.path !== "backends");
+    assert(
+      kept.config.presets.x === null && nonFatal,
+      "v37l) the malformed preset survives the converter untouched and its error is outside the boot-abort set (" + JSON.stringify(kept.config.presets.x) + ")"
+    );
+    const keptProviders = convertLegacyConfig(malformed({ v37km: { providers: [null] } }, {}));
+    const nonFatal2 = validateConfig(keptProviders.config, keptProviders.config, { mode: "load" }).errors.every((e) => e.path !== "" && e.path !== "backends");
+    assert(
+      keptProviders.config.models.v37km.deployments.length === 1 && keptProviders.config.models.v37km.deployments[0] === null && nonFatal2,
+      "v37m) the null provider survives as a null deployment (not dropped, not thrown on) and its error is outside the boot-abort set (" + JSON.stringify(keptProviders.config.models.v37km.deployments) + ")"
+    );
+  }
+
+  {
+    // v37n)-v37o) R8(a): a model carrying BOTH providers and deployments loses
+    // the hand-written v3 deployments to converter step 4. The behaviour is kept
+    // (it cannot arise from production, where the file is old-shape throughout);
+    // the goal here is that the loss is VISIBLE, naming the model.
+    const both = convertLegacyConfig({
+      backends: [{ id: "v37n", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_V37N" }],
+      models: {
+        v37bm: {
+          providers: [{ backend: "v37n", upstream: "from-providers" }],
+          deployments: [{ backend: "v37n", upstream: "from-deployments", backupOnly: true }]
+        }
+      },
+      presets: { v37bp: { strategy: "fallback", models: ["v37bm"], exposed: true } }
+    });
+    assert(
+      both.config.models.v37bm.deployments.length === 1 &&
+        both.config.models.v37bm.deployments[0].upstream === "from-providers" &&
+        both.config.models.v37bm.deployments[0].backupOnly === undefined,
+      "v37n) providers still win and the hand-written deployments are discarded (" + JSON.stringify(both.config.models.v37bm.deployments) + ")"
+    );
+    assert(
+      both.warnings.some((w) => w.includes("v37bm") && /deployments/.test(w) && /dropped|discard/i.test(w)),
+      "v37o) the discard is VISIBLE: a warning names the model and says the deployments were dropped (" + JSON.stringify(both.warnings) + ")"
+    );
+    // R7: a MIXTURE converts model by model - the already-v3 entry keeps its own
+    // deployments while the old-shape entry is converted, so one config-wide
+    // predicate in the pipeline is enough and no per-model predicate is needed.
+    const mixed = convertLegacyConfig({
+      backends: [{ id: "v37n", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_V37N" }],
+      models: {
+        v37mm: { deployments: [{ backend: "v37n", upstream: "already-v3" }], exposed: true },
+        v37om: { providers: [{ backend: "v37n", upstream: "was-old-shape" }] }
+      },
+      presets: { v37mp: { strategy: "fallback", models: ["v37mm", "v37om"], exposed: true } }
+    });
+    assert(
+      mixed.config.models.v37mm.deployments[0].upstream === "already-v3" &&
+        mixed.config.models.v37om.deployments[0].upstream === "was-old-shape" &&
+        mixed.config.models.v37om.providers === undefined,
+      "v37p) a MIXED config converts the old-shape entry and leaves the v3 entry's deployments alone (" + JSON.stringify(mixed.config.models) + ")"
+    );
+  }
+
   // ---- config write path: single-file bind mount ----------------------------
   // The live homelab config is a single-file bind mount. Linux refuses to
   // rename() onto a mount point (EBUSY), and even a swap that succeeded would
@@ -5215,6 +5558,12 @@ async function main() {
           (u9Broken.length ? " [NOT FOUND OR UNPARSEABLE: " + u9Broken.join(", ") + "]" : "") +
           (u9EvalError ? " [evaluation failed: " + u9EvalError + "]" : "")
       );
+      // Served-surface comparisons must use the shape the router actually runs:
+      // the load pipeline converts an old-shape file in memory, so the mirror as
+      // written and the mirror as served are two different objects. This is the
+      // project's own converter, so the compared form is the effective config,
+      // not a hand-written approximation of it.
+      const u9MirrorServed = convertLegacyConfig(mirror).config;
       const u9Entry = mirror && mirror.models ? mirror.models[u9Subject] : null;
       assert(
         !!u9Entry,
@@ -5316,7 +5665,7 @@ async function main() {
         // is exercised on data whose shape is known rather than hoped for.
         // The before/after surface lists are taken from the LIVE mirror here,
         // ahead of the fixture rebuilding a draft of its own.
-        const u9BeforeList = u9Api.servedIds(mirror);
+        const u9BeforeList = u9Api.servedIds(u9MirrorServed);
         const u9FxModel = "u9-fx-dialect-model";
         const u9FxBackend = "u9-fx-backend";
         const u9FxKeyEnv = "U9_FX_KEY";
@@ -5420,7 +5769,9 @@ async function main() {
         rCfg.draft = JSON.parse(JSON.stringify(mirror));
         rCfg.draft.models[u9Subject].meta = Object.assign({}, rCfg.draft.models[u9Subject].meta, { label: u9Label });
 
-        const u9AfterList = u9Api.servedIds(rCfg.draft);
+        const u9AfterDraft = JSON.parse(JSON.stringify(rCfg.draft));
+        u9AfterDraft.models[u9Subject].meta = Object.assign({}, u9AfterDraft.models[u9Subject].meta, { label: u9Label });
+        const u9AfterList = u9Api.servedIds(convertLegacyConfig(u9AfterDraft).config);
         let u9FirstMove = -1;
         for (let i = 0; i < Math.max(u9BeforeList.length, u9AfterList.length) && u9FirstMove < 0; i++) if (u9BeforeList[i] !== u9AfterList[i]) u9FirstMove = i;
         assert(
@@ -5437,7 +5788,7 @@ async function main() {
         let u9ServedAfter = null;
         let u9ServeError = null;
         try {
-          const u9BeforeChild = await startRouterCfg(Object.assign({}, mirror, { port: 0 }), "");
+          const u9BeforeChild = await startRouterCfg(Object.assign({}, u9MirrorServed, { port: 0 }), "");
           try { u9ServedBefore = (await (await fetch(u9BeforeChild.base + "/v1/models")).json()).data.map((x) => x.id); } finally { u9BeforeChild.child.kill(); await rm(u9BeforeChild.dir, { recursive: true, force: true }); }
           const u9AfterChild = await startRouterCfg(Object.assign({}, rCfg.draft, { port: 0 }), "");
           try { u9ServedAfter = (await (await fetch(u9AfterChild.base + "/v1/models")).json()).data.map((x) => x.id); } finally { u9AfterChild.child.kill(); await rm(u9AfterChild.dir, { recursive: true, force: true }); }
@@ -5658,7 +6009,12 @@ async function main() {
           },
           presets: { p1: { strategy: "failover", models: ["p1"] }, p2: { strategy: "failover", models: ["m2"] } },
         };
-        const X = await mkPicker(xCfg, { model: "p1", msgs: [] });
+        // The router serves the EFFECTIVE config, and `mkPicker` injects exactly
+        // what /api/config returns. Feeding the UI harness the raw old-shape file
+        // would compare the UI's rule for a config the router no longer runs, so
+        // the injected body is the project's own converted form.
+        const xServed = convertLegacyConfig(xCfg).config;
+        const X = await mkPicker(xServed, { model: "p1", msgs: [] });
         let servedByServer = null;
         let servedError = null;
         try {
@@ -5676,7 +6032,7 @@ async function main() {
           !!servedByServer && servedByServer.length > 0,
           "u7g) a real router's /v1/models list was read for the served-id cross-check" + (servedError ? " [child failed: " + servedError + "]" : "")
         );
-        const xList = servedOk && typeof X.api.servedIds === "function" ? X.api.servedIds(xCfg) : null;
+        const xList = servedOk && typeof X.api.servedIds === "function" ? X.api.servedIds(xServed) : null;
         assert(
           xList !== null && jw(xList) === jw(servedByServer),
           "u7h) servedIds(cfg) yields the same ids in the same order as a real router's /v1/models (got " +
