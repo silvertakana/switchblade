@@ -19,7 +19,7 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 // and then it is lowered in that SAME commit so the coverage reduction is
 // visible in review. Never lower it to turn a red run green — fix the code
 // or the test instead.
-const SUITE_FLOOR = 395;
+const SUITE_FLOOR = 594;
 
 // Sanity floor for the S5 id scan: the suite carries far more ids than this,
 // so a count below the floor means the extractor broke, not that the ids went
