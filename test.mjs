@@ -3966,6 +3966,110 @@ async function main() {
       ].join("\n");
       assert(!bodies.includes("secret-value-a") && !bodies.includes("secret-value-b"), "zCE11a) no apiKeyEnv value leaks into any config response");
       assert(bodies.includes("KEY_CE_A"), "zCE11b) the env var NAME is still served (the UI needs it)");
+
+      // v39a)-v39f) bridge the WRITE half: saving and restoring go through the
+      // same conversion the loader already runs, so an old-shape payload can
+      // never land on disk as `providers` again. The two ways an old-shape
+      // write arrives are covered separately - a browser save (v39a/v39b) and a
+      // snapshot restore (v39e/v39f) - because they are independent entry
+      // points onto the same helper.
+      const draft39 = JSON.parse(await rawOnDisk());
+      draft39.models["bridge-probe"] = { providers: [{ backend: "ce-a", upstream: "u-probe" }] };
+      const r39 = await post("/api/config", { config: draft39, force: true });
+      const b39 = await r39.json();
+      assert(r39.status === 200, "v39a) old-shape save is accepted through the bridge (got " + r39.status + ", " + JSON.stringify(b39.errors || b39.error) + ")");
+      const disk39 = JSON.parse(await rawOnDisk());
+      assert(
+        !!disk39.models["bridge-probe"].deployments &&
+          disk39.models["bridge-probe"].providers === undefined &&
+          Object.values(disk39.models).every((m) => m.providers === undefined),
+        "v39b) a save writes v3, never a persisted `providers` block (" + JSON.stringify(disk39.models["bridge-probe"]) + ")"
+      );
+
+      // The bridge's own warnings reach the CALLER, not just the console: the
+      // Config tab can only tell the operator what it rewrote if the save
+      // response carries it. A repair nobody is told about is a silent edit of
+      // the operator's file. The payload is the block's ORIGINAL old-shape
+      // config - a clone of disk is already v3, so the bridge would not run and
+      // this would prove nothing - carrying a real error-class empty string in
+      // an object-typed position (`models[*].retry`), the exact editor artifact
+      // the production config shipped with: left alone it would 400 the save,
+      // and repaired silently it would rewrite the operator's file.
+      const draft39c = JSON.parse(JSON.stringify(cfgCE));
+      draft39c.models["bridge-probe"] = { providers: [{ backend: "ce-a", upstream: "u-probe" }], retry: "" };
+      const expectBridge39c = convertLegacyConfig(draft39c).warnings;
+      assert(expectBridge39c.length > 0, "v39c0) the repair fixture really makes the converter warn (" + JSON.stringify(expectBridge39c) + ")");
+      const r39c = await post("/api/config", { config: draft39c, force: true });
+      const b39c = await r39c.json();
+      assert(r39c.status === 200, "v39c1) the repaired save itself succeeds (got " + r39c.status + ", " + JSON.stringify(b39c.errors || b39c.error) + ")");
+      const gotBridge39c = (b39c.warnings || []).filter((w) => w.path === "(bridge)");
+      assert(
+        gotBridge39c.length === expectBridge39c.length && gotBridge39c.some((w) => String(w.message).includes("was an empty string")),
+        "v39c2) the save response reports EVERY bridge warning, the repair included (got " + JSON.stringify(gotBridge39c.map((w) => w.message)) + ", expected " + expectBridge39c.length + ")"
+      );
+      const disk39c = JSON.parse(await rawOnDisk());
+      assert(disk39c.models["bridge-probe"].retry === undefined, "v39c3) the repaired value is not on disk (" + JSON.stringify(disk39c.models["bridge-probe"]) + ")");
+      assert(disk39c.models["bridge-probe"].deployments !== undefined, "v39c4) the repair and the conversion land together, not one without the other");
+
+      // The one refusal the converter STILL has: a converted config whose id is
+      // both a model and a preset cannot be resolved by rule. The fixture is
+      // built from the block's ORIGINAL old-shape config - not from disk, which
+      // is v3 by now - and is deliberately free of every OTHER validator error,
+      // so the 400 below can only come from the bridge: at base an old-shape
+      // preset/model id collision passes as a warning and the snapshot is
+      // written straight through, which is the silent bypass this pair exists
+      // to catch.
+      const before39 = await rawOnDisk();
+      const collisionSnap = JSON.parse(JSON.stringify(cfgCE));
+      collisionSnap.presets["ce-model"] = { strategy: "failover", models: ["ce-model", "ce-preset"] };
+      collisionSnap.x13Marker = "refused-snapshot-marker";
+      await writeFile(join(dirCE, "config.history", "t13-collision.json"), JSON.stringify(collisionSnap, null, 2) + "\n");
+      // Anti-vacuity: if the fixture is not old-shape (a clone of disk would
+      // not be) the bridge never runs and the 400 below would prove nothing.
+      assert(
+        Object.values(collisionSnap.models).some((m) => Array.isArray(m.providers)),
+        "v39d0) the refusal fixture really is an old-shape document, so the bridge is what judges it"
+      );
+      const r39d = await post("/api/config/reset", { snapshot: "t13-collision.json", force: true });
+      const b39d = await r39d.json();
+      assert(
+        r39d.status === 400 && (b39d.errors || []).some((e) => String(e.message).includes("both a model and a preset")),
+        "v39d) a snapshot the conversion refuses is refused (400, got " + r39d.status + ", " + JSON.stringify(b39d.errors || b39d.error) + ")"
+      );
+      const after39 = await rawOnDisk();
+      assert(after39 === before39, "v39e) the refused restore left the live file byte-identical");
+      assert(after39.indexOf("refused-snapshot-marker") === -1, "v39f) no part of the refused snapshot reached the file");
+
+      // ...and the POSITIVE half, which is the actual gap: at base the restore
+      // wrote the snapshot's `providers` verbatim and the preset kept the
+      // v2-era `affinity` name, so a restored config was silently a shape the
+      // v3 branch would then reject. Cloned from the block's ORIGINAL old-shape
+      // fixture rather than from disk, because by now disk is already v3 and a
+      // clone of it could not fail these assertions.
+      const plainOld = JSON.parse(JSON.stringify(cfgCE));
+      plainOld.models["ce-extra"] = { providers: [{ backend: "ce-b", upstream: "u-extra" }] };
+      // `ce-preset` is an identity preset named exactly like a model, so the
+      // conversion drops it. That makes the warning count a property of the
+      // FIXTURE rather than of whatever the converter happens to say today,
+      // while the assertion still counts against an INDEPENDENT conversion
+      // instead of a hardcoded number that would drift.
+      plainOld.presets["ce-model"] = { strategy: "failover", models: ["ce-model"] };
+      await writeFile(join(dirCE, "config.history", "t13-plain-old.json"), JSON.stringify(plainOld, null, 2) + "\n");
+      const expectBridge39g = convertLegacyConfig(plainOld).warnings;
+      assert(expectBridge39g.length > 0, "v39j0) the restore fixture really makes the bridge warn (" + JSON.stringify(expectBridge39g) + ")");
+      const r39g = await post("/api/config/reset", { snapshot: "t13-plain-old.json", force: true });
+      const b39g = await r39g.json();
+      assert(r39g.status === 200, "v39g) a valid old-shape snapshot is restored through the bridge (got " + r39g.status + ", " + JSON.stringify(b39g.errors || b39g.error) + ")");
+      const restored39 = await readCfg();
+      assert(
+        !!restored39.models["ce-extra"].deployments && restored39.models["ce-extra"].providers === undefined,
+        "v39h) the restored file is v3, not the snapshot's own shape (" + JSON.stringify(restored39.models["ce-extra"]) + ")"
+      );
+      assert(restored39.presets["ce-preset"].strategy === "fallback", "v39i) the restored preset carries the v3 strategy name (" + JSON.stringify(restored39.presets["ce-preset"]) + ")");
+      assert(
+        (b39g.warnings || []).filter((w) => w.path === "(bridge)").length === expectBridge39g.length,
+        "v39j) every bridge warning the restore's conversion emits is reported to the caller (got " + JSON.stringify((b39g.warnings || []).map((w) => w.path + ":" + w.message)) + ", expected " + expectBridge39g.length + ")"
+      );
     } finally {
       childCE.kill();
       await rm(dirCE, { recursive: true, force: true });
@@ -4558,10 +4662,14 @@ async function main() {
     };
     normalizeConfig(cfg);
     const c = candidates(cfg, "m1", "sess-a");
-    // `sess-1` is the key that FINDS the base bug: its hash is 2 mod 3, and the
-    // bridge-era shim pooled all three deployments together, so it picked the
-    // `backupOnly` entry as the session's primary. A key the shim happens to
-    // order favourably (`sess-a`, 1 mod 3) cannot prove anything.
+    // This block does NOT pin "the base got backupOnly wrong". Measured against
+    // 5ec0549: the base shim's `modelPool` already EXCLUDED `backupOnly` (pool =
+    // 2 over {b1, b2}), `sess-1`'s base primary is `b2`, and `b3` is primary for
+    // 0 of 5000 base keys. What these four pin is the CONVERTED-config path
+    // holding the same exclusion - the head routes by `deployments` rather than
+    // `providers`/`affinityPool`, and they fail if that read loses the
+    // `backupOnly` tail. The ordering rule itself is carried by `z8`, `v38d`
+    // and `v38d3`, which an ordering-bypass mutation DOES flip.
     assert(
       c.ordered[0].backend !== "b3",
       "v38a) backupOnly never primary (" + JSON.stringify(c.ordered) + ")"

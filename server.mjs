@@ -3318,6 +3318,44 @@ function isOldShape(raw) {
   return Object.values(models).some((m) => m && typeof m === "object" && Array.isArray(m.providers));
 }
 
+const BRIDGE_WARNING_PREFIX = "bridge: ";
+
+// The ONE bridge from a pre-v3 document to the config the router runs, shared by
+// every entry point that can be handed an old-shape document: boot, hot-reload,
+// a save from the Config tab, and a snapshot restore. Three inline copies of
+// this policy is the failure mode it exists to prevent - a save that converts
+// differently from a load is a config whose on-disk meaning depends on how it
+// arrived.
+//
+// The container restore is part of the policy, not an option: the converter
+// SYNTHESIZES `models`/`presets` to work on them, so a truncated file would come
+// back looking complete and the validator's "'presets' is required at the top
+// level" would be repaired away instead of reported. A key the input LACKED is
+// therefore removed again after conversion, so the validator judges what the
+// operator actually wrote.
+//
+// Conversion failure is RETURNED rather than thrown: the converter refuses only
+// on a residual id that is both a model and a preset, which no rule can resolve,
+// and the three callers answer it differently by design - boot aborts on the
+// small set it cannot interpret, a reload keeps the config already running, and
+// save/restore refuse with 400 - so the shared half must not pick one for them.
+const MISSING_TOP_CONTAINERS = ["models", "presets"];
+
+function bridgeToEffectiveConfig(rawInput) {
+  const missingContainers = MISSING_TOP_CONTAINERS.filter((k) => !(rawInput && typeof rawInput === "object" && k in rawInput));
+  if (!isOldShape(rawInput)) {
+    return { effective: rawInput, warnings: [], missingContainers, conversionError: null };
+  }
+  let converted;
+  try {
+    converted = convertLegacyConfig(rawInput);
+  } catch (e) {
+    return { effective: rawInput, warnings: [], missingContainers, conversionError: e };
+  }
+  for (const k of missingContainers) delete converted.config[k];
+  return { effective: converted.config, warnings: converted.warnings, missingContainers, conversionError: null };
+}
+
 async function loadConfig() {
   const raw = await readFileP(CONFIG_PATH, "utf8");
   const parsed = JSON.parse(raw);
@@ -3331,31 +3369,17 @@ async function loadConfig() {
   // memory first, so the validator judges the shape the router will actually
   // run. Validating the raw input instead would report one shape error per
   // model for a file that converts cleanly.
-  //
-  // A top-level container the input LACKS is recorded here and removed again
-  // after conversion, because the converter synthesizes `models`/`presets` to
-  // work on them: left in place, that synthesis would repair a half-written
-  // config file into something the validator calls complete, and the boot
-  // warning that tells the operator a key is missing would disappear.
-  const missingContainers = ["models", "presets"].filter((k) => !(parsed && typeof parsed === "object" && k in parsed));
-  let effective = parsed;
-  if (isOldShape(parsed)) {
-    let converted;
-    try {
-      converted = convertLegacyConfig(parsed);
-    } catch (e) {
-      // The loader cannot interpret this file (the converter refuses on a
-      // residual model/preset collision). At reload the previous config stays
-      // running; at boot there is nothing to fall back to, and continuing
-      // would run the router with no config at all.
-      if (!cfg) throw new Error("config conversion failed: " + e.message);
-      console.error(`[${new Date().toISOString()}] config reload rejected: conversion failed: ${e.message}`);
-      return cfg;
-    }
-    for (const w of converted.warnings) console.warn(`[${new Date().toISOString()}] config warning: bridge: ${w}`);
-    effective = converted.config;
-    for (const k of missingContainers) delete effective[k];
+  const bridge = bridgeToEffectiveConfig(parsed);
+  if (bridge.conversionError) {
+    // The loader cannot interpret this file. At reload the previous config
+    // stays running; at boot there is nothing to fall back to, and continuing
+    // would run the router with no config at all.
+    if (!cfg) throw new Error("config conversion failed: " + bridge.conversionError.message);
+    console.error(`[${new Date().toISOString()}] config reload rejected: conversion failed: ${bridge.conversionError.message}`);
+    return cfg;
   }
+  for (const w of bridge.warnings) console.warn(`[${new Date().toISOString()}] config warning: ${BRIDGE_WARNING_PREFIX}${w}`);
+  const effective = bridge.effective;
   // The abort is deliberately narrow, because the validator's error set is the
   // SAVE-side contract and is stricter than what this loader tolerates: it
   // repairs a non-object `retry` (the live production config carries
@@ -3558,10 +3582,27 @@ function server() {
         return writeError(res, newError(500, JSON.stringify({ error: { message: `cannot read the current config: ${e.message}`, type: "router_error" } })));
       }
 
-      const verdict = validateConfig(candidate, current);
+      // Convert to the form that will be WRITTEN before anything judges it, so
+      // every check below and the write itself read the same object. Validating
+      // or writing the pre-conversion candidate while the converted object went
+      // to disk would be a bypass: a `providers` payload the v3 branch rejects
+      // would pass the check that ran on the legacy shape and still land on disk.
+      const bridge = bridgeToEffectiveConfig(candidate);
+      if (bridge.conversionError) {
+        res.writeHead(400, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ ok: false, errors: [{ path: "", message: bridge.conversionError.message }], warnings: [] }));
+      }
+      const toSave = bridge.effective;
+      // The bridge's own warnings ride the same channel as the validator's
+      // (R6): a save that repairs the payload is a change the operator did not
+      // ask for and cannot see otherwise.
+      const bridgeWarnings = bridge.warnings.map((message) => ({ path: "(bridge)", message }));
+
+      const verdict = validateConfig(toSave, current);
+      const warnings = bridgeWarnings.concat(verdict.warnings);
       if (verdict.errors.length) {
         res.writeHead(400, { "content-type": "application/json" });
-        return res.end(JSON.stringify({ ok: false, errors: verdict.errors, warnings: verdict.warnings }));
+        return res.end(JSON.stringify({ ok: false, errors: verdict.errors, warnings }));
       }
 
       // Lost-update guard: the browser tells us which revision it edited. If
@@ -3578,7 +3619,7 @@ function server() {
               message: "the config file changed on disk since this page loaded it",
               type: "conflict",
             },
-            warnings: verdict.warnings,
+            warnings,
             current,
             revision: currentRevision,
           })
@@ -3587,21 +3628,24 @@ function server() {
 
       if (dryRun) {
         res.writeHead(200, { "content-type": "application/json" });
-        return res.end(JSON.stringify({ ok: true, dryRun: true, warnings: verdict.warnings, revision: currentRevision }));
+        return res.end(JSON.stringify({ ok: true, dryRun: true, warnings, revision: currentRevision }));
       }
 
       const snapshot = snapshotConfig();
       try {
-        writeConfigAtomic(candidate);
+        writeConfigAtomic(toSave);
       } catch (e) {
         return writeError(res, newError(500, JSON.stringify({ error: { message: `failed to write config: ${e.message}`, type: "router_error" } })));
+      }
+      for (const w of bridgeWarnings) {
+        console.warn(`[${new Date().toISOString()}] config save warning: ${BRIDGE_WARNING_PREFIX}${w.message}`);
       }
       for (const w of verdict.warnings) {
         console.warn(`[${new Date().toISOString()}] config save warning: ${w.path}: ${w.message}`);
       }
       console.error(`[${new Date().toISOString()}] config saved via web UI (snapshot ${snapshot || "unavailable"})`);
       res.writeHead(200, { "content-type": "application/json" });
-      return res.end(JSON.stringify({ ok: true, warnings: verdict.warnings, snapshot, revision: configRevision() }));
+      return res.end(JSON.stringify({ ok: true, warnings, snapshot, revision: configRevision() }));
     }
 
     if (req.method === "POST" && url === "/api/config/reset") {
@@ -3627,16 +3671,31 @@ function server() {
       // become rather than against itself. A restore is a deliberate user
       // action, so a bad snapshot is refused with its field paths instead of
       // being silently loaded.
+      //
+      // The snapshot is converted BEFORE it is judged, exactly as a save is: a
+      // snapshot taken before the bridge is an old-shape document, and writing
+      // it back verbatim would put `providers` on the live file again and let
+      // the v3 branch reject the router's own config on the next reload.
+      const bridge = bridgeToEffectiveConfig(restored);
+      if (bridge.conversionError) {
+        res.writeHead(400, { "content-type": "application/json" });
+        return res.end(
+          JSON.stringify({ ok: false, errors: [{ path: "", message: bridge.conversionError.message }], warnings: [], restored: name })
+        );
+      }
+      const toRestore = bridge.effective;
+      const bridgeWarnings = bridge.warnings.map((message) => ({ path: "(bridge)", message }));
       let currentRaw;
       try {
         currentRaw = readRawConfig();
       } catch (e) {
         return writeError(res, newError(500, JSON.stringify({ error: { message: `cannot read the current config: ${e.message}`, type: "router_error" } })));
       }
-      const verdict = validateConfig(restored, currentRaw);
+      const verdict = validateConfig(toRestore, currentRaw);
+      const warnings = bridgeWarnings.concat(verdict.warnings);
       if (verdict.errors.length) {
         res.writeHead(400, { "content-type": "application/json" });
-        return res.end(JSON.stringify({ ok: false, errors: verdict.errors, warnings: verdict.warnings }));
+        return res.end(JSON.stringify({ ok: false, errors: verdict.errors, warnings }));
       }
       // Same lost-update guard as POST /api/config. Conditional on the caller
       // having sent a revision: a reset that omits baseRevision is a deliberate
@@ -3647,7 +3706,7 @@ function server() {
           JSON.stringify({
             ok: false,
             error: { message: "the config file changed on disk since this page loaded it", type: "conflict" },
-            warnings: verdict.warnings,
+            warnings,
             revision: configRevision(),
           })
         );
@@ -3655,13 +3714,13 @@ function server() {
       // Snapshot the state being replaced so a restore is itself undoable.
       const safety = snapshotConfig();
       try {
-        writeConfigAtomic(restored);
+        writeConfigAtomic(toRestore);
       } catch (e) {
         return writeError(res, newError(500, JSON.stringify({ error: { message: `failed to restore: ${e.message}`, type: "router_error" } })));
       }
       console.error(`[${new Date().toISOString()}] config restored from snapshot ${name} (previous state saved as ${safety || "unavailable"})`);
       res.writeHead(200, { "content-type": "application/json" });
-      return res.end(JSON.stringify({ ok: true, restored: name, warnings: verdict.warnings, revision: configRevision() }));
+      return res.end(JSON.stringify({ ok: true, restored: name, warnings, revision: configRevision() }));
     }
 
     // ---- env editor (managed secrets store) -----------------------------------
