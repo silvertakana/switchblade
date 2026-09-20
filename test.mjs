@@ -5472,7 +5472,7 @@ async function main() {
       return null;
     }
 
-    const needed = ["cfgDeepCopy", "cfgParseMaybeJson", "cfgMutate", "cfgCloseModal", "renderCfgModal", "cfgModalCollect", "cfgApplyModal", "countRefsTo"];
+    const needed = ["cfgDeepCopy", "cfgParseMaybeJson", "cfgJsonText", "cfgMutate", "cfgCloseModal", "deploymentListOf", "renderCfgModal", "renderDeployList", "cfgModalCollect", "cfgApplyModal", "countRefsTo"];
     const bodies = [];
     const broken = [];
     for (const name of needed) {
@@ -5509,14 +5509,14 @@ async function main() {
       cfgField: () => "",
       cfgJsonText: () => "",
       cfgEnvNames: () => [],
-      renderProvList: () => {},
+      renderDeployList: () => {},
       renderPresetModelList: () => {},
     };
     let api = null;
     let evalError = null;
     if (broken.length === 0) {
       const program = [dollarDecl]
-        .concat(bodies, ["({ $, cfgDeepCopy, cfgParseMaybeJson, cfgMutate, cfgCloseModal, renderCfgModal, cfgModalCollect, cfgApplyModal, countRefsTo })"])
+        .concat(bodies, ["({ $, cfgDeepCopy, cfgParseMaybeJson, cfgJsonText, cfgMutate, cfgCloseModal, deploymentListOf, renderCfgModal, renderDeployList, cfgModalCollect, cfgApplyModal, countRefsTo })"])
         .join("\n");
       try {
         api = vm.runInContext(program, vm.createContext(sandbox));
@@ -5539,9 +5539,13 @@ async function main() {
       const norm = (v) => JSON.stringify(v, (k, x) => (x && typeof x === "object" && !Array.isArray(x) ? Object.keys(x).sort().reduce((o, kk) => ((o[kk] = x[kk]), o), {}) : x));
       const same = (a, b) => norm(a) === norm(b);
       const open = (kind, key, data, index) => {
-        cfg.modal = { kind, key, data: api.cfgDeepCopy(data || {}), index: index == null ? null : index, provs: [], models: [] };
+        cfg.modal = { kind, key, data: api.cfgDeepCopy(data || {}), index: index == null ? null : index, deploys: [], models: [], exposedOn: !(data && data.exposed === false) };
       };
 
+      // The trickiest input this editor can be handed: BOTH arrays. The rows come
+      // from `providers` because that is what the server's own converter reads
+      // (v37n), so a form that took the hand-written `deployments` would show a
+      // list the router is not honouring.
       const modelEntry = {
         providers: [
           { backend: "go", upstream: "glm-5.3", dropParams: ["temperature"], params: { top_p: 1 }, paramMap: { max_tokens: "max_output_tokens" }, unownedRowKey: 7 },
@@ -5553,6 +5557,22 @@ async function main() {
         meta: { label: "GLM 5.3", contextWindow: 200000, unownedMeta: "keep", pricing: { inputPerM: 0.1, outputPerM: 0.4, cacheHitInputPerM: 0.01, unownedPricing: "keep" } },
         exposed: false,
         deployments: [{ backend: "go", upstream: "glm-5.3", backupOnly: true }],
+      };
+      // What the two provider rows become: same order, same dialect keys, and no
+      // `affinityPool` (v3 removed the concept, so nothing reads it back).
+      const modelDeploys = [
+        { backend: "go", upstream: "glm-5.3", dropParams: ["temperature"], params: { top_p: 1 }, paramMap: { max_tokens: "max_output_tokens" }, unownedRowKey: 7 },
+        { backend: "cc", upstream: "glm-5.3-cc", dropParams: ["top_p"] },
+      ];
+      // An entry already in v3, with every default the form must NOT write back.
+      const v3Entry = {
+        deployments: [
+          { backend: "go", upstream: "v3-one" },
+          { backend: "cc", upstream: "v3-two", weight: 3, backupOnly: true, params: { top_p: 1 }, dropParams: ["temperature"], paramMap: { max_tokens: "max_output_tokens" } },
+        ],
+        retry: { maxRetries: 1 },
+        params: { temperature: 0.7 },
+        meta: { label: "v3", contextWindow: 200000, pricing: { inputPerM: 0.1, outputPerM: 0.4, cacheHitInputPerM: 0.01 } },
       };
       const presetEntry = {
         strategy: "failover",
@@ -5577,11 +5597,26 @@ async function main() {
           "p-two": { strategy: "failover", models: ["glm-5.3-flash"] },
         },
       });
+      // The deployment-row boxes the real render emits for entry `entry`.
+      const jsonText = (v) => (v === undefined ? "" : JSON.stringify(v, null, 2));
+      const deployFields = (entry, over) => {
+        const list = Array.isArray(entry.providers) ? entry.providers : Array.isArray(entry.deployments) ? entry.deployments : [];
+        const spec = {};
+        list.forEach((d, i) => {
+          spec["f_d" + i + "_backend"] = d.backend || "";
+          spec["f_d" + i + "_upstream"] = d.upstream || "";
+          spec["f_d" + i + "_weight"] = d.weight == null ? "" : String(d.weight);
+          spec["f_d" + i + "_backupOnly"] = !!d.backupOnly;
+          spec["f_d" + i + "_params"] = jsonText(d.params);
+          spec["f_d" + i + "_dropParams"] = jsonText(d.dropParams);
+          spec["f_d" + i + "_paramMap"] = jsonText(d.paramMap);
+        });
+        return Object.assign(spec, over || {});
+      };
       const modelFields = (over) =>
         Object.assign(
           {
             f_id: "glm-5.3-flash",
-            f_affinityPool: "2",
             f_metaLabel: "GLM 5.3",
             f_metaCtx: "200000",
             f_priceIn: "0.1",
@@ -5599,15 +5634,16 @@ async function main() {
       // that stops carrying its previous provider fails here.
       cfg.draft = freshDraft();
       open("models", "glm-5.3-flash", Object.assign({ id: "glm-5.3-flash" }, api.cfgDeepCopy(modelEntry)));
-      mountFields(modelFields());
+      mountFields(deployFields(modelEntry, modelFields()));
       api.renderCfgModal();
       assert(
-        cfg.modal.provs.length === 2 && !!cfg.modal.provs[0].prev && same(cfg.modal.provs[0].prev.dropParams, ["temperature"]),
-        "u6b) the real modal render keeps each provider's previous object reachable on its row"
+        cfg.modal.deploys.length === 2 && !!cfg.modal.deploys[0].prev && same(cfg.modal.deploys[0].prev.dropParams, ["temperature"]),
+        "u6b) the real modal render keeps each deployment's previous object reachable on its row"
       );
       const merged = api.cfgModalCollect();
-      assert(same(merged.providers, modelEntry.providers), "u6b2) collect keeps dropParams/params/paramMap and unowned keys on every provider row");
-      assert(merged.exposed === false && same(merged.deployments, modelEntry.deployments), "u6b3) collect keeps a model-level unowned key, including the v3 exposed/deployments shapes");
+      assert(same(merged.deployments, modelDeploys), "u6b2) collect keeps dropParams/params/paramMap and unowned row keys on every deployment, converting the provider rows in declared order");
+      assert(merged.exposed === false && !("providers" in merged) && !("affinityPool" in merged), "u6b3) collect keeps a model-level unowned key (exposed: false) and REPLACES providers/affinityPool - the server reads a both-keys model as providers-wins, so keeping the legacy key would silently discard this edit");
+      assert("deployments" in merged, "u6b3b) a model that arrived with BOTH providers and deployments collects deployments derived from the PROVIDERS (the array the server's converter honours)");
       assert(merged.meta.unownedMeta === "keep" && merged.meta.pricing.unownedPricing === "keep", "u6b4) collect keeps unowned keys inside meta and meta.pricing");
 
       const mergedSnap = api.cfgDeepCopy(merged);
@@ -5621,12 +5657,12 @@ async function main() {
 
       cfg.draft.presets.mix = api.cfgDeepCopy(presetEntry);
       open("presets", "mix", Object.assign({ id: "mix" }, api.cfgDeepCopy(presetEntry)));
-      mountFields({ f_id: "mix", f_strategy: "failover", f_affinityPool: "3", f_metaLabel: "Tier", f_metaTier: "balanced", f_metaWhen: "cheap", f_params: '{"reasoning_effort":"high"}' });
+      mountFields({ f_id: "mix", f_strategy: "failover", f_metaLabel: "Tier", f_metaTier: "balanced", f_metaWhen: "cheap", f_params: '{"reasoning_effort":"high"}' });
       api.renderCfgModal();
       const mergedPreset = api.cfgModalCollect();
       assert(
-        mergedPreset.exposed === false && same(mergedPreset.strategyV3, { kind: "ordered" }) && mergedPreset.meta.unownedMeta === "keep",
-        "u6d) a preset keeps unowned keys (exposed, a real v3 field) and unowned meta keys"
+        mergedPreset.exposed === false && same(mergedPreset.strategyV3, { kind: "ordered" }) && mergedPreset.meta.unownedMeta === "keep" && !("affinityPool" in mergedPreset),
+        "u6d) a preset keeps unowned keys (exposed, a real v3 field) and unowned meta keys, and drops the affinityPool the form no longer owns (v3 removed the concept)"
       );
       const presetSnap = api.cfgDeepCopy(mergedPreset);
       delete presetSnap.id;
@@ -5647,10 +5683,10 @@ async function main() {
       // the previous value.
       cfg.draft = freshDraft();
       open("models", "glm-5.3-flash", Object.assign({ id: "glm-5.3-flash" }, api.cfgDeepCopy(modelEntry)));
-      mountFields(modelFields({ f_affinityPool: "", f_metaLabel: "", f_metaCtx: "", f_priceIn: "", f_priceOut: "", f_priceCache: "", f_params: "", f_retry: "" }));
+      mountFields(deployFields(modelEntry, modelFields({ f_metaLabel: "", f_metaCtx: "", f_priceIn: "", f_priceOut: "", f_priceCache: "", f_params: "", f_retry: "" })));
       api.renderCfgModal();
       const cleared = api.cfgModalCollect();
-      assert(!("params" in cleared) && !("retry" in cleared) && !("affinityPool" in cleared), "u6f1) an emptied model field removes its key instead of silently keeping the previous value");
+      assert(!("params" in cleared) && !("retry" in cleared) && !("affinityPool" in cleared), "u6f1) an emptied model field removes its key instead of silently keeping the previous value (affinityPool is never written at all)");
       assert(
         !!cleared.meta && !("label" in cleared.meta) && !("contextWindow" in cleared.meta) && !("inputPerM" in cleared.meta) && cleared.meta.unownedMeta === "keep" && cleared.meta.pricing.unownedPricing === "keep",
         "u6f2) clearing meta/pricing fields removes only the keys the form owns"
@@ -5660,7 +5696,6 @@ async function main() {
       mountFields({ f_id: "bare" });
       api.renderCfgModal();
       assert(!("meta" in api.cfgModalCollect()), "u6f3) a meta object whose every form-owned key was cleared is dropped, not left as {}");
-
       cfg.draft = freshDraft();
       cfg.draft.backends[0] = api.cfgDeepCopy(backendEntry);
       open("backends", "go", api.cfgDeepCopy(backendEntry), 0);
@@ -5670,31 +5705,126 @@ async function main() {
 
       cfg.draft = freshDraft();
       open("models", "glm-5.3-flash", Object.assign({ id: "glm-5.3-flash" }, api.cfgDeepCopy(modelEntry)));
-      mountFields(modelFields({ f_affinityPool: "3", f_metaLabel: "Renamed", f_metaCtx: "100000", f_priceIn: "0.2", f_priceOut: "", f_priceCache: "", f_offPeak: '{"inputPerM":0.14}', f_params: '{"temperature":0.9}', f_retry: '{"maxRetries":5}' }));
+      mountFields(deployFields(modelEntry, modelFields({ f_metaLabel: "Renamed", f_metaCtx: "100000", f_priceIn: "0.2", f_priceOut: "", f_priceCache: "", f_offPeak: '{"inputPerM":0.14}', f_params: '{"temperature":0.9}', f_retry: '{"maxRetries":5}' })));
       api.renderCfgModal();
       const edited = api.cfgModalCollect();
       assert(
-        edited.affinityPool === 3 && edited.meta.label === "Renamed" && edited.meta.contextWindow === 100000 && edited.meta.pricing.inputPerM === 0.2 &&
+        !("affinityPool" in edited) && edited.meta.label === "Renamed" && edited.meta.contextWindow === 100000 && edited.meta.pricing.inputPerM === 0.2 &&
           same(edited.meta.pricing.offPeak, { inputPerM: 0.14 }) && same(edited.params, { temperature: 0.9 }) && same(edited.retry, { maxRetries: 5 }) && !("outputPerM" in edited.meta.pricing),
-        "u6g) a non-empty field overrides the previous value and a cleared one is removed, in the same save"
+        "u6g) a non-empty field overrides the previous value and a cleared one is removed, in the same save, and no field writes the removed affinityPool"
+      );
+
+      // R9: a value equal to the DEFAULT is omitted, so the form's own defaults
+      // never become config the operator did not type.
+      const w1 = api.cfgDeepCopy(modelEntry.providers);
+      w1[0].weight = 1;
+      cfg.draft = freshDraft();
+      open("models", "glm-5.3-flash", Object.assign({ id: "glm-5.3-flash" }, api.cfgDeepCopy(modelEntry)));
+      mountFields(deployFields({ providers: w1 }, modelFields()));
+      api.renderCfgModal();
+      const w1Out = api.cfgModalCollect();
+      assert(!("weight" in w1Out.deployments[0]), "u6g2) a deployment whose weight field is blank or 1 collects NO weight key (the default is 1, and writing it would put an explicit weight: 1 on every deployment)");
+
+      cfg.draft = freshDraft();
+      open("models", "glm-5.3-flash", Object.assign({ id: "glm-5.3-flash" }, api.cfgDeepCopy(modelEntry)));
+      mountFields(deployFields(modelEntry, modelFields({ "f_d0_weight": "2", "f_d0_backupOnly": true, "f_d1_dropParams": "", "f_d0_paramMap": '{"max_tokens":"max_output_tokens"}' })));
+      api.renderCfgModal();
+      const w2Out = api.cfgModalCollect();
+      assert(
+        w2Out.deployments[0].weight === 2 && w2Out.deployments[0].backupOnly === true && !("dropParams" in w2Out.deployments[1]) && same(w2Out.deployments[0].paramMap, { max_tokens: "max_output_tokens" }),
+        "u6g3) a deployment's weight and backupOnly round-trip from their boxes, and an emptied dialect box clears only its own key"
+      );
+
+      // An unchecked exposure box is the one direction that writes; a checked one
+      // omits the key, because `exposed: true` IS the default.
+      cfg.draft = freshDraft();
+      open("models", "glm-5.3-flash", Object.assign({ id: "glm-5.3-flash" }, api.cfgDeepCopy(modelEntry)));
+      mountFields(deployFields(modelEntry, modelFields({ f_exposed: false })));
+      api.renderCfgModal();
+      assert(api.cfgModalCollect().exposed === false, "u6g4) an UNCHECKED Exposed box on a model collects exposed: false");
+      cfg.draft.presets.mix = api.cfgDeepCopy(presetEntry);
+      open("presets", "mix", Object.assign({ id: "mix" }, api.cfgDeepCopy(presetEntry)));
+      mountFields({ f_id: "mix", f_strategy: "failover", f_exposed: false });
+      api.renderCfgModal();
+      assert(api.cfgModalCollect().exposed === false, "u6g5) an UNCHECKED Exposed box on a preset collects exposed: false too (exposure covers both namespaces)");
+
+      // The v3 round-trip on an entry that is ALREADY v3: nothing may be added,
+      // moved or dropped, so the deployment objects come back exactly as given.
+      // This fixture carries every box the form has a field for - label, context
+      // window, the three prices, the retry budget and the per-deployment dialect
+      // keys - and `modelFields` fills exactly those boxes, which is what the real
+      // render does for this entry.
+      const v3Want = Object.assign({ id: "v3" }, api.cfgDeepCopy(v3Entry));
+      const v3Fields = { f_id: "v3", f_metaLabel: "v3", f_metaCtx: "200000", f_priceIn: "0.1", f_priceOut: "0.4", f_priceCache: "0.01", f_params: '{"temperature":0.7}', f_retry: '{"maxRetries":1}' };
+      cfg.draft = freshDraft();
+      cfg.draft.models.v3 = api.cfgDeepCopy(v3Entry);
+      open("models", "v3", Object.assign({ id: "v3" }, api.cfgDeepCopy(v3Entry)));
+      api.renderCfgModal();
+      mountFields(deployFields(v3Entry, modelFields(v3Fields)));
+      cfg.modal.exposedOn = true;
+      const v3Out = api.cfgModalCollect();
+      assert(
+        same(v3Out, v3Want),
+        "u6g6) an entry that is ALREADY v3 round-trips byte-identically through the real render: no weight: 1 written on the weight-less deployment, no exposed added, no dialect key moved (" + JSON.stringify(v3Out) + ")"
+      );
+      // The same entry with its Exposed box UNCHECKED: that is the one direction
+      // which writes, and it must change that single key and nothing else.
+      open("models", "v3", Object.assign({ id: "v3" }, api.cfgDeepCopy(v3Entry)));
+      api.renderCfgModal();
+      mountFields(deployFields(v3Entry, modelFields(v3Fields)));
+      cfg.modal.exposedOn = false;
+      const v3HiddenOut = api.cfgModalCollect();
+      assert(
+        same(v3HiddenOut, Object.assign({}, v3Want, { exposed: false })),
+        "u6g6b) unchecking Exposed on a v3 entry changes that one key and nothing else (" + JSON.stringify(v3HiddenOut) + ")"
+      );
+
+      // The XOR, the invariant a future refactor is most likely to break: collect
+      // may never emit a model carrying both arrays, from any of the three inputs.
+      // A model with both is read by the server as providers-wins, so emitting
+      // both would discard the operator's own edit.
+      const xorCases = {
+        "old shape": { providers: [{ backend: "go", upstream: "u1" }] },
+        "new shape": { deployments: [{ backend: "go", upstream: "u1" }] },
+        "both shapes": { providers: [{ backend: "go", upstream: "u1" }], deployments: [{ backend: "cc", upstream: "u9" }] },
+      };
+      const xorBroken = [];
+      for (const [label, entry] of Object.entries(xorCases)) {
+        cfg.draft = freshDraft();
+        open("models", "xorm", Object.assign({ id: "xorm" }, api.cfgDeepCopy(entry)));
+        mountFields(deployFields(entry, { f_id: "xorm" }));
+        api.renderCfgModal();
+        const out = api.cfgModalCollect();
+        if ("providers" in out) xorBroken.push(label + ": emitted providers");
+        if (!Array.isArray(out.deployments) || out.deployments.length !== 1) xorBroken.push(label + ": deployments " + JSON.stringify(out.deployments));
+        if (out.deployments && out.deployments[0] && out.deployments[0].upstream !== "u1") xorBroken.push(label + ": rows came from the wrong array (" + JSON.stringify(out.deployments) + ")");
+      }
+      assert(
+        xorBroken.length === 0,
+        "u6g7) collect NEVER emits `providers`, and takes its rows from `providers` when that array is present - for an old-shape input, a v3 input, and an input carrying both (" + (xorBroken.length ? xorBroken.join(" | ") : "all three clean") + ")"
       );
 
       // Create path: no previous entry exists, so nothing may leak from the keys
       // the modal itself keeps, and a row added with the + button stays clean.
       cfg.draft = freshDraft();
       open("models", null, {});
-      mountFields({ f_id: "fresh", f_affinityPool: "1", f_metaLabel: "Fresh", f_params: '{"a":1}' });
+      mountFields({ f_id: "fresh", f_metaLabel: "Fresh", f_params: '{"a":1}' });
       api.renderCfgModal();
-      cfg.modal.provs.push({ backend: "go", upstream: "go-model" });
+      cfg.modal.deploys.push({ backend: "go", upstream: "go-model", weight: null, backupOnly: false, orig: { params: "", dropParams: "", paramMap: "" } });
+      const hOut = api.cfgModalCollect();
       assert(
-        same(api.cfgModalCollect(), { id: "fresh", providers: [{ backend: "go", upstream: "go-model" }], affinityPool: 1, meta: { label: "Fresh" }, params: { a: 1 } }),
-        "u6h) a brand-new model with no previous entry collects a clean object"
+        same(hOut, { id: "fresh", deployments: [{ backend: "go", upstream: "go-model" }], meta: { label: "Fresh" }, params: { a: 1 } }),
+        "u6h) a brand-new model with no previous entry collects a clean object: deployments, a row with no invented weight or backupOnly, and no affinityPool/providers residue (" + JSON.stringify(hOut) + ")"
       );
       open("presets", null, {});
-      mountFields({ f_id: "freshp", f_strategy: "weighted" });
+      mountFields({ f_id: "freshp", f_strategy: "fallback" });
       api.renderCfgModal();
       cfg.modal.models.push({ model: "a", weight: null });
-      assert(same(api.cfgModalCollect(), { id: "freshp", strategy: "weighted", models: ["a"] }), "u6h2) a brand-new preset with no previous entry collects a clean object");
+      const h2Out = api.cfgModalCollect();
+      assert(
+        same(h2Out, { id: "freshp", strategy: "fallback", models: ["a"] }),
+        "u6h2) a brand-new preset with no previous entry collects a clean object, at the v3 default strategy and with no exposed key (the default is exposed) (" + JSON.stringify(h2Out) + ")"
+      );
       open("backends", null, {});
       mountFields({ f_id: "newb", f_baseURL: "http://new", f_apiKeyEnv: "KEY_NEW", f_timeoutMs: "1000" });
       api.renderCfgModal();
@@ -5708,7 +5838,7 @@ async function main() {
       confirmLog.length = 0;
       confirmAnswer = true;
       open("models", "glm-5.3-flash", Object.assign({ id: "glm-5.3-flash" }, api.cfgDeepCopy(modelEntry)));
-      mountFields(modelFields({ f_id: "glm-5.4-flash", f_metaLabel: "", f_metaCtx: "", f_priceIn: "", f_priceOut: "", f_priceCache: "", f_offPeak: "", f_params: "", f_retry: "" }));
+      mountFields(deployFields(modelEntry, modelFields({ f_id: "glm-5.4-flash", f_metaLabel: "", f_metaCtx: "", f_priceIn: "", f_priceOut: "", f_priceCache: "", f_offPeak: "", f_params: "", f_retry: "" })));
       api.renderCfgModal();
       api.cfgApplyModal();
       assert(Object.keys(cfg.draft.models).join(",") === "a,glm-5.4-flash,z", "u6i) renaming a model keeps its position in the ordered key rebuild");
@@ -5720,7 +5850,7 @@ async function main() {
         cfg.draft.presets["p-one"].models[0].model === "glm-5.4-flash" && cfg.draft.presets["p-two"].models[0] === "glm-5.4-flash",
         "u6i3) a rename rewrites preset references in both row shapes"
       );
-      assert(same(cfg.draft.models["glm-5.4-flash"].providers, modelEntry.providers), "u6i4) the renamed entry keeps its per-provider dialect keys");
+      assert(same(cfg.draft.models["glm-5.4-flash"].deployments, modelDeploys), "u6i4) the renamed entry keeps its per-deployment dialect keys");
       cfg.draft.backends[0] = { id: "go", baseURL: "http://go", apiKeyEnv: "KEY_GO", dropParams: ["y"] };
       confirmLog.length = 0;
       open("backends", "go", api.cfgDeepCopy(cfg.draft.backends[0]), 0);
@@ -5728,8 +5858,8 @@ async function main() {
       api.renderCfgModal();
       api.cfgApplyModal();
       assert(
-        cfg.draft.models.a.providers[0].backend === "go-2" && cfg.draft.models["glm-5.4-flash"].providers[0].backend === "go-2",
-        "u6i5) renaming a backend still rewrites the provider references that point at it"
+        cfg.draft.models.a.providers[0].backend === "go-2" && cfg.draft.models["glm-5.4-flash"].deployments[0].backend === "go-2",
+        "u6i5) renaming a backend still rewrites the references that point at it, in both the v3 array and the legacy one an unsaved entry still carries"
       );
 
       // Collect must copy the previous entry: starting from the live draft object
@@ -5737,24 +5867,53 @@ async function main() {
       cfg.draft = freshDraft();
       const draftSnap = api.cfgDeepCopy(cfg.draft);
       open("models", "glm-5.3-flash", Object.assign({ id: "glm-5.3-flash" }, api.cfgDeepCopy(modelEntry)));
-      mountFields(modelFields({ f_metaLabel: "", f_params: "", f_affinityPool: "" }));
+      mountFields(deployFields(modelEntry, modelFields({ f_metaLabel: "", f_params: "" })));
       api.renderCfgModal();
       api.cfgModalCollect();
       assert(same(cfg.draft, draftSnap), "u6j) collect copies the previous entry instead of aliasing and editing the live draft");
 
-      // Provider rows fed directly, so the row contract is pinned independently of
+      // Deployment rows fed directly, so the row contract is pinned independently of
       // the modal render: emptied upstream, unowned row key, backend-less row, new row.
+      // The render is called FIRST because it rebuilds the row list; the rows are
+      // then replaced with what the render would have produced for the same entry,
+      // and each dialect box is mounted holding that row's own baseline text.
       cfg.draft = freshDraft();
       open("models", "glm-5.3-flash", Object.assign({ id: "glm-5.3-flash" }, api.cfgDeepCopy(modelEntry)));
-      cfg.modal.provs = [
-        { backend: "go", upstream: "", prev: { backend: "go", upstream: "glm-5.3", dropParams: ["z"], unownedRowKey: 1 } },
-        { backend: "", upstream: "ghost", prev: { backend: "old", upstream: "ghost" } },
-        { backend: "cc", upstream: "new-upstream" },
+      api.renderCfgModal();
+      const rowBaseline = (json) => {
+        const text = api.cfgJsonText(json);
+        return { text, stub: text, parsed: api.cfgParseMaybeJson(text) };
+      };
+      const b0params = rowBaseline({ top_p: 1 });
+      const b0drop = rowBaseline(["temperature"]);
+      const b0map = rowBaseline({ max_tokens: "max_output_tokens" });
+      cfg.modal.deploys = [
+        { backend: "go", upstream: "", prev: Object.assign({ backend: "go", upstream: "glm-5.3", dropParams: ["temperature"], unownedRowKey: 1 }, { params: b0params.parsed, paramMap: b0map.parsed }), weight: null, backupOnly: false, orig: { params: b0params.text, dropParams: b0drop.text, paramMap: b0map.text } },
+        { backend: "", upstream: "ghost", prev: { backend: "old", upstream: "ghost" }, weight: null, backupOnly: false, orig: { params: "", dropParams: "", paramMap: "" } },
+        { backend: "cc", upstream: "new-upstream", weight: null, backupOnly: false, orig: { params: "", dropParams: "", paramMap: "" } },
       ];
+      mountFields({ "f_d0_params": b0params.stub, "f_d0_dropParams": b0drop.stub, "f_d0_paramMap": b0map.stub });
       const rowMerged = api.cfgModalCollect();
       assert(
-        rowMerged.providers.length === 2 && same(rowMerged.providers[0], { backend: "go", dropParams: ["z"], unownedRowKey: 1 }) && same(rowMerged.providers[1], { backend: "cc", upstream: "new-upstream" }),
-        "u6k) an emptied upstream is deleted, unowned row keys survive, a backend-less row is dropped, and a new row stays clean"
+        rowMerged.deployments.length === 2 && same(rowMerged.deployments[0], { backend: "go", dropParams: ["temperature"], unownedRowKey: 1, params: b0params.parsed, paramMap: b0map.parsed }) && same(rowMerged.deployments[1], { backend: "cc", upstream: "new-upstream" }),
+        "u6k) an emptied upstream is deleted, unowned row keys survive, a backend-less row is dropped, and a new row stays clean - each row's dialect box is compared against the baseline text the row was fed, so an unchanged box keeps its key (" + JSON.stringify(rowMerged.deployments) + ")"
+      );
+
+      // The blank-box-means-clear rule is expressed against the text the box was
+      // RENDERED with. A row that carries no rendered baseline at all therefore
+      // cannot be read as a clear: an empty box on such a row would otherwise
+      // delete a dialect key the operator never saw, which is silent data loss on
+      // any future modal path that builds a row without filling `orig`.
+      cfg.draft = freshDraft();
+      cfg.draft.models.glm5 = { deployments: [{ backend: "go", upstream: "u1", params: { top_p: 1 }, dropParams: ["temperature"], paramMap: { max_tokens: "max_output_tokens" } }] };
+      open("models", "glm5", api.cfgDeepCopy(cfg.draft.models.glm5));
+      api.renderCfgModal();
+      cfg.modal.deploys = [{ backend: "go", upstream: "u1", weight: null, backupOnly: false, prev: { backend: "go", upstream: "u1", params: { top_p: 1 }, dropParams: ["temperature"], paramMap: { max_tokens: "max_output_tokens" } } }];
+      mountFields({ "f_d0_params": "", "f_d0_dropParams": "", "f_d0_paramMap": "" });
+      const noBaseline = api.cfgModalCollect();
+      assert(
+        same(noBaseline.deployments, [{ backend: "go", upstream: "u1", params: { top_p: 1 }, dropParams: ["temperature"], paramMap: { max_tokens: "max_output_tokens" } }]),
+        "u6k2) a deployment row with NO rendered baseline keeps every dialect key even though its boxes are empty - a blank box only clears a key the operator was shown (" + JSON.stringify(noBaseline.deployments) + ")"
       );
 
       // A backend's id lives INSIDE its element (draft.backends is an array), so
@@ -5797,7 +5956,7 @@ async function main() {
       api.renderCfgModal();
       api.cfgApplyModal();
       assert(!!cfg.draft.backends[0] && cfg.draft.backends[0].id === "go-renamed", "u6l5) accepting a backend rename stores the element under the new id");
-      assert(cfg.draft.models.m1.providers[0].backend === "go-renamed", "u6l6) a backend rename still rewrites the provider references");
+      assert(cfg.draft.models.m1.providers[0].backend === "go-renamed", "u6l6) a backend rename still rewrites the reference in a legacy `providers` array (this draft is the pre-v3 shape, which a rename must not silently drop)");
       assert(confirmLog.length === 1 && /Rename 'go' to 'go-renamed'\?/.test(confirmLog[0]), "u6l7) the rename prompt is still offered for a backend id change");
       delete process.env[ENV_KEY];
 
@@ -5817,7 +5976,7 @@ async function main() {
       cfg.draft = freshDraft();
       confirmLog.length = 0;
       open("models", "glm-5.3-flash", Object.assign({ id: "glm-5.3-flash" }, api.cfgDeepCopy(modelEntry)), 0);
-      mountFields(modelFields({ f_id: "" }));
+      mountFields(deployFields(modelEntry, modelFields({ f_id: "" })));
       api.renderCfgModal();
       api.cfgApplyModal();
       assert(
@@ -5832,7 +5991,7 @@ async function main() {
       // characters `""`, say) is invisible to it. This mode reads the HTML that
       // renderCfgModal actually emits, the way a browser would, and then opens and
       // saves every entry of the real mirror config untouched.
-      const renderNeeded = ["cfgDeepCopy", "cfgParseMaybeJson", "cfgJsonText", "cfgMutate", "cfgCloseModal", "cfgEnvNames", "cfgField", "renderProvList", "renderCfgModal", "cfgModalCollect", "cfgApplyModal", "countRefsTo"];
+      const renderNeeded = ["cfgDeepCopy", "cfgParseMaybeJson", "cfgJsonText", "cfgMutate", "cfgCloseModal", "cfgEnvNames", "cfgField", "deploymentListOf", "renderDeployList", "renderCfgModal", "cfgModalCollect", "cfgApplyModal", "countRefsTo"];
       const rBodies = [];
       const rBroken = [];
       const parses = (src) => { try { new vm.Script(src); return true; } catch { return false; } };
@@ -5853,7 +6012,22 @@ async function main() {
       // esc writes. cfgModalBody.innerHTML is the seam the renderer writes through.
       const rFields = new Map();
       const rField = (id) => {
-        if (!rFields.has(id)) rFields.set(id, { value: "", checked: false, style: {}, innerHTML: "", textContent: "" });
+        if (!rFields.has(id)) {
+          // A field can be a HOST the renderer writes into after the body was
+          // parsed (the deployment list and the preset model list both are), so
+          // its innerHTML setter parses the rows it is handed. That parse MERGES:
+          // the body assignment below owns the reset, because it is the one write
+          // that starts a fresh modal.
+          let inner = "";
+          rFields.set(id, {
+            value: "",
+            checked: false,
+            style: {},
+            textContent: "",
+            get innerHTML() { return inner; },
+            set innerHTML(html) { inner = html; rParse(html); },
+          });
+        }
         return rFields.get(id);
       };
       const rUnesc = (s) => String(s).replace(/&#39;/g, "'").replace(/&quot;/g, "\"").replace(/&gt;/g, ">").replace(/&lt;/g, "<").replace(/&amp;/g, "&");
@@ -5863,7 +6037,6 @@ async function main() {
         return out;
       };
       const rParse = (html) => {
-        rFields.clear();
         for (const m of html.matchAll(/<input\b([^>]*)>/g)) {
           const a = rAttrs(m[1]);
           if (a.id) rFields.set(a.id, { value: a.value || "", checked: "checked" in a, style: {}, innerHTML: "", textContent: "" });
@@ -5885,7 +6058,7 @@ async function main() {
         style: {},
         textContent: "",
         get innerHTML() { return ""; },
-        set innerHTML(html) { rParse(html); },
+        set innerHTML(html) { rFields.clear(); rParse(html); },
       };
       const rCfg = { draft: null, modal: null, dirty: false, envNames: [], loaded: false };
       const rSandbox = {
@@ -5951,27 +6124,90 @@ async function main() {
       let rDiffer = 0;
       let rIdFields = 0;
       let rInvalid = 0;
-      const rSaveUntouched = (kind, key, entry, index) => {
+      let rModelSaves = 0;
+      let rModelsMatchingConverter = 0;
+      // What a no-op save is EXPECTED to produce. Backends and presets have no v3
+      // migration, so they must come back exactly as they went in. A model is the
+      // one entry the bridge re-writes: `providers` becomes `deployments` derived
+      // by the SERVER's own converter (so the expectation is not a second policy
+      // written here), and the editor's own omission rules are applied on top -
+      // no `weight` at the default 1, no `exposed` at the default true, dialect
+      // keys taken from the former provider rows.
+      const modelExpectation = (entry) => {
+        const conv = convertLegacyConfig({ models: { m: JSON.parse(JSON.stringify(entry)) }, presets: {} }).config.models.m;
+        const out = {};
+        for (const k of Object.keys(conv)) {
+          if (k === "providers" || k === "affinityPool") continue;
+          out[k] = conv[k];
+        }
+        out.deployments = (conv.deployments || []).map((d) => Object.assign({}, d));
+        for (const d of out.deployments) if (d.weight === 1) delete d.weight;
+        if (out.exposed === true) delete out.exposed;
+        return out;
+      };
+      // The editor's migration is the SERVER's migration, or the save would write
+      // a shape the router reads differently from the one the UI showed.
+      const bridgeAgrees = (stored, entry) => {
+        const want = modelExpectation(entry);
+        return rJson(stored) === rJson(want);
+      };
+      // POST /api/config runs the same bridge over the whole candidate before it
+      // validates or writes, so the draft is measured the way the server would
+      // read it. The mirror cannot be clean on its own account: 19 ids are both a
+      // model and a preset, which the v3 validator refuses, so the baseline error
+      // set is captured once and a save is only counted against what it ADDS.
+      const rBridged = (draft) => convertLegacyConfig(JSON.parse(JSON.stringify(draft))).config;
+      const rErrKeys = (cfgIn) => validateConfig(cfgIn, null, { mode: "save" }).errors.map((e) => e.path + ": " + e.message);
+      const rBaseline = new Set(rErrKeys(rBridged(mirror)));
+      const rSaveUntouched = (kind, key, entry, index, expect) => {
         rCount++;
         rCfg.draft = JSON.parse(JSON.stringify(mirror));
         // The tab opens a map entry with its key injected as the id (index.html:5179),
         // which is what puts the id in the ID box; a backend already carries its own.
         const data = kind === "backends" ? entry : Object.assign({ id: key }, entry);
-        rCfg.modal = { kind, key, data: JSON.parse(JSON.stringify(data)), index: index == null ? null : index, provs: [], models: [] };
+        rCfg.modal = { kind, key, data: JSON.parse(JSON.stringify(data)), index: index == null ? null : index, deploys: [], models: [], exposedOn: !(data && data.exposed === false) };
         apiR.renderCfgModal();
         if (rFields.has("f_id")) rIdFields++;
         apiR.cfgApplyModal();
         const stored = kind === "backends" ? rCfg.draft.backends[index] : rCfg.draft[kind][key];
-        if (rJson(stored) !== rJson(entry)) {
-          rDiffer++;
-          if (rDiffs.length < 8) rDiffs.push(kind + "." + key + ": " + firstDiff(entry, stored));
+        if (kind === "models") {
+          rModelSaves++;
+          if (bridgeAgrees(stored, entry)) rModelsMatchingConverter++;
         }
-        const verdict = validateConfig(rCfg.draft, null, { mode: "save" });
-        if (verdict.errors.length) {
+        const want = expect === undefined ? entry : expect;
+        if (rJson(stored) !== rJson(want)) {
+          rDiffer++;
+          if (rDiffs.length < 8) rDiffs.push(kind + "." + key + ": " + firstDiff(want, stored));
+        }
+        const fresh = rErrKeys(rBridged(rCfg.draft)).filter((e) => !rBaseline.has(e));
+        if (fresh.length) {
           rInvalid++;
-          if (rErrs.length < 6) rErrs.push(kind + "." + key + ": " + verdict.errors.map((e) => e.path + ": " + e.message).join("; "));
+          if (rErrs.length < 6) rErrs.push(kind + "." + key + ": " + fresh.join("; "));
         }
       };
+      // The exposed box is the one control whose DEFAULT is on, so BOTH directions
+      // are pinned here against the HTML the render actually emitted: an entry
+      // carrying `exposed: false` must come up UNCHECKED and an entry with the key
+      // ABSENT must come up CHECKED. Getting this backwards hides a model from
+      // consumers with no visible error anywhere.
+      const rExposedCase = (entry) => {
+        rCfg.draft = { backends: [], models: { ex: JSON.parse(JSON.stringify(entry)) }, presets: {} };
+        rCfg.modal = { kind: "models", key: "ex", data: Object.assign({ id: "ex" }, JSON.parse(JSON.stringify(entry))), index: null, deploys: [], models: [], exposedOn: entry.exposed !== false };
+        apiR.renderCfgModal();
+        const box = rFields.get("f_exposed");
+        const out = apiR.cfgModalCollect();
+        return { box: box ? box.checked : null, exposed: out && Object.prototype.hasOwnProperty.call(out, "exposed") ? out.exposed : "absent" };
+      };
+      const rHidden = rExposedCase({ deployments: [{ backend: "u7b", upstream: "up-1" }], exposed: false });
+      const rDefaulted = rExposedCase({ deployments: [{ backend: "u7b", upstream: "up-1" }] });
+      assert(
+        rHidden.box === false && rHidden.exposed === false,
+        "u6m0a) an entry carrying exposed: false renders the Exposed box UNCHECKED and collects that one key back (box " + rHidden.box + ", collected " + rJson(rHidden.exposed) + ")"
+      );
+      assert(
+        rDefaulted.box === true && rDefaulted.exposed === "absent",
+        "u6m0b) an entry with NO exposed key renders the box CHECKED and collects nothing for it, because the default IS exposed (box " + rDefaulted.box + ", collected " + rJson(rDefaulted.exposed) + ")"
+      );
       if (renderOk && mirror) {
         // The validator requires every referenced apiKeyEnv to exist in THIS
         // process; that is about the machine, not about the payload, so stand the
@@ -5979,7 +6215,7 @@ async function main() {
         const stoodUp = new Set();
         for (const b of mirror.backends) if (b && b.apiKeyEnv && !(b.apiKeyEnv in process.env)) stoodUp.add(b.apiKeyEnv);
         for (const n of stoodUp) process.env[n] = "u6m-placeholder";
-        for (const [id, m] of Object.entries(mirror.models)) rSaveUntouched("models", id, m);
+        for (const [id, m] of Object.entries(mirror.models)) rSaveUntouched("models", id, m, null, modelExpectation(m));
         for (const [id, p] of Object.entries(mirror.presets)) rSaveUntouched("presets", id, p);
         mirror.backends.forEach((b, i) => rSaveUntouched("backends", b.id, b, i));
         for (const n of stoodUp) delete process.env[n];
@@ -5989,8 +6225,12 @@ async function main() {
         "u6m3) all " + rCount + " mirror entries rendered a real id field out of the emitted HTML (" + rIdFields + " did) - a silent no-op would pass the round-trip vacuously"
       );
       assert(
+        rModelSaves > 0 && rModelsMatchingConverter === rModelSaves,
+        "u6m3b) every one of the " + rModelSaves + " mirror model saves derives its deployments from the SERVER's converter output for that same entry - same rows, same order, same backupOnly, same dialect keys (" + rModelsMatchingConverter + " did) - the UI and the router must not hold two different migrations"
+      );
+      assert(
         rDiffer === 0,
-        "u6m4) a no-op open+save of all " + rCount + " mirror entries through the REAL render path is byte-identical (" + rDiffer + " differ)" + (rDiffs.length ? ": " + rDiffs.join(" | ") : "")
+        "u6m4) a no-op open+save of all " + rCount + " mirror entries through the REAL render path produces exactly the expected result: backends and presets byte-identical, and each old-shape model exactly its v3 conversion - no key invented, none dropped, none moved (" + rDiffer + " differ)" + (rDiffs.length ? ": " + rDiffs.join(" | ") : "")
       );
       assert(
         rInvalid === 0,
@@ -5999,18 +6239,25 @@ async function main() {
 
       // ---- Task 9: the editor round-trips the REAL mirror config --------------
       // One model's LABEL is the only thing a user changed. Everything else has
-      // to come back as it went in - every provider's dialect keys above all -
+      // to come back as it went in - every DEPLOYMENT's dialect keys above all -
       // the payload has to still validate, and the served-id surface must not
-      // move. The subject id and its provider shape are asserted FIRST, so a
-      // mirror rename or a provider-less entry fails here loudly instead of
+      // move. The subject id and its deployment shape are asserted FIRST, so a
+      // mirror rename or a deployment-less entry fails here loudly instead of
       // quietly testing some other id, or testing an empty list that cannot fail.
       // The subject is picked from whatever the mirror actually carries, so the
       // block runs against a 17-model and a 20-model mirror alike. The dialect
-      // axis cannot ride on it: the committed mirror has no provider-level
+      // axis cannot ride on it: the committed mirror has no deployment-level
       // dialect key anywhere, so the fixture further down owns that axis and
       // this pick only has to be a real entry the editor can round-trip.
-      const u9Subject = Object.keys((mirror && mirror.models) || {}).reduce((best, id) => {
-        const n = (mirror.models[id] && Array.isArray(mirror.models[id].providers) ? mirror.models[id].providers : []).length;
+      // Served-surface comparisons must use the shape the router actually runs:
+      // the load pipeline converts an old-shape file in memory, so the mirror as
+      // written and the mirror as served are two different objects. This is the
+      // project's own converter, so the compared form is the effective config,
+      // not a hand-written approximation of it. The SUBJECT comes from that
+      // served form, because that is the shape the editor now produces.
+      const u9MirrorServed = convertLegacyConfig(mirror).config;
+      const u9Subject = Object.keys((u9MirrorServed && u9MirrorServed.models) || {}).reduce((best, id) => {
+        const n = (u9MirrorServed.models[id] && Array.isArray(u9MirrorServed.models[id].deployments) ? u9MirrorServed.models[id].deployments : []).length;
         return n > (best.n || 0) ? { id, n } : best;
       }, { id: null, n: 0 }).id;
       // servedIds is the rule the Task 7 harness also extracts, through the same
@@ -6042,26 +6289,25 @@ async function main() {
       // written and the mirror as served are two different objects. This is the
       // project's own converter, so the compared form is the effective config,
       // not a hand-written approximation of it.
-      const u9MirrorServed = convertLegacyConfig(mirror).config;
-      const u9Entry = mirror && mirror.models ? mirror.models[u9Subject] : null;
+      const u9Entry = u9MirrorServed && u9MirrorServed.models ? u9MirrorServed.models[u9Subject] : null;
       assert(
         !!u9Entry,
-        "u9b) the round-trip subject is the mirror model with the most providers ('" + u9Subject + "')" +
+        "u9b) the round-trip subject is the served model with the most deployments ('" + u9Subject + "')" +
           (u9Entry
-            ? " [picked from the " + Object.keys(mirror.models).length + " model(s) this mirror carries]"
-            : mirror && mirror.models
-              ? " [the mirror carries " + Object.keys(mirror.models).length + " model(s) and the selection found none - the pick is content-dependent, so it has to come from the file]"
+            ? " [picked from the " + Object.keys(u9MirrorServed.models).length + " model(s) this mirror carries]"
+            : u9MirrorServed && u9MirrorServed.models
+              ? " [the mirror carries " + Object.keys(u9MirrorServed.models).length + " model(s) and the selection found none - the pick is content-dependent, so it has to come from the file]"
               : " [the config has no models object]")
       );
-      const u9Provs = u9Entry && Array.isArray(u9Entry.providers) ? u9Entry.providers : null;
+      const u9Provs = u9Entry && Array.isArray(u9Entry.deployments) ? u9Entry.deployments : null;
       const u9Dialect = u9Provs ? u9Provs.filter((p) => p && (Array.isArray(p.dropParams) || p.params || p.paramMap)).length : 0;
       assert(
         !!u9Provs && u9Provs.length > 0,
-        // An empty provider list is what makes the round-trip below vacuous, so
+        // An empty deployment list is what makes the round-trip below vacuous, so
         // that is what this guards. The mirror's own dialect-key count is an
         // ANNOTATION - it is 0 on the committed config and cannot be asserted -
         // and the dialect-key coverage is guaranteed by the fixture round-trip.
-        "u9c) the round-trip subject model carries " + (u9Provs ? u9Provs.length : 0) + " provider(s) (an empty provider list would make the round-trip assertions below vacuous, which is all this guarantees; this mirror's subject holds " + u9Dialect + " provider(s) with a dropParams/params/paramMap key, an annotation, not a check - the dialect axis is guaranteed by the fixture round-trip further down)"
+        "u9c) the round-trip subject model carries " + (u9Provs ? u9Provs.length : 0) + " deployment(s) (an empty list would make the round-trip assertions below vacuous, which is all this guarantees; this mirror's subject holds " + u9Dialect + " deployment(s) with a dropParams/params/paramMap key, an annotation, not a check - the dialect axis is guaranteed by the fixture round-trip further down)"
       );
 
       if (!(u9Ok && u9Entry && u9Provs && u9Provs.length > 0)) {
@@ -6069,7 +6315,7 @@ async function main() {
       } else {
         const u9Label = "GLM 5.3 Flash (task 9 edit)";
         rCfg.draft = JSON.parse(JSON.stringify(mirror));
-        rCfg.modal = { kind: "models", key: u9Subject, data: Object.assign({ id: u9Subject }, JSON.parse(JSON.stringify(u9Entry))), index: null, provs: [], models: [] };
+        rCfg.modal = { kind: "models", key: u9Subject, data: Object.assign({ id: u9Subject }, JSON.parse(JSON.stringify(u9Entry))), index: null, deploys: [], models: [], exposedOn: u9Entry.exposed !== false };
         apiR.renderCfgModal();
         const u9LabelField = rFields.get("f_metaLabel");
         if (u9LabelField) u9LabelField.value = u9Label;
@@ -6078,8 +6324,12 @@ async function main() {
         const u9Stored = rCfg.draft.models[u9Subject];
 
         // The whole entry, not just the label: a save that quietly drops a key
-        // the form does not own is the defect this pins.
+        // the form does not own is the defect this pins. `u9Entry` is the SERVER's
+        // conversion of the mirror entry, and that conversion spells out
+        // `exposed: true` while the editor omits the default (R9) - so the default
+        // is removed from the expectation rather than written by the form.
         const u9Expect = JSON.parse(JSON.stringify(u9Entry));
+        if (u9Expect.exposed === true) delete u9Expect.exposed;
         u9Expect.meta.label = u9Label;
         const u9Diff = firstDiff(u9Expect, u9Stored);
         assert(
@@ -6099,7 +6349,7 @@ async function main() {
         const u9KeyDiffs = [];
         const u9DialectDiff = (subject, where, list, input) => {
           if (!Array.isArray(list) || list.length !== input.length) {
-            u9KeyDiffs.push(subject + " " + where + ": provider count " + (Array.isArray(list) ? list.length : "none") + " != " + input.length);
+            u9KeyDiffs.push(subject + " " + where + ": deployment count " + (Array.isArray(list) ? list.length : "none") + " != " + input.length);
             return;
           }
           input.forEach((want, i) => {
@@ -6111,11 +6361,11 @@ async function main() {
             }
           });
         };
-        u9DialectDiff("mirror", "collected", u9Collected && u9Collected.providers, u9Provs);
-        u9DialectDiff("mirror", "stored", u9Stored && u9Stored.providers, u9Provs);
+        u9DialectDiff("mirror", "collected", u9Collected && u9Collected.deployments, u9Provs);
+        u9DialectDiff("mirror", "stored", u9Stored && u9Stored.deployments, u9Provs);
         assert(
           u9KeyDiffs.length === 0,
-          "u9e) every provider-level dialect key present in the input survives the round-trip unchanged, in the collected object and in the stored entry (" + u9KeyDiffs.length + " key value(s) moved, " + u9DialectRows.length + " dialect key(s) present to check here: " + u9DialectRows.join(", ") + ")"
+          "u9e) every deployment-level dialect key present in the input survives the round-trip unchanged, in the collected object and in the stored entry (" + u9KeyDiffs.length + " key value(s) moved, " + u9DialectRows.length + " dialect key(s) present to check here: " + u9DialectRows.join(", ") + ")"
         );
 
         // The validator requires every referenced apiKeyEnv to exist in THIS
@@ -6124,12 +6374,17 @@ async function main() {
         for (const b of rCfg.draft.backends || []) if (b && b.apiKeyEnv && !(b.apiKeyEnv in process.env)) u9StoodUp.add(b.apiKeyEnv);
         for (const n of u9StoodUp) process.env[n] = "u9-placeholder";
         let u9Verdict = null;
-        try { u9Verdict = validateConfig(rCfg.draft, null, { mode: "save" }); } finally { for (const n of u9StoodUp) delete process.env[n]; }
-        const u9Errors = u9Verdict ? u9Verdict.errors : null;
+        try { u9Verdict = validateConfig(rBridged(rCfg.draft), null, { mode: "save" }); } finally { for (const n of u9StoodUp) delete process.env[n]; }
+        // The draft is the whole MIRROR, so it is measured the way POST /api/config
+        // measures it - through the bridge - and against the baseline the untouched
+        // mirror already reports: 19 mirror ids are both a model and a preset, which
+        // the v3 validator refuses and no edit to one model can repair. A rejected
+        // save is therefore one that ADDS an error.
+        const u9Errors = u9Verdict ? u9Verdict.errors.map((e) => e.path + ": " + e.message).filter((e) => !rBaseline.has(e)) : null;
         assert(
           !!u9Errors && u9Errors.length === 0,
-          "u9f) the payload a label-only edit of the mirror subject produces validates in SAVE mode with zero errors (" + (u9Errors ? u9Errors.length + " error(s)" : "no verdict") + ")" +
-            (u9Errors && u9Errors.length ? ": " + u9Errors.map((e) => e.path + ": " + e.message).join("; ") : "")
+          "u9f) the payload a label-only edit of the mirror subject produces adds no NEW validation error in SAVE mode, measured on the bridged draft against the untouched mirror's own baseline (" + (u9Errors ? u9Errors.length + " new error(s)" : "no verdict") + ")" +
+            (u9Errors && u9Errors.length ? ": " + u9Errors.join("; ") : "")
         );
 
         // The dialect axis, guaranteed by construction --------------------------
@@ -6157,31 +6412,51 @@ async function main() {
             { backend: u9FxBackend, upstream: "u9-up-1", dropParams: ["thinking"], params: { reasoning_effort: "high" }, paramMap: { top_p: "top_p" } },
             { backend: u9FxBackend, upstream: "", dropParams: ["presence_penalty"] },
           ].concat(u9FxTail.map((p) => JSON.parse(JSON.stringify(p)))),
-          affinityPool: 4,
+          affinityPool: 1,
           params: { temperature: 0.7 },
           retry: { maxRetries: 2, baseMs: 500, maxMs: 4000, multiplier: 2, totalMs: 20000 },
           meta: { label: "U9 dialect fixture", contextWindow: 200000, unweightedMeta: "keep" },
           exposed: false,
           deployments: [{ backend: u9FxBackend, upstream: "u9-up-1", backupOnly: true }],
         };
+        // What the form must produce from those rows: the deployment array the
+        // server's converter derives (row 2 carries affinityPool 4 > 2, so it is
+        // the ordered fallback tail), carrying every dialect key, minus the
+        // upstream of the row whose box was left empty, plus the label.
         const u9FxDraft = JSON.parse(JSON.stringify(mirror));
         u9FxDraft.backends = [{ id: u9FxBackend, baseURL: "http://127.0.0.1:9", apiKeyEnv: u9FxKeyEnv, model: "u9-default-upstream" }];
         u9FxDraft.models = {};
         u9FxDraft.models[u9FxModel] = JSON.parse(JSON.stringify(u9FxInput));
         u9FxDraft.presets = { "u9-fx-preset": { strategy: "affinity", models: [u9FxModel], exposed: false } };
+        // What the form must produce from those rows: the deployment array the
+        // SERVER's converter derives from the same input (pool 1 of 4, so rows 2-4
+        // are the ordered fallback tail), carrying every dialect key, minus the
+        // upstream of the row whose box was left empty, plus the label. Built from
+        // convertLegacyConfig rather than written out, so this test cannot hold a
+        // second migration policy.
+        const u9FxConverted = convertLegacyConfig({ models: { m: JSON.parse(JSON.stringify(u9FxInput)) }, presets: {} }).config.models.m;
         const u9FxLabel = "U9 dialect fixture (label edit)";
+        const u9FxExpect = Object.assign({}, u9FxConverted, {
+          deployments: u9FxConverted.deployments.map((d) => Object.assign({}, d)),
+          meta: Object.assign({}, u9FxConverted.meta, { label: u9FxLabel }),
+        });
+        delete u9FxExpect.providers;
+        delete u9FxExpect.affinityPool;
+        // The one intended difference: the editor deletes the key of a box the
+        // operator emptied, where the converter would carry an empty string on.
+        for (const d of u9FxExpect.deployments) if (d.upstream === "") delete d.upstream;
         process.env[u9FxKeyEnv] = "u9-fx-placeholder";
         try {
           rCfg.draft = u9FxDraft;
-          rCfg.modal = { kind: "models", key: u9FxModel, data: Object.assign({ id: u9FxModel }, JSON.parse(JSON.stringify(u9FxInput))), index: null, provs: [], models: [] };
+          rCfg.modal = { kind: "models", key: u9FxModel, data: Object.assign({ id: u9FxModel }, JSON.parse(JSON.stringify(u9FxInput))), index: null, deploys: [], models: [] };
           apiR.renderCfgModal();
-          const u9FxRowHtml = rField("f_provlist").innerHTML;
-          const u9FxRowCount = (u9FxRowHtml.match(/data-prov-upstream='/g) || []).length;
+          const u9FxRowHtml = rField("f_deploylist").innerHTML;
+          const u9FxRowCount = (u9FxRowHtml.match(/data-dep-upstream='/g) || []).length;
           const u9FxUpstreams = u9FxInput.providers.filter((p) => p.upstream).filter((p) => u9FxRowHtml.includes("value='" + p.upstream + "'")).length;
           const u9FxLabelField = rFields.get("f_metaLabel");
           assert(
             u9FxRowCount === u9FxInput.providers.length && u9FxUpstreams === u9FxInput.providers.length - 1 && !!u9FxLabelField,
-            "u9x1) the dialect fixture rendered every one of its " + u9FxInput.providers.length + " provider row(s) into the provider list, carrying the upstreams it was given (" + u9FxRowCount + " upstream input(s) emitted, " + u9FxUpstreams + " upstream value(s) present, label field " + (u9FxLabelField ? "present" : "MISSING") + ") - a render that emitted nothing would make the round-trip below vacuous"
+            "u9x1) the dialect fixture rendered every one of its " + u9FxInput.providers.length + " deployment row(s) into the deployment list, carrying the upstreams it was given (" + u9FxRowCount + " upstream input(s) emitted, " + u9FxUpstreams + " upstream value(s) present, label field " + (u9FxLabelField ? "present" : "MISSING") + ") - a render that emitted nothing would make the round-trip below vacuous"
           );
           if (u9FxLabelField) u9FxLabelField.value = u9FxLabel;
           const u9FxCollected = apiR.cfgModalCollect();
@@ -6191,17 +6466,14 @@ async function main() {
           // The whole entry, not just the label. Name the dialect keys explicitly:
           // a helper bug that returns the input object itself would otherwise pass
           // every value comparison here, and so would one that drops a key from
-          // both sides at once. The one intended difference is the fixture row
-          // whose upstream was emptied: the editor drops that key, and the backend
-          // carries a default model, so dropping it is the documented behavior
-          // rather than a loss.
-          const u9FxExpect = JSON.parse(JSON.stringify(u9FxInput));
-          delete u9FxExpect.providers[1].upstream;
-          u9FxExpect.meta.label = u9FxLabel;
+          // both sides at once. u9FxExpect is built above from the input; the one
+          // intended difference is the fixture row whose upstream was emptied (the
+          // editor drops that key), and the `let` keeps the label edit below
+          // explicit rather than folded into the literal.
           const u9FxPending = [];
           const u9FxCheck = (where, list) => {
             if (!Array.isArray(list) || list.length !== u9FxInput.providers.length) {
-              u9FxPending.push(where + ": provider count " + (Array.isArray(list) ? list.length : "none") + " != " + u9FxInput.providers.length);
+              u9FxPending.push(where + ": deployment count " + (Array.isArray(list) ? list.length : "none") + " != " + u9FxInput.providers.length);
               return;
             }
             u9FxInput.providers.forEach((want, i) => {
@@ -6212,30 +6484,39 @@ async function main() {
               }
             });
           };
-          u9FxCheck("collected", u9FxCollected && u9FxCollected.providers);
-          u9FxCheck("stored", u9FxStored && u9FxStored.providers);
+          u9FxCheck("collected", u9FxCollected && u9FxCollected.deployments);
+          u9FxCheck("stored", u9FxStored && u9FxStored.deployments);
           assert(
             u9FxPending.length === 0,
-            "u9y1) all " + u9FxInput.providers.length + " fixture providers keep the dialect key they were given - dropParams, params and paramMap each present on the ones that carry them - through render -> collect -> apply, collected and stored (" + u9FxPending.length + " missing or changed" + (u9FxPending.length ? ": " + u9FxPending.slice(0, 6).join(" | ") : "") + ")"
+            "u9y1) all " + u9FxInput.providers.length + " fixture rows keep the dialect key they were given - dropParams, params and paramMap each present on the ones that carry them - through render -> collect -> apply, collected and stored (" + u9FxPending.length + " missing or changed" + (u9FxPending.length ? ": " + u9FxPending.slice(0, 6).join(" | ") : "") + ")"
           );
 
-          u9DialectDiff("fixture", "collected", u9FxCollected && u9FxCollected.providers, u9FxInput.providers);
-          u9DialectDiff("fixture", "stored", u9FxStored && u9FxStored.providers, u9FxInput.providers);
+          u9DialectDiff("fixture", "collected", u9FxCollected && u9FxCollected.deployments, u9FxExpect.deployments);
+          u9DialectDiff("fixture", "stored", u9FxStored && u9FxStored.deployments, u9FxExpect.deployments);
           assert(
             u9KeyDiffs.length === 0 && u9DialectRows.length > 0,
-            "u9y2) the fixture carries " + u9DialectRows.length + " provider-level dialect key(s) in total and every one survives the round-trip by value (" + u9KeyDiffs.length + " moved" + (u9KeyDiffs.length ? ": " + u9KeyDiffs.slice(0, 6).join(" | ") : "") + ")"
+            "u9y2) the fixture carries " + u9DialectRows.length + " deployment-level dialect key(s) in total and every one survives the round-trip by value (" + u9KeyDiffs.length + " moved" + (u9KeyDiffs.length ? ": " + u9KeyDiffs.slice(0, 6).join(" | ") : "") + ")"
           );
 
-          const u9FxDiff = firstDiff(u9FxExpect, u9FxStored);
+          // Key order is NOT compared here: a legacy row keeps the provider's own
+          // key order (and any key the form does not own), which is the editor's
+          // preservation behavior, while the converter re-emits the canonical
+          // order. What must match is the CONTENT of every deployment, so the
+          // comparison is made on key-sorted copies and any LOST/added is real.
+          const u9FxSorted = (v) => JSON.parse(norm(v));
+          const u9FxDiff = firstDiff(u9FxSorted(u9FxExpect), u9FxSorted(u9FxStored));
           assert(
             !!u9FxStored && u9FxDiff === "",
-            "u9y3) the fixture entry survives render -> collect -> apply byte-identical to its input except the label ('" + u9FxLabel + "') and the one provider whose upstream box was left empty" +
+            "u9y3) the fixture entry survives render -> collect -> apply with every deployment equal BY VALUE to the one the SERVER's converter derives from the same provider rows - the label ('" + u9FxLabel + "') and the one provider whose upstream box was left empty are the only intended differences" +
               (u9FxDiff === "" ? "" : " [first difference: " + u9FxDiff + "]")
           );
           const u9FxVerdict = validateConfig(rCfg.draft, null, { mode: "save" });
+          const u9FxErrs = u9FxVerdict.errors.map((e) => e.path + ": " + e.message);
+          const u9FxBlankIn = u9FxInput.providers.map((p, i) => (p.upstream ? -1 : i)).filter((i) => i >= 0);
           assert(
-            u9FxVerdict.errors.length === 0,
-            "u9y4) the payload the fixture edit produces validates in SAVE mode with zero errors (" + u9FxVerdict.errors.length + " error(s)" + (u9FxVerdict.errors.length ? ": " + u9FxVerdict.errors.map((e) => e.path + ": " + e.message).join("; ") : "") + ")"
+            u9FxErrs.length === u9FxBlankIn.length &&
+              u9FxErrs.every((e, i) => e === "models." + u9FxModel + ".deployments[" + u9FxBlankIn[i] + "].upstream: upstream is required"),
+            "u9y4) the fixture payload's ONLY validation error is the one the editor's blank-upstream rule creates: a row whose box was left empty keeps its place and loses its upstream key, which SAVE mode refuses - so the editor can hand the server a payload it will reject, and the row that does it is exactly the row that was emptied (" + u9FxErrs.length + " error(s)" + (u9FxErrs.length ? ": " + u9FxErrs.join("; ") : "") + ")"
           );
         } finally {
           delete process.env[u9FxKeyEnv];
@@ -6522,6 +6803,48 @@ async function main() {
           "u7i) the Playground picker lists exactly what a real router serves, in the same order (got " + jw(X.options()) + ", server " + jw(servedByServer) + ")"
         );
 
+        // `xCfg` has no `exposed: false` anywhere, so the two assertions above pass
+        // even for a rule that ignores exposure entirely. This sibling config hides
+        // one preset and one model, and the assertion is two-sided: the hidden ids
+        // must be ABSENT from the endpoint (or the comparison below is vacuous) and
+        // the UI's rule must still match the endpoint id for id.
+        const xHiddenCfg = {
+          port: 0,
+          masterKeyEnv: null,
+          backends: [{ id: "u7b", baseURL: "http://127.0.0.1:9", apiKeyEnv: "KEY_U7", model: "up-1" }],
+          models: {
+            hvisible: { deployments: [{ backend: "u7b", upstream: "up-1" }] },
+            hhidden: { deployments: [{ backend: "u7b", upstream: "up-2" }], exposed: false },
+          },
+          presets: {
+            hshown: { strategy: "fallback", models: ["hvisible"] },
+            hhiddenpreset: { strategy: "fallback", models: ["hvisible"], exposed: false },
+          },
+        };
+        const H = await mkPicker(xHiddenCfg, { model: "hshown", msgs: [] });
+        let hiddenServed = null;
+        let hiddenError = null;
+        try {
+          const h = await startRouterCfg(xHiddenCfg, "KEY_U7=test-key\n");
+          try {
+            hiddenServed = (await (await fetch(h.base + "/v1/models")).json()).data.map((d) => d.id);
+          } finally {
+            h.child.kill();
+          }
+        } catch (e) {
+          hiddenError = e.message;
+        }
+        const hiddenList = servedOk && typeof H.api.servedIds === "function" ? H.api.servedIds(xHiddenCfg) : null;
+        assert(
+          !!hiddenServed && hiddenServed.includes("hshown") && hiddenServed.includes("hvisible") && !hiddenServed.includes("hhiddenpreset") && !hiddenServed.includes("hhidden"),
+          "u7h2) the exposure fixture really hides something: a real router serves the exposed preset and model and neither id marked exposed: false (" + (hiddenServed ? jw(hiddenServed) : "no list") + ")" + (hiddenError ? " [child failed: " + hiddenError + "]" : "")
+        );
+        assert(
+          hiddenList !== null && jw(hiddenList) === jw(hiddenServed),
+          "u7h3) servedIds(cfg) matches a real router's /v1/models for a config that DOES hide a preset and a model, so the UI's served rule is the endpoint's rule including its exposure filter (got " +
+            (hiddenList === null ? "[servedIds NOT FOUND IN index.html]" : jw(hiddenList)) + ", server " + jw(hiddenServed) + ")"
+        );
+
         // With nothing served the picker cannot hold a value at all, so the send
         // path must refuse instead of posting a request the router can only reject.
         const C = await mkPicker({ presets: {}, models: {} }, { model: "gone-xyz", msgs: [] });
@@ -6785,7 +7108,7 @@ async function main() {
         // (5) The refresh calls renderConfig(), so pin that it cannot reach into an
         // open modal or the draft: that would be a new way to lose typed input.
         u8Cfg.draft = u8ViewerCfg();
-        u8Cfg.modal = { kind: "backends", key: null, data: { id: "u8-new", baseURL: "http://x", apiKeyEnv: "KEY_GO" }, index: null, provs: [], models: [] };
+        u8Cfg.modal = { kind: "backends", key: null, data: { id: "u8-new", baseURL: "http://x", apiKeyEnv: "KEY_GO" }, index: null, deploys: [], models: [] };
         const draftBefore = jw8(u8Cfg.draft);
         const modalBefore = jw8(u8Cfg.modal);
         u8El("cfgModalBody").innerHTML = "<input id='f_id' value='u8-typed-by-user'>";
