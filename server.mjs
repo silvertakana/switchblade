@@ -300,6 +300,15 @@ function envNames() {
   return Object.keys(process.env).sort();
 }
 
+// v3 backend keys. `model` is the bridge-era default-upstream source and
+// `idleTimeoutMs`/`connectTimeoutMs` are live fields, so all three are known
+// here: a converted live config must not be told its real backend fields are
+// unrecognized.
+const KNOWN_BACKEND_KEYS = new Set([
+  "id", "baseURL", "apiKeyEnv", "params", "dropParams",
+  "connectTimeoutMs", "idleTimeoutMs", "translateDeveloperRole", "timeoutMs", "model",
+]);
+
 // Validate a candidate config. Returns { errors, warnings }; a non-empty
 // errors array means the save is refused and the file is left untouched.
 function validateConfig(candidate, current, opts) {
@@ -326,6 +335,18 @@ function validateConfig(candidate, current, opts) {
   }
   if (errors.length) return { errors, warnings };
 
+  // Shape detection: a config is validated under v3 rules as soon as ANY model
+  // carries `deployments` - a key no pre-v3 config has. Detection is
+  // deliberately CONFIG-WIDE rather than per model. A hand-written mixture is a
+  // config that started migrating, and a v3 router cannot route the entries
+  // that have not: validating each entry under its own shape would accept a
+  // file that only half works. Configs with no `deployments` anywhere never
+  // enter the v3 branch and keep their behavior exactly.
+  const shapeModels = candidate.models;
+  const isV3 =
+    Boolean(shapeModels) && typeof shapeModels === "object" && !Array.isArray(shapeModels) &&
+    Object.values(shapeModels).some((m) => m && typeof m === "object" && m.deployments !== undefined);
+
   // ---- backends ----
   const backends = candidate.backends;
   if (!Array.isArray(backends)) {
@@ -348,6 +369,17 @@ function validateConfig(candidate, current, opts) {
         );
       }
     });
+    if (isV3) {
+      // v3 backends are allowlisted: an unknown key warns and is never an
+      // error, so a config carrying a field this version does not know still
+      // loads.
+      backends.forEach((b, i) => {
+        if (!b || typeof b !== "object") return;
+        for (const k of Object.keys(b)) {
+          if (!KNOWN_BACKEND_KEYS.has(k)) warn(`backends[${i}]`, `unrecognized backend key '${k}'; the router ignores it`);
+        }
+      });
+    }
   }
 
   // ---- models ----
@@ -364,23 +396,50 @@ function validateConfig(candidate, current, opts) {
         continue;
       }
       const providers = Array.isArray(m.providers) ? m.providers : null;
-      if (!providers) {
-        err(at + ".providers", "must be an array of {backend, upstream}");
-        continue;
+      if (isV3) {
+        // v3 models carry `deployments` instead of `providers`. An entry
+        // without them is a pre-migration model inside an otherwise v3 config,
+        // so the error names that model rather than being skipped.
+        const deps = Array.isArray(m.deployments) ? m.deployments : null;
+        if (!deps || !deps.length) {
+          err(at + ".deployments", "must be a non-empty array of {backend, upstream}");
+        } else {
+          deps.forEach((d, i) => {
+            const dat = `${at}.deployments[${i}]`;
+            if (!d || typeof d !== "object") return err(dat, "must be an object");
+            if (!d.backend) return err(dat + ".backend", "backend is required");
+            if (!backendIds.has(d.backend)) return err(dat + ".backend", `unknown deployment backend '${d.backend}'`);
+            // A v3 deployment always names its upstream: the backend's
+            // bridge-era `model` is not a v3 default-upstream source.
+            if (!d.upstream) err(dat + ".upstream", "upstream is required");
+            if (d.weight !== undefined && (!Number.isInteger(d.weight) || d.weight < 1)) err(dat + ".weight", "weight must be an integer >= 1");
+            if (d.backupOnly !== undefined && typeof d.backupOnly !== "boolean") err(dat + ".backupOnly", "backupOnly must be a boolean");
+            // A deployment holds what a provider used to hold, so the typed
+            // params checks follow the field into its new position.
+            if (d.params !== undefined && (!d.params || typeof d.params !== "object" || Array.isArray(d.params))) err(dat + ".params", "params must be an object");
+            if (d.paramMap !== undefined && (!d.paramMap || typeof d.paramMap !== "object" || Array.isArray(d.paramMap))) err(dat + ".paramMap", "paramMap must be an object");
+          });
+        }
+        if (m.exposed !== undefined && typeof m.exposed !== "boolean") err(at + ".exposed", "exposed must be a boolean");
+      } else {
+        if (!providers) {
+          err(at + ".providers", "must be an array of {backend, upstream}");
+          continue;
+        }
+        if (!providers.length) warn(at + ".providers", "no providers: this model routes nowhere and will 404");
+        providers.forEach((pr, i) => {
+          const pat = `${at}.providers[${i}]`;
+          if (!pr || typeof pr !== "object") return err(pat, "must be an object");
+          if (!pr.backend) return err(pat + ".backend", "backend is required");
+          if (!backendIds.has(pr.backend)) {
+            return err(pat + ".backend", `unknown backend '${pr.backend}'`);
+          }
+          const b = backendById.get(pr.backend);
+          if (!pr.upstream && !(b && b.model)) {
+            err(pat + ".upstream", `no upstream given and backend '${pr.backend}' has no default model`);
+          }
+        });
       }
-      if (!providers.length) warn(at + ".providers", "no providers: this model routes nowhere and will 404");
-      providers.forEach((pr, i) => {
-        const pat = `${at}.providers[${i}]`;
-        if (!pr || typeof pr !== "object") return err(pat, "must be an object");
-        if (!pr.backend) return err(pat + ".backend", "backend is required");
-        if (!backendIds.has(pr.backend)) {
-          return err(pat + ".backend", `unknown backend '${pr.backend}'`);
-        }
-        const b = backendById.get(pr.backend);
-        if (!pr.upstream && !(b && b.model)) {
-          err(pat + ".upstream", `no upstream given and backend '${pr.backend}' has no default model`);
-        }
-      });
       if (m.affinityPool !== undefined && (!Number.isInteger(m.affinityPool) || m.affinityPool < 1)) {
         err(at + ".affinityPool", "affinityPool must be an integer >= 1");
       }
@@ -397,11 +456,13 @@ function validateConfig(candidate, current, opts) {
       if (m.params !== undefined && (!m.params || typeof m.params !== "object" || Array.isArray(m.params))) {
         err(at + ".params", "params must be an object");
       }
-      providers.forEach((pr, i) => {
-        const pat = at + ".providers[" + i + "]";
-        if (pr && pr.params !== undefined && (!pr.params || typeof pr.params !== "object" || Array.isArray(pr.params))) err(pat + ".params", "params must be an object");
-        if (pr && pr.paramMap !== undefined && (!pr.paramMap || typeof pr.paramMap !== "object" || Array.isArray(pr.paramMap))) err(pat + ".paramMap", "paramMap must be an object");
-      });
+      if (providers) {
+        providers.forEach((pr, i) => {
+          const pat = at + ".providers[" + i + "]";
+          if (pr && pr.params !== undefined && (!pr.params || typeof pr.params !== "object" || Array.isArray(pr.params))) err(pat + ".params", "params must be an object");
+          if (pr && pr.paramMap !== undefined && (!pr.paramMap || typeof pr.paramMap !== "object" || Array.isArray(pr.paramMap))) err(pat + ".paramMap", "paramMap must be an object");
+        });
+      }
       if (m.meta !== undefined && m.meta.pricing !== undefined) {
         const prc = m.meta.pricing;
         if (!prc || typeof prc !== "object" || Array.isArray(prc)) {
@@ -412,7 +473,7 @@ function validateConfig(candidate, current, opts) {
           }
         }
       }
-      if (typeof m.affinityPool === "number" && m.affinityPool > providers.length) {
+      if (providers && typeof m.affinityPool === "number" && m.affinityPool > providers.length) {
         warn(at + ".affinityPool", `affinityPool ${m.affinityPool} exceeds ${providers.length} provider(s); it clamps at request time`);
       }
     }
@@ -431,10 +492,25 @@ function validateConfig(candidate, current, opts) {
         err(at, "must be an object");
         continue;
       }
-      if (p.strategy && !["affinity", "failover", "weighted"].includes(p.strategy)) {
+      if (isV3) {
+        // v3 narrows the valid strategies to 'fallback' alone: the bridge maps
+        // every legacy value at conversion time, so anything else was authored
+        // against the wrong schema. There is deliberately NO legacy allowlist in
+        // this branch - pre-v3 configs never reach it, and the v2 path below
+        // keeps its own values (including v2's "unknown 'fallback'") untouched.
+        if (p.strategy !== "fallback") warn(at + ".strategy", `v3 preset strategy must be 'fallback'; ${JSON.stringify(p.strategy)} is not a v3 value (the bridge maps the legacy strategies at conversion time)`);
+      } else if (p.strategy && !["affinity", "failover", "weighted"].includes(p.strategy)) {
         warn(at + ".strategy", `unknown strategy '${p.strategy}'; the router falls back to affinity`);
       }
-      if (modelIds.has(id)) warn(at, `id '${id}' is both a model and a preset; the preset wins in /v1/models`);
+      if (modelIds.has(id)) {
+        // One collision rule, verdict by shape: pre-v3 keeps the warn (the real
+        // configs carry 19+ of them, and aborting boot mid-migration is not an
+        // option), while v3 refuses it - a converted config has already resolved
+        // every identity collision.
+        if (isV3) err(at, `id '${id}' is both a model and a preset; v3 ids are one or the other`);
+        else warn(at, `id '${id}' is both a model and a preset; the preset wins in /v1/models`);
+      }
+      if (isV3 && p.exposed !== undefined && typeof p.exposed !== "boolean") err(at + ".exposed", "exposed must be a boolean");
       const list = Array.isArray(p.models) ? p.models : null;
       if (!list) {
         err(at + ".models", "must be an array of model or preset ids");

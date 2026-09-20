@@ -4058,6 +4058,136 @@ async function main() {
     );
   }
 
+  // ---- v3 typed validation ---------------------------------------------------
+  // A config whose shape is v3 (detected by at least one model carrying
+  // `deployments`) is checked under v3 rules. The pre-v3 path is untouched: its
+  // strategy allowlist, its collision WARN and its `providers` requirement all
+  // still apply to a config that has not migrated, which the last four
+  // assertions here characterize.
+  {
+    const savedKeyB1 = process.env.KEY_B1;
+    process.env.KEY_B1 = "x";
+    try {
+      const base = () => ({
+        backends: [{ id: "b1", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_B1", idleTimeoutMs: 5000, connectTimeoutMs: 2000, model: "bridge-era-upstream" }],
+        models: { m1: { deployments: [{ backend: "b1", upstream: "u" }], exposed: true } },
+        presets: { p1: { strategy: "fallback", models: ["m1"], exposed: true } }
+      });
+      const bad1 = base(); bad1.models.m1.deployments = [];
+      assert(validateConfig(bad1, bad1).errors.some((e) => e.path === "models.m1.deployments"), "v36xa) empty deployments is an error");
+      const bad2 = base(); bad2.models.m1.deployments = [{ backend: "ghost", upstream: "u" }];
+      assert(validateConfig(bad2, bad2).errors.some((e) => e.path === "models.m1.deployments[0].backend"), "v36xb) unknown deployment backend ref is an error");
+      const bad3 = base(); bad3.models.m1.deployments = [{ backend: "b1", upstream: "" }];
+      assert(validateConfig(bad3, bad3).errors.some((e) => e.path === "models.m1.deployments[0].upstream"), "v36xc) empty upstream is an error");
+      const bad4 = base(); bad4.models.m1.deployments = [{ backend: "b1", upstream: "u", weight: "abc" }];
+      assert(validateConfig(bad4, bad4).errors.some((e) => e.path === "models.m1.deployments[0].weight"), "v36xd) non-integer weight is an error");
+      const bad5 = base(); bad5.models.m1.deployments = [{ backend: "b1", upstream: "u", backupOnly: "yes" }];
+      assert(validateConfig(bad5, bad5).errors.some((e) => e.path === "models.m1.deployments[0].backupOnly"), "v36xe) non-boolean backupOnly is an error");
+      const bad5e = base(); bad5e.models.m1.exposed = "yes";
+      assert(validateConfig(bad5e, bad5e).errors.some((e) => e.path === "models.m1.exposed"), "v36xk) non-boolean model exposed is an error");
+      const bad6 = base(); bad6.presets.p1.strategy = "affinity";
+      const v6 = validateConfig(bad6, bad6);
+      assert(v6.errors.length === 0 && v6.warnings.some((w) => w.path === "presets.p1.strategy"), "v36xf) v3 non-fallback strategy warns only (the bridge already mapped the legacy shapes)");
+      const good = base();
+      const vg = validateConfig(good, good);
+      assert(vg.errors.length === 0 && vg.warnings.length === 0, "v36xg) known backend fields (idleTimeoutMs/connectTimeoutMs + bridge-era model) never warn (" + JSON.stringify(vg.warnings) + ")");
+      const coll = base(); coll.presets.m1 = { strategy: "fallback", models: ["m1"], exposed: true };
+      assert(validateConfig(coll, coll).errors.some((e) => e.path === "presets.m1"), "v36xh) v3-shaped collision is an error (G1 XOR)");
+      // Pre-v3 input must NOT hit the v3 branch: affinity/failover/weighted stay
+      // silent here, and nothing the v3 branch adds may appear at a strategy path.
+      const old = { backends: base().backends, models: { "m1": { providers: [{ backend: "b1", upstream: "u" }] } }, presets: { "p1": { strategy: "affinity", models: ["m1"] } } };
+      assert(!validateConfig(old, old).warnings.some((w) => w.path === "presets.p1.strategy"), "v36xi) old-shape strategy untouched by the v3 warn set");
+      // The other half of the warn-set narrowing, stated truthfully: what the
+      // pre-v3 path keeps silent is affinity/failover/weighted. A pre-v3 preset
+      // spelled `strategy: "fallback"` warns TODAY, because `fallback` is the v3
+      // name and the old allowlist does not know it - and that pre-existing
+      // verdict must not change (old shapes keep their behaviour exactly).
+      const legacy4 = {
+        backends: base().backends,
+        models: { "m1": { providers: [{ backend: "b1", upstream: "u" }] } },
+        presets: {
+          "la": { strategy: "affinity", models: ["m1"] },
+          "lf": { strategy: "failover", models: ["m1"] },
+          "lw": { strategy: "weighted", models: ["m1"] },
+          "lb": { strategy: "fallback", models: ["m1"] }
+        }
+      };
+      const vj = validateConfig(legacy4, legacy4);
+      const stratPaths = vj.warnings.filter((w) => /\.strategy$/.test(w.path)).map((w) => w.path);
+      assert(
+        !stratPaths.some((p) => p !== "presets.lb.strategy"),
+        "v36xj) old-shape input keeps affinity/failover/weighted silent and no v3 strategy warn leaks into the pre-v3 path (" + JSON.stringify(stratPaths) + ")"
+      );
+      assert(
+        stratPaths.length === 1 && stratPaths[0] === "presets.lb.strategy",
+        "v36xj2) characterization: 'fallback' on a PRE-v3 preset keeps exactly its one pre-existing v2 'unknown strategy' warning (" + JSON.stringify(stratPaths) + ")"
+      );
+      // v3 parity for the typed positions the pre-v3 path checks on a provider:
+      // a deployment now holds them, so the same values are errors there.
+      const badp = base(); badp.models.m1.deployments = [{ backend: "b1", upstream: "u", params: 5 }];
+      assert(validateConfig(badp, badp).errors.some((e) => e.path === "models.m1.deployments[0].params"), "v36xl2) a non-object deployment params is an error (parity with the pre-v3 provider check)");
+      const badpe = base(); badpe.presets.p1.exposed = "yes";
+      assert(validateConfig(badpe, badpe).errors.some((e) => e.path === "presets.p1.exposed"), "v36xl) non-boolean preset exposed is an error");
+      // The detection boundary, pinned rather than accidental: at least one model
+      // with `deployments` puts the WHOLE config under v3 rules. For a
+      // hand-written mixture the honest verdict is the error below, not a silent
+      // pass - the pre-migration entry has no deployments, so a v3 router cannot
+      // route it, and validating each entry under its own shape would accept a
+      // file that only half works. A converted payload is purely v3 (the bridge
+      // converts or refuses), so this only bites input that skipped the bridge.
+      const mixed = () => ({
+        backends: base().backends,
+        models: {
+          "v3m": { deployments: [{ backend: "b1", upstream: "u" }], exposed: true },
+          "oldm": { providers: [{ backend: "b1", upstream: "u" }] }
+        },
+        presets: { "pm": { strategy: "fallback", models: ["v3m", "oldm"], exposed: true } }
+      });
+      const mixedVerdict = validateConfig(mixed(), mixed());
+      assert(
+        mixedVerdict.errors.some((e) => e.path === "models.oldm.deployments") &&
+          !mixedVerdict.errors.some((e) => e.path.startsWith("models.v3m") || e.path === "models.oldm.providers"),
+        "v36xm) a MIXED config is validated config-wide as v3: the unmigrated model errors at models.oldm.deployments, the v3 model is clean, and the pre-v3 `providers` requirement is NOT applied (" + JSON.stringify(mixedVerdict.errors.map((e) => e.path)) + ")"
+      );
+      const m2 = mixed();
+      const swapped = { backends: m2.backends, models: { "oldm": m2.models.oldm, "v3m": m2.models.v3m }, presets: m2.presets };
+      const swappedVerdict = validateConfig(swapped, swapped);
+      assert(
+        JSON.stringify(swappedVerdict.errors.map((e) => e.path)) === JSON.stringify(mixedVerdict.errors.map((e) => e.path)),
+        "v36xm2) detection is order-independent: the same mixture in the other order gives the same verdict (" + JSON.stringify(swappedVerdict.errors.map((e) => e.path)) + ")"
+      );
+      // *** THE DEFERRED ZERO-ERROR CRITERION (Task 10's acceptance criterion, closed here). ***
+      // The bridge and the validator must AGREE end to end: a pre-v3 config runs
+      // through convertLegacyConfig and is then validated in SAVE mode - the mode
+      // POST /api/config uses - and must report ZERO errors, including the shape
+      // and env classes that were the only ones left when this criterion was
+      // deferred. The apiKeyEnv name stands in the process above. The fixture
+      // carries the pre-fix editor's empty-string artifacts on purpose, since
+      // their repair is what keeps every later save from being blocked.
+      const legacy = {
+        backends: [{ id: "b1", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_B1", idleTimeoutMs: 5000, connectTimeoutMs: 2000, model: "bridge-era-upstream" }],
+        models: {
+          "m1": { providers: [{ backend: "b1", upstream: "u" }, { backend: "b1", upstream: "u2" }], affinityPool: 1 },
+          "m2": { providers: [{ backend: "b1", upstream: "u" }], retry: "" }
+        },
+        presets: {
+          "m1": { strategy: "affinity", models: [{ model: "m1", weight: 1 }] },
+          "p1": { strategy: "failover", models: ["m1", "m2"], params: "" }
+        },
+        params: { temperature: 0.2 }
+      };
+      const converted = convertLegacyConfig(legacy);
+      const vc = validateConfig(converted.config, converted.config);
+      assert(
+        vc.errors.length === 0,
+        "v36xn) a converted pre-v3 config validates in SAVE mode with ZERO errors - the bridge and the validator agree (" + JSON.stringify(vc.errors) + "; validator warnings " + JSON.stringify(vc.warnings) + ")"
+      );
+    } finally {
+      if (savedKeyB1 === undefined) delete process.env.KEY_B1;
+      else process.env.KEY_B1 = savedKeyB1;
+    }
+  }
+
   // ---- config write path: single-file bind mount ----------------------------
   // The live homelab config is a single-file bind mount. Linux refuses to
   // rename() onto a mount point (EBUSY), and even a swap that succeeded would
