@@ -181,7 +181,7 @@ function referencedEnvNames() {
   if (!cfg) return out;
   if (cfg.masterKeyEnv) out.add(cfg.masterKeyEnv);
   if (cfg.uiPasswordEnv) out.add(cfg.uiPasswordEnv);
-  for (const b of cfg.backends || []) if (b.apiKeyEnv) out.add(b.apiKeyEnv);
+  for (const b of cfg.backends || []) if (b && typeof b === "object" && b.apiKeyEnv) out.add(b.apiKeyEnv);
   return out;
 }
 
@@ -309,6 +309,22 @@ const KNOWN_BACKEND_KEYS = new Set([
   "connectTimeoutMs", "idleTimeoutMs", "translateDeveloperRole", "timeoutMs", "model",
 ]);
 
+// v3 model keys. The dialect/typed fields live per deployment in v3, but a model
+// still carries `params`/`retry`/`meta` and the optional `exposed` flag, and the
+// allowlist keeps the SAME tolerance the backend layer already has: an unknown
+// key warns and never refuses the save. Deliberately absent is `providers`: a
+// converted model has none, and a hand-written v3 model that keeps one is
+// carrying data the v3 read ignores, which the operator needs told.
+const KNOWN_MODEL_KEYS = new Set([
+  "deployments", "exposed", "params", "retry", "meta", "affinityPool",
+  "dropParams", "paramMap", "translateDeveloperRole", "timeoutMs",
+]);
+
+// v3 deployment keys: what a provider could carry, in its new position.
+const KNOWN_DEPLOYMENT_KEYS = new Set([
+  "backend", "upstream", "weight", "backupOnly", "params", "dropParams", "paramMap",
+]);
+
 // Validate a candidate config. Returns { errors, warnings }; a non-empty
 // errors array means the save is refused and the file is left untouched.
 function validateConfig(candidate, current, opts) {
@@ -418,9 +434,20 @@ function validateConfig(candidate, current, opts) {
             // params checks follow the field into its new position.
             if (d.params !== undefined && (!d.params || typeof d.params !== "object" || Array.isArray(d.params))) err(dat + ".params", "params must be an object");
             if (d.paramMap !== undefined && (!d.paramMap || typeof d.paramMap !== "object" || Array.isArray(d.paramMap))) err(dat + ".paramMap", "paramMap must be an object");
+            for (const k of Object.keys(d)) {
+              if (!KNOWN_DEPLOYMENT_KEYS.has(k)) warn(dat, `unrecognized deployment key '${k}'; the router ignores it`);
+            }
           });
         }
         if (m.exposed !== undefined && typeof m.exposed !== "boolean") err(at + ".exposed", "exposed must be a boolean");
+        // Allowlist, exactly as the backend layer does it: `backuponly: true`
+        // (a misspelling of `backupOnly`) would otherwise leave the deployment a
+        // PRIMARY and put live traffic on an account the operator marked as
+        // break-glass. A warning, never an error - an unknown key must not be
+        // able to refuse a save.
+        for (const k of Object.keys(m)) {
+          if (!KNOWN_MODEL_KEYS.has(k)) warn(at, `unrecognized model key '${k}'; the router ignores it`);
+        }
       } else {
         if (!providers) {
           err(at + ".providers", "must be an array of {backend, upstream}");
@@ -589,16 +616,67 @@ function markHealthy(id, origin) {
   health.set(id, { state: "healthy", nextAvailableAt: 0, fails: 0, backoffMs: 0, lastError: null });
 }
 
-// Read a model's deployment list as provider-shaped entries, so the request
-// path serves a converted config unchanged while the routing read is migrated.
-// The bridge-era pipeline converts old-shape files to `deployments`, and until
-// the routing read owns that shape the converted entries must still resolve:
-// without this a converted config boots, serves /api/config and routes NOTHING.
-// `backupOnly` is deliberately ignored here (callers see the same order they
-// always did), which is the routing read's own task, not this loader's.
-function modelProviders(m) {
+// Read a model's deployment list as provider-shaped entries. The v3 read OWNS
+// the routing semantics now (`backupOnly`, `weight`, `exposed`), so this
+// resolves and filters rather than presenting the raw list: the bridge-era
+// pass-through deliberately hands a semantically unusable provider into
+// `deployments` so the VALIDATOR can name it, and that is not licence for the
+// router to build an attempt carrying `model: undefined`. A deployment is
+// routable only when it is a plain object, names a KNOWN backend, and resolves
+// an upstream - the same three reasons v2's loader dropped a provider, reported
+// in the same wording. `backendById` is passed in because the caller already
+// holds it (normalizeConfig, candidates) and re-deriving it per model would be
+// the only reason this function needs the whole config.
+function modelDeployments(m, id, backendById) {
   const list = Array.isArray(m.deployments) ? m.deployments : Array.isArray(m.providers) ? m.providers : [];
-  return list.filter((p) => p && typeof p === "object");
+  const out = [];
+  list.forEach((d, i) => {
+    const at = "deployments[" + i + "]";
+    if (!d || typeof d !== "object") {
+      console.warn(`config warning: model '${id}': entry at ${at} is not an object, dropped`);
+      return;
+    }
+    if (typeof d.backend !== "string") {
+      console.warn(`config warning: model '${id}': entry at ${at} names no backend, dropped`);
+      return;
+    }
+    const b = backendById.get(d.backend);
+    if (!b) {
+      console.warn(`config warning: model '${id}': entry at ${at} references unknown backend '${d.backend}', dropped`);
+      return;
+    }
+    const upstream = d.upstream ?? b.model;
+    if (!upstream) {
+      console.warn(`config warning: model '${id}': entry at ${at} (backend '${d.backend}') has no resolvable upstream, dropped`);
+      return;
+    }
+    out.push({ ...d, upstream });
+  });
+  return out;
+}
+
+// v3 primary selection: `backupOnly` deployments are the ordered fallback tail
+// and the primary comes from the weighted heads, so a break-glass deployment
+// never receives live traffic by hash. Weights that are not integers >= 1 are
+// treated as 1 (the validator reports the type; the read must not refuse to
+// route over it).
+function orderDeployments(deps, sessionKey) {
+  const primaries = deps.filter((d) => !d.backupOnly);
+  const backups = deps.filter((d) => d.backupOnly);
+  if (!primaries.length) return [...deps];
+  const weights = primaries.map((d) => (Number.isInteger(d.weight) && d.weight >= 1 ? d.weight : 1));
+  const total = weights.reduce((s, w) => s + w, 0);
+  const h = hashStr(sessionKey) % total;
+  let acc = 0;
+  let pick = 0;
+  for (let i = 0; i < weights.length; i++) {
+    acc += weights[i];
+    if (h < acc) {
+      pick = i;
+      break;
+    }
+  }
+  return [primaries[pick], ...primaries.filter((_, i) => i !== pick), ...backups];
 }
 
 // The session-spread width of a model. In v2 it was `affinityPool`; the
@@ -612,9 +690,17 @@ function modelPool(m) {
 }
 
 function ensureBackends(cfg) {
-  for (const b of cfg.backends) {
+  for (const b of cfg.backends || []) {
+    if (!b || typeof b !== "object") continue; // a non-object entry is the validator's to name
     if (!health.has(b.id)) markHealthy(b.id);
   }
+}
+
+// The backends a routing/UI path may actually USE. A non-object entry is kept in
+// the config so the validator can name `backends.N`, which means every consumer
+// that maps the array has to skip it rather than dereference it.
+function usableBackends(cfg) {
+  return (cfg.backends || []).filter((b) => b && typeof b === "object");
 }
 
 // Classify an upstream failure into a backoff "kind".
@@ -1259,7 +1345,7 @@ function dashboardPayload(cfg) {
     activeModelCount: k.models.size,
   };
 
-  const byBackend = cfg.backends.map((b) => {
+  const byBackend = usableBackends(cfg).map((b) => {
     const acc = ANALYTICS.byBackend.get(b.id);
     const h = health.get(b.id) || {};
     const isCooling = h.state === "cooling" && h.nextAvailableAt > now;
@@ -1538,7 +1624,10 @@ function convertLegacyConfig(raw) {
       if (obj[k] === "") repairEmptyString(obj, at, k, warnings);
     }
   };
-  for (const b of cfg.backends || []) repairEmpty(b, "backends." + b.id);
+  // A non-object entry PASSES THROUGH UNTOUCHED: it is the validator's job to
+  // name `backends.N`, and dereferencing it here is what used to take the router
+  // down at boot on a hand-edited file.
+  for (const b of cfg.backends || []) if (b && typeof b === "object") repairEmpty(b, "backends." + b.id);
   for (const [id, m] of Object.entries(cfg.models)) {
     repairEmpty(m, "models." + id);
     (m.deployments || []).forEach((d, i) => repairEmpty(d, "models." + id + ".deployments[" + i + "]"));
@@ -1578,7 +1667,7 @@ const collisionWarned = new Set(); // model id == preset id warns once per proce
 
 function normalizeConfig(cfg) {
   if (!cfg || typeof cfg !== "object") cfg = {};
-  const backendById = new Map((cfg.backends || []).map((b) => [b.id, b]));
+  const backendById = new Map((cfg.backends || []).filter((b) => b && typeof b === "object" && b.id).map((b) => [b.id, b]));
   if (!cfg.models || typeof cfg.models !== "object") cfg.models = {};
   if (!cfg.presets || typeof cfg.presets !== "object") cfg.presets = {};
 
@@ -1818,7 +1907,7 @@ function normalizeConfig(cfg) {
     for (const mid of flattenPresetModels(pid, new Set())) {
       const m = cfg.models[mid];
       if (!m) continue;
-      for (const pr of modelProviders(m)) {
+      for (const pr of modelDeployments(m, mid, backendById)) {
         if (seen.has(pr.backend)) continue;
         seen.add(pr.backend);
         members.push({ backend: pr.backend, weight: 1 });
@@ -1839,10 +1928,10 @@ function normalizeConfig(cfg) {
     }
   };
   warnModelInParams(cfg.params, "global");
-  for (const b of cfg.backends || []) warnModelInParams(b.params, `backend ${b.id}`);
+  for (const b of cfg.backends || []) if (b && typeof b === "object") warnModelInParams(b.params, `backend ${b.id}`);
   for (const [mid, m] of Object.entries(cfg.models)) {
     warnModelInParams(m.params, `model ${mid}`);
-    for (const pr of modelProviders(m)) warnModelInParams(pr.params, `provider ${mid}/${pr.backend}`);
+    for (const pr of modelDeployments(m, mid, backendById)) warnModelInParams(pr.params, `provider ${mid}/${pr.backend}`);
   }
   for (const [pid, p] of Object.entries(cfg.presets)) warnModelInParams(p.params, `preset ${pid}`);
   // dropParams union warnings: every dropped public/request key is a silent
@@ -1852,7 +1941,7 @@ function normalizeConfig(cfg) {
     for (const ref of p.models || []) {
       const m = cfg.models[ref.model];
       if (!m) continue;
-      for (const pr of modelProviders(m)) {
+      for (const pr of modelDeployments(m, ref.model, backendById)) {
         const b = backendById.get(pr.backend);
         if (!b) continue;
         const drop = new Set([...(b.dropParams || []), ...(pr.dropParams || [])]);
@@ -2028,17 +2117,25 @@ function candidates(cfg, requestedId, sessionKey, rng = Math.random) {
     orderedModels = [modelIds[primaryIdx], ...modelIds.filter((_, i) => i !== primaryIdx)];
   }
 
-  // Model-level provider ordering + flatten + backend dedup.
+  // Model-level deployment ordering + flatten + backend dedup. The shape is
+  // dispatched PER MODEL so a converted config (which is entirely `deployments`)
+  // is not forced through the legacy `providers`/`affinityPool` read, while an
+  // old-shape entry that never went through the bridge keeps working.
   const ordered = [];
   const seenBackends = new Set();
+  const backendById = new Map((cfg.backends || []).filter((b) => b && typeof b === "object" && b.id).map((b) => [b.id, b]));
   for (const mid of orderedModels) {
     const m = (cfg.models || {})[mid];
     if (!m) continue;
-    const providers = modelProviders(m);
+    const providers = modelDeployments(m, mid, backendById);
     if (providers.length === 0) continue;
-    const pool = Math.min(modelPool(m), providers.length);
-    const primaryIdx = hashStr(sessionKey) % pool;
-    const providerOrder = [providers[primaryIdx], ...providers.filter((_, i) => i !== primaryIdx)];
+    const providerOrder = Array.isArray(m.deployments)
+      ? orderDeployments(providers, sessionKey)
+      : (() => {
+          const pool = Math.min(modelPool(m), providers.length);
+          const primaryIdx = hashStr(sessionKey) % pool;
+          return [providers[primaryIdx], ...providers.filter((_, i) => i !== primaryIdx)];
+        })();
     for (const pr of providerOrder) {
       if (seenBackends.has(pr.backend)) continue;
       seenBackends.add(pr.backend);
@@ -2062,24 +2159,26 @@ function newError(status, body) {
 
 // ---- layered parameters ----------------------------------------------------
 
-// Merge request parameters across the six layers, highest priority last:
-// global < backend.params < provider.params < model.params < preset.params <
-// request body. `model` is RESERVED: config-layer model keys are ignored and
-// the forwarded `model` is ALWAYS provider.upstream. Dialect handling runs
+// Merge request parameters across the config layers, highest priority last:
+// global < backend.params < deployment.params < model.params < request body.
+// There is NO preset layer in v3: `preset` is still a parameter so existing
+// callers keep working, but its params are deliberately not read - a preset
+// selects an ordered model list and a deployment holds the per-provider
+// dialect. `model` is RESERVED: config-layer model keys are ignored and the
+// forwarded `model` is ALWAYS the deployment's upstream. Dialect handling runs
 // AFTER the merge, on the PUBLIC/request key space: dropParams (union of
-// backend + provider, legacy backend field still honored) deletes keys first,
-// then provider.paramMap renames the survivors, then the developer-role
+// backend + deployment, the legacy provider field still honored) deletes keys
+// first, then paramMap renames the survivors, then the developer-role
 // translation (backend field, special-cased). Pure: never mutates `body`.
-function buildPayload(body, cfg, preset, model, provider, backend) {
+function buildPayload(body, cfg, preset, model, deployment, backend) {
   const out = {};
   Object.assign(out, cfg.params || {}); // lowest layer
   Object.assign(out, backend.params || {});
-  Object.assign(out, provider.params || {});
+  Object.assign(out, deployment.params || {});
   Object.assign(out, model.params || {});
-  if (preset) Object.assign(out, preset.params || {});
   delete out.model; // reserved in config layers
   Object.assign(out, body); // request body wins
-  out.model = provider.upstream; // always
+  out.model = deployment.upstream; // always
   // An explicit thinking:disabled is authoritative for the reasoning group:
   // strip any config-default reasoning_effort so upstream never receives the
   // contradictory pair (disabled thinking + effort set). 2026-09-09 fix.
@@ -2087,9 +2186,9 @@ function buildPayload(body, cfg, preset, model, provider, backend) {
     delete out.reasoning_effort;
   }
   // Dialect: drop FIRST (public/request key space), then rename survivors.
-  const drop = new Set([...(backend.dropParams || []), ...(provider.dropParams || [])]);
+  const drop = new Set([...(backend.dropParams || []), ...(deployment.dropParams || [])]);
   for (const k of drop) delete out[k];
-  for (const [from, to] of Object.entries(provider.paramMap || {})) {
+  for (const [from, to] of Object.entries(deployment.paramMap || {})) {
     if (from in out) {
       out[to] = out[from];
       delete out[from];
@@ -2278,11 +2377,14 @@ async function handleChat(req, res, cfg, bodyText) {
   let lastTried = null;
   const captureDetail = bodyText.length <= DETAIL_MAX_BODY_BYTES; // size guard: skip huge payloads
   const detailT = Date.now();
+  // Built once per request rather than per attempt: the payload builder and the
+  // deployment read both need it, and `modelDeployments` re-resolves the entry.
+  const backendById = new Map((cfg.backends || []).filter((b) => b && typeof b === "object" && b.id).map((b) => [b.id, b]));
   for (const attempt of pool) {
     lastTried = attempt;
-    const backend = cfg.backends.find((b) => b.id === attempt.backend);
+    const backend = cfg.backends.find((b) => b && b.id === attempt.backend);
     const model = (cfg.models || {})[attempt.model];
-    const provider = (model && modelProviders(model).find((p) => p.backend === attempt.backend)) || null;
+    const provider = (model && modelDeployments(model, attempt.model, backendById).find((p) => p.backend === attempt.backend)) || null;
     if (!backend || !model || !provider) continue; // defensive: candidates built the attempt
     const payload = buildPayload(body, cfg, c.preset, model, provider, backend);
     // Per-model retry: on retryable failures, retry the SAME provider with
@@ -3287,7 +3389,7 @@ async function loadConfig() {
   // members. Routing and /api/config only ever see the normalized form.
   normalizeConfig(effective);
   // Reconcile: keep health registry keyed by backend id on reload.
-  const prevIds = new Set(cfg ? cfg.backends.map((b) => b.id) : []);
+  const prevIds = new Set(cfg ? (cfg.backends || []).filter((b) => b && typeof b === "object").map((b) => b.id) : []);
   cfg = effective;
   if (cfg.masterKeyEnv && !process.env[cfg.masterKeyEnv]) {
     console.error(
@@ -3314,7 +3416,7 @@ function server() {
 
     if (req.method === "GET" && url === "/health") {
       const now = Date.now();
-      const backends = cfg.backends.map((b) => {
+      const backends = usableBackends(cfg).map((b) => {
         const h = health.get(b.id) || {};
         const isCooling = h.state === "cooling" && h.nextAvailableAt > now;
         return {
@@ -3337,13 +3439,17 @@ function server() {
     }
 
     if (req.method === "GET" && url === p + "/models") {
-      // Preset ids first (config order), then model ids not already listed
-      // (config order). Colliding ids appear exactly once (the preset owns it).
+      // Exposed presets first (config order), then exposed models not already
+      // listed. `exposed: false` is a LISTING rule only: the entry stays
+      // routable, it is just not advertised. The legacy collision rule is gone
+      // with the v3 XOR constraint - a converted config has no collisions left.
       const ids = [];
       for (const id of Object.keys(cfg.presets || {})) {
+        if (cfg.presets[id] && cfg.presets[id].exposed === false) continue;
         if (!ids.includes(id)) ids.push(id);
       }
       for (const id of Object.keys(cfg.models || {})) {
+        if (cfg.models[id] && cfg.models[id].exposed === false) continue;
         if (!ids.includes(id)) ids.push(id);
       }
       const data = ids.map((id) => ({ id, object: "model", owned_by: "local-router" }));
@@ -3708,7 +3814,7 @@ function server() {
       }
       const id = body && body.id;
       const action = body && body.action;
-      if (!id || !cfg.backends.some((b) => b.id === id)) {
+      if (!id || !usableBackends(cfg).some((b) => b.id === id)) {
         res.writeHead(404, { "content-type": "application/json" });
         return res.end(JSON.stringify({ error: { message: `backend '${id}' not found`, type: "not_found" } }));
       }
@@ -3902,7 +4008,7 @@ async function main() {
     });
   }
   console.error(`[${new Date().toISOString()}] config: ${CONFIG_PATH}`);
-  console.error(`[${new Date().toISOString()}] backends: ${cfg.backends.map((b) => `${b.id}(${mask(process.env[b.apiKeyEnv])})`).join(", ")}`);
+  console.error(`[${new Date().toISOString()}] backends: ${(cfg.backends || []).filter((b) => b && typeof b === "object").map((b) => `${b.id}(${mask(process.env[b.apiKeyEnv])})`).join(", ")}`);
 }
 
 // Running the file as a script starts the server; importing it (test.mjs

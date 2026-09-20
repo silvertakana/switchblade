@@ -4531,6 +4531,377 @@ async function main() {
     );
   }
 
+  {
+    // v38a)-v38d) the v3 routing read. `candidates()` reads `deployments` with
+    // backupOnly ordering and sticky weighted primaries, and it must do so from
+    // the same code path the router actually runs for a converted config: a v3
+    // model is dispatched to the v3 branch PER ENTRY, while the legacy
+    // `providers`/`affinityPool` read stays reachable for the pre-bridge blocks
+    // that call `candidates()` directly with old-shape fixtures.
+    const cfg = {
+      backends: [{ id: "b1" }, { id: "b2" }, { id: "b3" }],
+      models: {
+        m1: {
+          deployments: [
+            { backend: "b1", upstream: "u" },
+            { backend: "b2", upstream: "u", weight: 2 },
+            { backend: "b3", upstream: "u", backupOnly: true },
+          ],
+          exposed: true,
+        },
+        hid: { deployments: [{ backend: "b1", upstream: "uh" }], exposed: false },
+      },
+      presets: {
+        tier: { strategy: "fallback", models: ["m1", "hid"] },
+        secret: { strategy: "fallback", models: ["m1"], exposed: false },
+      },
+    };
+    normalizeConfig(cfg);
+    const c = candidates(cfg, "m1", "sess-a");
+    // `sess-1` is the key that FINDS the base bug: its hash is 2 mod 3, and the
+    // bridge-era shim pooled all three deployments together, so it picked the
+    // `backupOnly` entry as the session's primary. A key the shim happens to
+    // order favourably (`sess-a`, 1 mod 3) cannot prove anything.
+    assert(
+      c.ordered[0].backend !== "b3",
+      "v38a) backupOnly never primary (" + JSON.stringify(c.ordered) + ")"
+    );
+    const sweep = [];
+    for (let i = 0; i < 300; i++) sweep.push(candidates(cfg, "m1", "sess-" + i).ordered.map((a) => a.backend));
+    assert(
+      sweep.every((o) => o[0] !== "b3"),
+      "v38a2) backupOnly is never the PRIMARY for any of 300 session keys (" + JSON.stringify(sweep.slice(0, 6)) + ")"
+    );
+    assert(
+      c.ordered[c.ordered.length - 1].backend === "b3",
+      "v38b) backupOnly tried last (" + JSON.stringify(c.ordered) + ")"
+    );
+    assert(
+      sweep.every((o) => o[o.length - 1] === "b3"),
+      "v38b2) backupOnly is LAST for every session key, not just the favourably-hashed ones (" + JSON.stringify(sweep.slice(0, 6)) + ")"
+    );
+    assert(
+      candidates(cfg, "m1", "sess-a").ordered.map((a) => a.backend).join(",") ===
+        candidates(cfg, "m1", "sess-a").ordered.map((a) => a.backend).join(","),
+      "v38c) two SEPARATE calls with the same session key pick the same primary, so a later call cannot drift"
+    );
+    // The fixture's weights are b1:1, b2:2 over a total of 3, so the pick is the
+    // session hash modulo 3: buckets 0 -> b1, 1 and 2 -> b2. Spread, ratio and
+    // the backupOnly exclusion are three properties the same 300-key sweep
+    // measures, and every one of them can fail.
+    const picks = { b1: 0, b2: 0, b3: 0 };
+    for (let i = 0; i < 300; i++) {
+      const first = candidates(cfg, "m1", "sess-" + i).ordered[0].backend;
+      picks[first] = (picks[first] || 0) + 1;
+    }
+    assert(
+      picks.b1 > 0 && picks.b2 > 0,
+      "v38d) both weighted primaries are picked at least once (" + JSON.stringify(picks) + ")"
+    );
+    assert(
+      picks.b3 === 0,
+      "v38d2) backupOnly never wins the pick for ANY session key (" + JSON.stringify(picks) + ")"
+    );
+    const b1Share = picks.b1 / 300;
+    assert(
+      b1Share >= 0.2 && b1Share <= 0.45 && picks.b2 === 300 - picks.b1,
+      "v38d3) the picks land in the fixture's 1:2 weight band (" + JSON.stringify(picks) + ")"
+    );
+    const t = candidates(cfg, "tier", "sess-a");
+    assert(t.models.includes("hid"), "v38d4) hidden model still routable through preset (" + JSON.stringify(t.models) + ")");
+  }
+
+  {
+    // v38e)-v38f) T3: exposure is a LISTING rule, not a routing rule. An
+    // `exposed: false` preset and model stay routable while being absent from
+    // /v1/models, and the list is exposed presets first, then exposed models
+    // (the order the plan sanctions; the legacy collision rule is gone).
+    const hid = mockBackend("hidB", {});
+    hid.port = await listen(hid.srv);
+    const hcfg = {
+      port: 0,
+      prefix: "/v1",
+      masterKeyEnv: null,
+      backends: [{ id: "hidB", baseURL: "http://127.0.0.1:" + hid.port, apiKeyEnv: "KEY_HID" }],
+      models: {
+        "shown-m": { deployments: [{ backend: "hidB", upstream: "u" }], exposed: true },
+        "hidden-m": { deployments: [{ backend: "hidB", upstream: "u" }], exposed: false },
+      },
+      presets: {
+        "shown-p": { strategy: "fallback", models: ["shown-m"], exposed: true },
+        "hidden-p": { strategy: "fallback", models: ["hidden-m"], exposed: false },
+      },
+    };
+    const { child: hidChild, base: hidBase, dir: hidDir } = await startRouterCfg(hcfg, "KEY_HID=k\n");
+    try {
+      const served = (await (await api(hidBase, "/v1/models", { method: "GET" })).json()).data.map((x) => x.id);
+      assert(
+        served.join(",") === "shown-p,shown-m",
+        "v38e) exposed:false model and preset ids are ABSENT from /v1/models (exposed presets first, then exposed models; got " +
+          JSON.stringify(served) + ")"
+      );
+      const rh = await api(hidBase, "/v1/chat/completions", { body: { model: "hidden-p", messages: [{ role: "user", content: "hi" }] } });
+      const rm = await api(hidBase, "/v1/chat/completions", { body: { model: "hidden-m", messages: [{ role: "user", content: "hi" }] } });
+      assert(
+        rh.status === 200 && rm.status === 200,
+        "v38f) an exposed:false preset and an exposed:false model stay routable (preset=" + rh.status + ", model=" + rm.status + ")"
+      );
+    } finally {
+      hidChild.kill();
+      hid.srv.close();
+      await rm(hidDir, { recursive: true, force: true });
+    }
+  }
+
+  {
+    // v38g)-v38h) R6: the READ path must not USE a deployment it cannot route.
+    // The bridge-era pass-through hands a structurally intact but semantically
+    // unusable provider into `deployments` so the VALIDATOR can name it; that is
+    // not licence for the router to build an attempt carrying `model: undefined`.
+    // Four unusable entries are mixed with two good ones: an unknown backend, a
+    // missing upstream on a backend with no default model, a non-object entry,
+    // and an entry with no backend at all. Each good deployment uses its OWN
+    // backend, because the attempt list dedups by backend id - a rule this block
+    // deliberately stays clear of so it measures the drop and nothing else.
+    const cfg = {
+      backends: [{ id: "b1" }, { id: "b2" }],
+      models: {
+        m1: {
+          deployments: [
+            { backend: "b1", upstream: "u1" },
+            { backend: "ghost", upstream: "u2" },
+            { backend: "b1" },
+            null,
+            { upstream: "u3" },
+            { backend: "b2", upstream: "u4", backupOnly: true },
+          ],
+        },
+      },
+      presets: { p1: { strategy: "fallback", models: ["m1"] } },
+    };
+    const seen = new Set();
+    const realWarn = console.warn;
+    console.warn = (msg) => seen.add(String(msg));
+    let c = null;
+    try {
+      normalizeConfig(cfg);
+      c = candidates(cfg, "m1", "sess-a");
+    } finally {
+      console.warn = realWarn;
+    }
+    assert(
+      c.ordered.map((a) => a.backend + "/" + a.upstream).join(",") === "b1/u1,b2/u4",
+      "v38g) only resolvable deployments reach the attempt list (" + JSON.stringify(c.ordered) + ")"
+    );
+    assert(
+      c.ordered.every((a) => a.backend && a.upstream),
+      "v38g2) no attempt carries an undefined backend or upstream (" + JSON.stringify(c.ordered) + ")"
+    );
+    // Each unusable entry is dropped for ITS OWN reason, and the v2 wording is
+    // pinned down to the entry so a silent drop cannot hide behind a count.
+    const expectWarn = [
+      "model 'm1': entry at deployments[1] references unknown backend 'ghost', dropped",
+      "model 'm1': entry at deployments[2] (backend 'b1') has no resolvable upstream, dropped",
+      "model 'm1': entry at deployments[3] is not an object, dropped",
+      "model 'm1': entry at deployments[4] names no backend, dropped",
+    ];
+    assert(
+      [...seen].filter((m) => m.includes("model 'm1'")).length === 4 && expectWarn.every((w) => [...seen].some((m) => m.includes(w))),
+      "v38h) each unusable deployment is dropped with its OWN v2-wording warning naming the model and the entry (" + JSON.stringify(expectWarn) + " vs " + JSON.stringify([...seen]) + ")"
+    );
+    let sessB = null;
+    const realWarn2 = console.warn;
+    console.warn = () => {};
+    try {
+      sessB = candidates(cfg, "m1", "sess-b").ordered.map((a) => a.backend + "/" + a.upstream).join(",");
+    } finally {
+      console.warn = realWarn2;
+    }
+    assert(
+      sessB === "b1/u1,b2/u4",
+      "v38h3) the drop is not session-dependent (" + sessB + ")"
+    );
+  }
+
+  {
+    // v38i)-v38j) R3: a MISSPELLED key in a v3 model or deployment is the hazard
+    // this validator branch exists to catch - `backuponly: true` silently makes a
+    // deployment the operator intended as a backup into a PRIMARY that receives
+    // live traffic. The backend layer already allowlists its keys; the same
+    // pattern now covers models and deployments, as a WARNING (never an error).
+    const v3cfg = (model) => ({
+      port: 0,
+      prefix: "/v1",
+      masterKeyEnv: null,
+      backends: [{ id: "b1", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_R3" }],
+      models: { m1: model },
+      presets: { p1: { strategy: "fallback", models: ["m1"], exposed: true } },
+    });
+    // The validator also reports an unset apiKeyEnv as an error; these fixtures
+    // are about the KEY axis, so the env name is provided and the assertions
+    // name the exact paths they care about instead of a bare error count.
+    const prevKeyR3 = process.env.KEY_R3;
+    process.env.KEY_R3 = "k";
+    let misspelled = null;
+    let modelTypo = null;
+    let clean = null;
+    try {
+      misspelled = validateConfig(
+        v3cfg({ deployments: [{ backend: "b1", upstream: "u", backuponly: true, wieght: 2 }] }),
+        null,
+        {}
+      );
+      modelTypo = validateConfig(v3cfg({ deployments: [{ backend: "b1", upstream: "u" }], expossed: false }), null, {});
+      // The allowlist must be complete for the shape the converter PRODUCES and
+      // for the fields the live config really carries, or every boot logs noise.
+      clean = validateConfig(
+        v3cfg({
+          deployments: [
+            { backend: "b1", upstream: "u", weight: 2, params: { temperature: 1 }, dropParams: ["logit_bias"], paramMap: { a: "b" } },
+            { backend: "b1", upstream: "u2", backupOnly: true },
+          ],
+          params: { temperature: 0.5 },
+          retry: { maxRetries: 1 },
+          meta: { label: "l", contextWindow: 1000, pricing: { inputPerM: 1 } },
+          exposed: true,
+        }),
+        null,
+        {}
+      );
+    } finally {
+      if (prevKeyR3 === undefined) delete process.env.KEY_R3;
+      else process.env.KEY_R3 = prevKeyR3;
+    }
+    assert(
+      misspelled.warnings.some((w) => w.path === "models.m1.deployments[0]" && /backuponly/.test(w.message)) &&
+        misspelled.warnings.some((w) => w.path === "models.m1.deployments[0]" && /wieght/.test(w.message)),
+      "v38i) an unknown v3 DEPLOYMENT key warns with its real path (" + JSON.stringify(misspelled.warnings) + ")"
+    );
+    assert(
+      misspelled.errors.filter((e) => e.path.startsWith("models.m1")).length === 0,
+      "v38i2) an unknown key is a WARNING, never an error (" + JSON.stringify(misspelled.errors) + ")"
+    );
+    assert(
+      modelTypo.warnings.some((w) => w.path === "models.m1" && /expossed/.test(w.message)) &&
+        modelTypo.errors.filter((e) => e.path.startsWith("models.m1")).length === 0,
+      "v38j) an unknown v3 MODEL key warns at the model path and is not an error (" + JSON.stringify(modelTypo.warnings) + ")"
+    );
+    assert(
+      clean.warnings.length === 0,
+      "v38j2) every key the converter produces is known: no spurious warning (" + JSON.stringify(clean.warnings) + ")"
+    );
+    // The warning must reach the OPERATOR at boot, not only the save verdict -
+    // that is the whole point of closing the misspelled-key hazard. The child is
+    // spawned inline so its stderr is captured and assertable.
+    const typoDir = await mkdtemp(join(tmpdir(), "lmr-v38j-"));
+    const typoCfgPath = join(typoDir, "config.json");
+    await writeFile(typoCfgPath, JSON.stringify(v3cfg({ deployments: [{ backend: "b1", upstream: "u", backuponly: true }] }), null, 2));
+    await writeFile(join(typoDir, ".env"), "KEY_R3=k\n");
+    const typoChild = spawn(process.execPath, ["server.mjs"], {
+      cwd: join(import.meta.dirname),
+      env: { ...process.env, ROUTER_CONFIG: typoCfgPath, ROUTER_ENV: join(typoDir, ".env") },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let typoBase = null;
+    let typoErr = "";
+    try {
+      await new Promise((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error("v38j4 child did not start (stderr tail: " + JSON.stringify(typoErr.slice(-400)) + ")")), 8000);
+        typoChild.stderr.on("data", (d) => {
+          const s = d.toString();
+          typoErr += s;
+          const m = /listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(s);
+          if (m) { typoBase = "http://127.0.0.1:" + parseInt(m[1], 10); clearTimeout(t); resolve(); }
+        });
+      });
+      const live = await (await api(typoBase, "/api/config", { method: "GET" })).json();
+      assert(
+        !!live && !!live.models && !!live.models.m1,
+        "v38j3) the router boots and serves a config carrying the misspelling (sanity)"
+      );
+      assert(
+        /backuponly/.test(typoErr) && /models\.m1/.test(typoErr),
+        "v38j4) the misspelling reaches the OPERATOR at boot, naming the model path (stderr tail: " + JSON.stringify(typoErr.slice(-400)) + ")"
+      );
+    } finally {
+      typoChild.kill();
+      await rm(typoDir, { recursive: true, force: true });
+    }
+  }
+
+  {
+    // v38k) R5: `backends: [null]` is a hand-edited config that used to take the
+    // router DOWN at boot - an unguarded `.id` dereference in normalizeConfig's
+    // backendById map (base 197824a line 1522, and HEAD's converter sweep wrapped
+    // by loadConfig as "config conversion failed"). A non-object entry must pass
+    // through untouched so the validator names `backends.0` and boot stays
+    // tolerant: a warning, not death.
+    const r5cfg = {
+      port: 0,
+      prefix: "/v1",
+      masterKeyEnv: null,
+      backends: [null, { id: "r5b", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_R5" }],
+      models: { r5m: { deployments: [{ backend: "r5b", upstream: "u" }], exposed: true } },
+      presets: { r5p: { strategy: "fallback", models: ["r5m"], exposed: true } },
+    };
+    // The warning path is asserted the same way: the point of the fix is BOTH
+    // that boot survives AND that the operator is told which entry is junk. The
+    // child is spawned inline so its stderr stays in scope for the assertion,
+    // which runs BEFORE the finally-block cleanup so it can still read it.
+    const r5Dir = await mkdtemp(join(tmpdir(), "lmr-v38k-"));
+    const r5CfgPath = join(r5Dir, "config.json");
+    await writeFile(r5CfgPath, JSON.stringify(r5cfg, null, 2));
+    await writeFile(join(r5Dir, ".env"), "KEY_R5=k\n");
+    const r5Child = spawn(process.execPath, ["server.mjs"], {
+      cwd: join(import.meta.dirname),
+      env: { ...process.env, ROUTER_CONFIG: r5CfgPath, ROUTER_ENV: join(r5Dir, ".env") },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let r5Base = null;
+    let r5Err = "";
+    try {
+      await new Promise((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error("v38k child did not start (stderr tail: " + JSON.stringify(r5Err.slice(-400)) + ")")), 8000);
+        r5Child.stderr.on("data", (d) => {
+          const s = d.toString();
+          r5Err += s;
+          const m = /listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(s);
+          if (m) { r5Base = "http://127.0.0.1:" + parseInt(m[1], 10); clearTimeout(t); resolve(); }
+        });
+      });
+      // The child prints its listen banner from the listen callback, so it is
+      // accepting connections already; a first-request ECONNRESET here would be
+      // a real defect, and the failure is carried into the assertion rather than
+      // crashing the whole run.
+      const r5Get = async (path) => {
+        let lastErr = null;
+        for (let i = 0; i < 5; i++) {
+          try {
+            return await (await api(r5Base, path, { method: "GET" })).json();
+          } catch (e) {
+            lastErr = e;
+            await new Promise((r) => setTimeout(r, 100));
+          }
+        }
+        throw lastErr;
+      };
+      const health = await r5Get("/health");
+      const r5served = (await r5Get("/v1/models")).data.map((x) => x.id);
+      assert(
+        health.ok === true && r5served.join(",") === "r5p,r5m",
+        "v38k) a config carrying backends:[null] BOOTS and serves instead of dying (health=" +
+          JSON.stringify(health.ok) + ", served=" + JSON.stringify(r5served) + ")"
+      );
+      assert(
+        /backends\[0\][\s\S]*must be an object/.test(r5Err),
+        "v38k2) the junk backend entry is NAMED at boot with its validator path (stderr tail: " + JSON.stringify(r5Err.slice(-400)) + ")"
+      );
+    } finally {
+      r5Child.kill();
+      await rm(r5Dir, { recursive: true, force: true });
+    }
+  }
+
   // ---- config write path: single-file bind mount ----------------------------
   // The live homelab config is a single-file bind mount. Linux refuses to
   // rename() onto a mount point (EBUSY), and even a swap that succeeded would
