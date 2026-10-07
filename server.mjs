@@ -3226,7 +3226,12 @@ function makeUsageCollector() {
       const slot = ch0 ? ch0.delta || ch0.message || null : null;
       if (slot) {
         if (slot.content != null && String(slot.content).length > 0) hasContent = true;
-        if (slot.reasoning_content != null || slot.reasoning != null) hasReasoning = true;
+        // Present-but-empty is NOT output: a provider emits reasoning_content:"" on a
+        // truncated or filtered reply, and counting that as usable reports success, marks
+        // the route healthy and pins it for a session it served nothing (review finding 9).
+        // hasUsableContentNonStream already applies exactly this rule.
+        const rslot = slot.reasoning_content != null ? slot.reasoning_content : slot.reasoning;
+        if (rslot != null && String(rslot).trim() !== "") hasReasoning = true;
         if (Array.isArray(slot.tool_calls) && slot.tool_calls.length > 0) hasToolCalls = true;
       }
       if (obj && obj.usage) {
@@ -3619,7 +3624,8 @@ async function relay(res, upstreamRes, stream, backendId, started, callId, idleT
             const firstMsg = parsed.choices[0].message || parsed.choices[0].delta || {};
             preview = cap(firstMsg.content != null ? firstMsg.content : (firstMsg.text != null ? firstMsg.text : null));
             hasContent = firstMsg.content != null && String(firstMsg.content).length > 0;
-            hasReasoning = firstMsg.reasoning_content != null || firstMsg.reasoning != null;
+            const rmsg = firstMsg.reasoning_content != null ? firstMsg.reasoning_content : firstMsg.reasoning;
+            hasReasoning = rmsg != null && String(rmsg).trim() !== "";
             hasToolCalls = Array.isArray(firstMsg.tool_calls) && firstMsg.tool_calls.length > 0;
           }
         } catch {

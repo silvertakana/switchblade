@@ -3394,6 +3394,80 @@ async function main() {
     }
   }
 
+  // zUnusable) A 200 whose body carries no output at all -- not even a non-empty reasoning
+  //   string -- must not count as usable. It fails over instead of reporting success on a
+  //   provider that served nothing (review finding 9).
+  {
+    let uzHits = 0;
+    const uz = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      uzHits++;
+      if (Buffer.concat(chunks).toString("utf8").includes('"stream":true')) {
+        // A real SSE reply whose only delta carries an EMPTY reasoning string: without a
+        // genuine event stream the collector's delta parser never runs at all, which is
+        // how an earlier version of this test passed against the unfixed code.
+        res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+        res.write("data: " + JSON.stringify({ id: "m", choices: [{ index: 0, delta: { role: "assistant", reasoning_content: "" } }] }) + "\n\n");
+        res.write("data: [DONE]\n\n");
+        res.end();
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: "m", object: "chat.completion", choices: [{ index: 0, message: { role: "assistant", content: "", reasoning_content: "" }, finish_reason: "stop" }], usage: { prompt_tokens: 5, completion_tokens: 0 } }));
+    });
+    const portUz = await listen(uz);
+    const okb = mockBackend("ok", {});
+    okb.port = await listen(okb.srv);
+    const cfgUn = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "uz", baseURL: `http://${HOST}:${portUz}`, apiKeyEnv: "KEY_UZ", timeoutMs: 20000 },
+        { id: "ok", baseURL: `http://${HOST}:${okb.port}`, apiKeyEnv: "KEY_OK" },
+      ],
+      models: { mE: { providers: [{ backend: "uz", upstream: "u1" }, { backend: "ok", upstream: "u1" }], affinityPool: 1 } },
+      presets: { pE: { strategy: "failover", models: ["mE"] } },
+      backoff: { ...BO, serverBaseMs: 30000, serverMaxMs: 300000 },
+    };
+    const hUn = await startRouterCfg(cfgUn, "KEY_UZ=k\nKEY_OK=k\n");
+    try {
+      const res = await api(hUn.base, "/v1/chat/completions", { body: { model: "pE", messages: [{ role: "user", content: "hi" }] } });
+      await res.text();
+      const callId = res.headers.get("x-router-call");
+      const entries = async () => ((await (await api(hUn.base, "/api/history?limit=5", { method: "GET" })).json()).entries || []);
+      const entry = (await entries()).find((e) => e.callId === callId);
+      const sum0 = entry && (entry.attemptsSummary || [])[0];
+      // The response is already on the wire by then, so it is charged rather than
+      // replayed (see the settlement comment in server.mjs): what matters is that it is
+      // never a success, never a pin, and that the route pays for it.
+      assert(
+        uzHits === 1 && entry && entry.backend === "uz" && entry.errorKind === "server" && entry.relayError === "upstream returned no usable output" && sum0 && sum0.decision === "unusable" && sum0.cooldownScope === "route",
+        "zUnusable1) an empty 200 is charged as unusable, never as a success (uzHits=" + uzHits + ", backend=" + (entry && entry.backend) + ", kind=" + (entry && entry.errorKind) + ", decision=" + (sum0 && sum0.decision) + ")"
+      );
+      const res2 = await api(hUn.base, "/v1/chat/completions", { body: { model: "pE", messages: [{ role: "user", content: "hi" }] } });
+      const txt2 = await res2.text();
+      const entry2 = (await entries()).find((e) => e.callId === res2.headers.get("x-router-call"));
+      assert(
+        txt2.includes("mock:ok") && entry2 && entry2.backend === "ok" && uzHits === 1,
+        "zUnusable2) the route an empty 200 cooled is not chosen for the next request (backend=" + (entry2 && entry2.backend) + ", uzHits=" + uzHits + ")"
+      );
+      // The same rule on the STREAMING collector, whose flags come from the delta slots
+      // rather than from a final message. Uncools first (which also re-checks that uncool
+      // clears the route) so the empty provider is reachable again.
+      await api(hUn.base, "/admin/backend", { body: { id: "uz", action: "uncool" } });
+      const sres = await api(hUn.base, "/v1/chat/completions", { body: { model: "pE", messages: [{ role: "user", content: "hi" }], stream: true } });
+      await sres.text();
+      const sentry = (await entries()).find((e) => e.callId === sres.headers.get("x-router-call"));
+      assert(
+        sentry && sentry.stream === true && sentry.errorKind === "server" && sentry.relayError === "upstream returned no usable output" && ((sentry.attemptsSummary || [])[0] || {}).decision === "unusable",
+        "zUnusable3) an empty streaming delta is charged as unusable too (stream=" + (sentry && sentry.stream) + ", decision=" + (sentry && (sentry.attemptsSummary || [])[0] && sentry.attemptsSummary[0].decision) + ")"
+      );
+    } finally {
+      hUn.child.kill(); uz.close(); okb.srv.close();
+      await rm(hUn.dir, { recursive: true, force: true });
+    }
+  }
+
   // rUnit) Route-health helpers: the 30/60/120-second progression to the
   //   five-minute cap, computed from the failure streak. Pure functions, so the
   //   clock never has to advance to test them.
