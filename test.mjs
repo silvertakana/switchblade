@@ -10,6 +10,9 @@ import { spawn } from "node:child_process";
 // Unit-level imports: server.mjs only starts the server when run as a script,
 // so importing it here gives direct access to strategy selection for tests.
 import { candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost, writeConfigAtomic } from "./server.mjs";
+// Namespace import so a not-yet-implemented helper reads as undefined and fails
+// its own assertion, rather than crashing the whole file at load time.
+import * as SRV from "./server.mjs";
 
 const HOST = "127.0.0.1";
 let passed = 0;
@@ -442,7 +445,7 @@ async function main() {
         meta: { label: "DeepSeek V4 Flash", contextWindow: 128000, pricing: { inputPerM: 0.18, outputPerM: 0.87 } },
       },
     },
-    backoff: { rateLimitBaseMs: 50, rateLimitMaxMs: 200, serverBaseMs: 50, serverMaxMs: 200, authBaseMs: 50, authMaxMs: 200, weeklyDefaultMs: 1000 },
+    backoff: { rateLimitBaseMs: 50, rateLimitMaxMs: 200, serverBaseMs: 60000, serverMaxMs: 300000, authBaseMs: 50, authMaxMs: 200, weeklyDefaultMs: 1000 },
   };
   const { child: childF, base: baseF, dir: dirF } = await startRouterCfg(cfgF, "KEY_F1=test-key-f1\nKEY_F2=test-key-f2\n");
   try {
@@ -454,8 +457,16 @@ async function main() {
     );
     const fh = await (await api(baseF, "/health", { method: "GET" })).json();
     assert(
-      fh.backends.find((b) => b.id === "f1").state === "cooling" && fh.backends.find((b) => b.id === "f2").state === "healthy",
-      "s2) failover: f1 cooled after 500, f2 healthy"
+      fh.backends.find((b) => b.id === "f1").state === "healthy" && fh.backends.find((b) => b.id === "f2").state === "healthy",
+      "s2) a 500 cools f1's ROUTE, not the f1 account: neither account is blamed (f1=" + fh.backends.find((b) => b.id === "f1").state + ")"
+    );
+    // ...and that route really is out of the pool: the retry skips it entirely.
+    const f1HitsBefore = f1.hits.length;
+    const r2f = await api(baseF, "/v1/chat/completions", { body: { model: "deepseek-v4-flash", messages: [] } });
+    await r2f.text();
+    assert(
+      r2f.headers.get("x-router-backend") === "f2" && f1.hits.length === f1HitsBefore,
+      "s2b) the cooling route is not retried (backend=" + r2f.headers.get("x-router-backend") + ", f1Hits=" + f1.hits.length + ")"
     );
 
     // t) meta passthrough + normalization via /api/config (never key values).
@@ -499,7 +510,7 @@ async function main() {
       "main": { strategy: "affinity", members: ["u2", "u1"], affinityPool: 1 },
       "spare": { strategy: "affinity", members: ["u3"], affinityPool: 1 },
     },
-    backoff: { rateLimitBaseMs: 50, rateLimitMaxMs: 200, serverBaseMs: 50, serverMaxMs: 200, authBaseMs: 50, authMaxMs: 200, weeklyDefaultMs: 1000 },
+    backoff: { rateLimitBaseMs: 50, rateLimitMaxMs: 200, serverBaseMs: 50, serverMaxMs: 200, authBaseMs: 50, authMaxMs: 200, weeklyDefaultMs: 604800000 },
   };
   const { child: childU, base: baseU, dir: dirU } = await startRouterCfg(cfgU, "KEY_U1=test-key-u1\nKEY_U2=test-key-u2\nKEY_U3=test-key-u3\n");
   try {
@@ -516,14 +527,19 @@ async function main() {
     const u2H = uh.backends.find((b) => b.id === "u2");
     assert(u1H.state === "cooling" && u1H.manual === true, "u3) /health shows u1 cooling + manual");
     assert(u2H.state === "cooling" && u2H.manual === false, "u4) /health shows weekly-pinned u2 is cooling, NOT manual");
-    // Request now: both cooling; fallback excludes manual u1 -> tries u2 only.
+    // Request now: u1 manually cooled, u2 weekly pinned. With no eligible provider
+    // the request is refused outright - NOT forced at the pinned u2, whose failure
+    // is already known.
     const u1HitsBefore = u1.hits.length;
+    const u2HitsBefore = u2.hits.length;
     r = await api(baseU, "/v1/chat/completions", { body: { model: "main", messages: [] } });
+    await r.text();
     assert(
-      r.status === 503 && r.headers.get("x-router-backend") === "u2",
-      "u5) all-cooling request 503s via system-cooled u2 (status=" + r.status + ", header=" + r.headers.get("x-router-backend") + ")"
+      r.status === 503 && r.headers.get("x-router-backend") === "none" && !!r.headers.get("retry-after"),
+      "u5) an all-cooling pool admits nothing and advertises the recovery (status=" + r.status + ", header=" + r.headers.get("x-router-backend") + ", retryAfter=" + r.headers.get("retry-after") + ")"
     );
     assert(u1.hits.length === u1HitsBefore, "u6) manual-cooled u1 never received the request (hits=" + u1.hits.length + ")");
+    assert(u2.hits.length === u2HitsBefore, "u6b) weekly-pinned u2 is not forcibly retried (hits=" + u2.hits.length + ")");
     // A success on another backend does NOT clear the manual cool.
     r = await api(baseU, "/v1/chat/completions", { body: { model: "spare", messages: [] } });
     ub = await r.json();
@@ -616,11 +632,18 @@ async function main() {
     // First request: w1 cooling -> healthy = [w2] -> w2 429 -> weekly pin.
     r = await api(baseW, "/v1/chat/completions", { body: { model: "main", messages: [] } });
     assert(r.status === 503 && r.headers.get("x-router-backend") === "w2", "w1) w2 weekly-pinned via system-cooled-only pool (status=" + r.status + ")");
-    // Both cooling now: fallback must exclude manual w1 and try weekly w2.
+    // Both cooling now: nothing is eligible, so neither the manual w1 NOR the
+    // weekly-pinned w2 is touched, and the 503 carries w2's recovery time.
     const w1HitsBefore = w1.hits.length;
+    const w2HitsBefore = w2.hits.length;
     r = await api(baseW, "/v1/chat/completions", { body: { model: "main", messages: [] } });
-    assert(r.status === 503 && r.headers.get("x-router-backend") === "w2", "w2) fallback tries weekly w2, not manual w1 (status=" + r.status + ")");
+    await r.text();
+    assert(
+      r.status === 503 && r.headers.get("x-router-backend") === "none" && !!r.headers.get("retry-after"),
+      "w2) an all-cooling pool touches neither provider (status=" + r.status + ", header=" + r.headers.get("x-router-backend") + ", retryAfter=" + r.headers.get("retry-after") + ")"
+    );
     assert(w1.hits.length === w1HitsBefore, "w3) manual-cooled w1 never received a request (hits=" + w1.hits.length + ")");
+    assert(w2.hits.length === w2HitsBefore, "w3b) weekly-pinned w2 is not forcibly retried (hits=" + w2.hits.length + ")");
     const wh = await (await api(baseW, "/health", { method: "GET" })).json();
     assert(
       wh.backends.find((b) => b.id === "w1").manual === true && wh.backends.find((b) => b.id === "w2").manual === false,
@@ -1839,7 +1862,8 @@ async function main() {
   //      request fails over to the next healthy backend; the slow backend gets
   //      marked failed (fails incremented / cooling after repeated timeouts).
   {
-    const hangSrv = http.createServer(() => { /* never respond */ });
+    let hangRequests = 0;
+    const hangSrv = http.createServer(() => { hangRequests++; /* never respond */ });
     const okSrv = mockBackend("z17ok", {});
     const ports17 = await Promise.all([listen(hangSrv), listen(okSrv.srv)]);
     okSrv.port = ports17[1];
@@ -1853,22 +1877,34 @@ async function main() {
         "m17": { providers: [{ backend: "z17hang", upstream: "u17" }, { backend: "z17ok", upstream: "u17" }], affinityPool: 1 },
       },
       presets: { "p17": { strategy: "affinity", models: ["m17"] } },
-      backoff: BO,
+      // A long server backoff keeps the timed-out route cooling for both probes.
+      backoff: { ...BO, serverBaseMs: 60000, serverMaxMs: 300000 },
     };
     const { child: childZ17, base: baseZ17, dir: dirZ17 } = await startRouterCfg(cfgZ17, "KEY_Z17HANG=k\nKEY_Z17OK=k\n");
     try {
-      const rr = await fetch(baseZ17 + "/v1/chat/completions", {
-        method: "POST",
-        headers: { "content-type": "application/json", authorization: "Bearer local-master" },
-        body: JSON.stringify({ model: "p17", messages: [] }),
-        signal: AbortSignal.timeout(8000),
-      });
-      const backend = rr.headers.get("x-router-backend");
-      const health = await (await api(baseZ17, "/health", { method: "GET" })).json();
-      const hang = health.backends.find((b) => b.id === "z17hang");
+      const once = async () => {
+        const rr = await fetch(baseZ17 + "/v1/chat/completions", {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: "Bearer local-master" },
+          body: JSON.stringify({ model: "p17", messages: [] }),
+          signal: AbortSignal.timeout(8000),
+        });
+        const backend = rr.headers.get("x-router-backend");
+        await rr.text();
+        return backend;
+      };
+      const backend = await once();
+      const hang = (await (await api(baseZ17, "/health", { method: "GET" })).json()).backends.find((b) => b.id === "z17hang");
       assert(
-        backend === "z17ok" && hang && hang.fails >= 1,
-        "z17) timeout failover: hang backend times out (80ms), request served by next backend (backend=" + backend + ", hangFails=" + (hang ? hang.fails : "?") + ")"
+        backend === "z17ok" && hang && hang.state === "healthy",
+        "z17) a timeout is charged to z17hang's ROUTE, not its account (backend=" + backend + ", hangState=" + (hang ? hang.state : "?") + ")"
+      );
+      // The cooling route is skipped, so the hanging upstream is not contacted again.
+      const hangRequestsAfterFirst = hangRequests;
+      const backend2 = await once();
+      assert(
+        backend2 === "z17ok" && hangRequests === hangRequestsAfterFirst,
+        "z17b) the timed-out route is not retried while cooling (backend2=" + backend2 + ", hangRequests=" + hangRequests + ")"
       );
     } finally {
       childZ17.kill();
@@ -2319,6 +2355,363 @@ async function main() {
     } finally {
       h3.child.kill(); srvA.close(); srvB.close(); o3Ntfy.srv.close();
       await rm(h3.dir, { recursive: true, force: true });
+    }
+  }
+
+  // zScope1) Cooldown is scoped to the PHYSICAL ROUTE, not the whole account. One
+  //   model's upstream failing must not disable a DIFFERENT upstream served by the
+  //   same backend: two logical models on one account are independent routes.
+  {
+    const hits = [];
+    const srv = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      hits.push(parsed.model);
+      if (parsed.model === "u-bad") {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "upstream exploded" } }));
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: "m", object: "chat.completion", choices: [{ message: { role: "assistant", content: "ok:" + parsed.model } }] }));
+    });
+    const port = await listen(srv);
+    const cfgSc1 = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "ra", baseURL: `http://${HOST}:${port}`, apiKeyEnv: "KEY_RA" }],
+      models: {
+        mGood: { providers: [{ backend: "ra", upstream: "u-good" }], affinityPool: 1 },
+        mBad: { providers: [{ backend: "ra", upstream: "u-bad" }], affinityPool: 1 },
+      },
+      presets: { pGood: { strategy: "affinity", models: ["mGood"] }, pBad: { strategy: "affinity", models: ["mBad"] } },
+      // A long server cooldown keeps the failure active for the whole test.
+      backoff: { rateLimitBaseMs: 50, rateLimitMaxMs: 200, serverBaseMs: 60000, serverMaxMs: 300000, authBaseMs: 50, authMaxMs: 200, weeklyDefaultMs: 1000 },
+    };
+    const hSc1 = await startRouterCfg(cfgSc1, "KEY_RA=k\n");
+    try {
+      await (await api(hSc1.base, "/v1/chat/completions", { body: { model: "pBad", messages: [] } })).text();
+      const good = await api(hSc1.base, "/v1/chat/completions", { body: { model: "pGood", messages: [] } });
+      const goodBody = await good.json();
+      assert(
+        good.status === 200 && goodBody.choices && goodBody.choices[0].message.content === "ok:u-good",
+        "zScope1) a failing route does not disable a sibling route on the same backend (status=" + good.status + ", hits=" + JSON.stringify(hits) + ")"
+      );
+    } finally {
+      hSc1.child.kill(); srv.close();
+      await rm(hSc1.dir, { recursive: true, force: true });
+    }
+  }
+
+  // zScope2) The inverse guarantee, so route scoping cannot over-isolate: two
+  //   logical models resolving to the SAME physical route (backend + upstream)
+  //   share one cooldown.
+  {
+    const hits = [];
+    const srv = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      hits.push(JSON.parse(Buffer.concat(chunks).toString("utf8")).model);
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "always down" } }));
+    });
+    const port = await listen(srv);
+    const cfgSc2 = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "rb", baseURL: `http://${HOST}:${port}`, apiKeyEnv: "KEY_RB" }],
+      models: {
+        aliasA: { providers: [{ backend: "rb", upstream: "u-shared" }], affinityPool: 1 },
+        aliasB: { providers: [{ backend: "rb", upstream: "u-shared" }], affinityPool: 1 },
+      },
+      presets: { pAliasA: { strategy: "affinity", models: ["aliasA"] }, pAliasB: { strategy: "affinity", models: ["aliasB"] } },
+      backoff: { rateLimitBaseMs: 50, rateLimitMaxMs: 200, serverBaseMs: 60000, serverMaxMs: 300000, authBaseMs: 50, authMaxMs: 200, weeklyDefaultMs: 1000 },
+    };
+    const hSc2 = await startRouterCfg(cfgSc2, "KEY_RB=k\n");
+    try {
+      await (await api(hSc2.base, "/v1/chat/completions", { body: { model: "pAliasA", messages: [] } })).text();
+      const second = await api(hSc2.base, "/v1/chat/completions", { body: { model: "pAliasB", messages: [] } });
+      const sBody = await second.text();
+      assert(
+        hits.length === 1 && second.status === 503,
+        "zScope2) two logical models on the same physical route share one cooldown (hits=" + hits.length + ", status=" + second.status + ", body=" + sBody.slice(0, 80) + ")"
+      );
+    } finally {
+      hSc2.child.kill(); srv.close();
+      await rm(hSc2.dir, { recursive: true, force: true });
+    }
+  }
+
+  // zScope3) Strict eligibility: when every candidate is cooling the router must NOT
+  //   force an attempt at one anyway (the old all-cooling fallback sent the request
+  //   to a known-broken provider). It admits nothing, reports backend "none", and
+  //   tells the caller when to come back.
+  {
+    let aHits = 0;
+    let bHits = 0;
+    const mkDown = (bump) => http.createServer((req, res) => { bump(); res.writeHead(500, { "content-type": "application/json" }); res.end(JSON.stringify({ error: { message: "down" } })); });
+    const srvA = mkDown(() => aHits++);
+    const srvB = mkDown(() => bHits++);
+    const portA = await listen(srvA);
+    const portB = await listen(srvB);
+    const cfgSc3 = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "sa", baseURL: `http://${HOST}:${portA}`, apiKeyEnv: "KEY_SA" },
+        { id: "sb", baseURL: `http://${HOST}:${portB}`, apiKeyEnv: "KEY_SB" },
+      ],
+      models: { mBoth: { providers: [{ backend: "sa", upstream: "u1" }, { backend: "sb", upstream: "u1" }], affinityPool: 1 } },
+      presets: { pBoth: { strategy: "affinity", models: ["mBoth"] } },
+      backoff: { rateLimitBaseMs: 50, rateLimitMaxMs: 200, serverBaseMs: 60000, serverMaxMs: 300000, authBaseMs: 50, authMaxMs: 200, weeklyDefaultMs: 1000 },
+    };
+    const hSc3 = await startRouterCfg(cfgSc3, "KEY_SA=k\nKEY_SB=k\n");
+    try {
+      await (await api(hSc3.base, "/v1/chat/completions", { body: { model: "pBoth", messages: [] } })).text();
+      const firstHits = aHits + "/" + bHits;
+      const second = await api(hSc3.base, "/v1/chat/completions", { body: { model: "pBoth", messages: [] } });
+      const retryAfter = second.headers.get("retry-after");
+      const backendHeader = second.headers.get("x-router-backend");
+      assert(
+        second.status === 503 && aHits === 1 && bHits === 1 && backendHeader === "none" && !!retryAfter,
+        "zScope3) no attempt is forced at a cooled provider (firstHits=" + firstHits + ", after=" + aHits + "/" + bHits + ", status=" + second.status + ", backend=" + backendHeader + ", retryAfter=" + retryAfter + ")"
+      );
+    } finally {
+      hSc3.child.kill(); srvA.close(); srvB.close();
+      await rm(hSc3.dir, { recursive: true, force: true });
+    }
+  }
+
+  // zScope4) An opaque rejection excludes that route for the SESSION that saw it, not
+  //   for every client of the account: a second session must still be free to use
+  //   the provider that refused the first one.
+  {
+    let aHits = 0;
+    const srvA = http.createServer((req, res) => { aHits++; res.writeHead(400, { "content-type": "application/json" }); res.end(); });
+    const srvB = mockBackend("ob", {});
+    const portA = await listen(srvA);
+    srvB.port = await listen(srvB.srv);
+    const cfgSc4 = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "oa", baseURL: `http://${HOST}:${portA}`, apiKeyEnv: "KEY_OA" },
+        { id: "ob", baseURL: `http://${HOST}:${srvB.port}`, apiKeyEnv: "KEY_OB" },
+      ],
+      models: { mS: { providers: [{ backend: "oa", upstream: "u1" }, { backend: "ob", upstream: "u1b" }], affinityPool: 1 } },
+      presets: { pS: { strategy: "affinity", models: ["mS"] } },
+      backoff: BO,
+    };
+    const hSc4 = await startRouterCfg(cfgSc4, "KEY_OA=k\nKEY_OB=k\n");
+    try {
+      const s1 = { "x-session-affinity": "scope-sess-1" };
+      await (await api(hSc4.base, "/v1/chat/completions", { body: { model: "pS", messages: [] }, headers: s1 })).text();
+      const afterFirst = aHits;
+      await (await api(hSc4.base, "/v1/chat/completions", { body: { model: "pS", messages: [] }, headers: s1 })).text();
+      const afterSecond = aHits;
+      const other = await api(hSc4.base, "/v1/chat/completions", { body: { model: "pS", messages: [] }, headers: { "x-session-affinity": "scope-sess-2" } });
+      await other.text();
+      assert(
+        afterFirst === 1 && afterSecond === 1 && aHits === 2,
+        "zScope4) an opaque rejection is excluded for that session only (first=" + afterFirst + ", sameSessionAgain=" + afterSecond + ", otherSession=" + aHits + ")"
+      );
+    } finally {
+      hSc4.child.kill(); srvA.close(); srvB.srv.close();
+      await rm(hSc4.dir, { recursive: true, force: true });
+    }
+  }
+
+  // zProbe1) Exactly one request may probe a recovering route. Once the cooldown
+  //   lapses, the first request takes the probe and hangs on the upstream; a second
+  //   request arriving while that probe is still open must NOT pile onto the same
+  //   route - it fails over instead.
+  {
+    let paHits = 0;
+    const pa = http.createServer(async (req, res) => {
+      for await (const c of req) { /* drain */ }
+      paHits++;
+      // Deliberately slow, so a rival request arrives while the probe is open.
+      setTimeout(() => {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "probe failed" } }));
+      }, 500);
+    });
+    const pb = mockBackend("pb", {});
+    const portPa = await listen(pa);
+    pb.port = await listen(pb.srv);
+    const cfgPr = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "pa", baseURL: `http://${HOST}:${portPa}`, apiKeyEnv: "KEY_PA" },
+        { id: "pb", baseURL: `http://${HOST}:${pb.port}`, apiKeyEnv: "KEY_PB" },
+      ],
+      models: { mPr: { providers: [{ backend: "pa", upstream: "u1" }, { backend: "pb", upstream: "u1" }], affinityPool: 1 } },
+      presets: { pPr: { strategy: "affinity", models: ["mPr"] } },
+      backoff: { ...BO, serverBaseMs: 120, serverMaxMs: 300 },
+    };
+    const hPr = await startRouterCfg(cfgPr, "KEY_PA=k\nKEY_PB=k\n");
+    try {
+      await (await api(hPr.base, "/v1/chat/completions", { body: { model: "pPr", messages: [] } })).text();
+      assert(paHits === 1 && pb.hits.length === 1, "zProbe1a) the first failure cools the route and fails over (paHits=" + paHits + ", pbHits=" + pb.hits.length + ")");
+      await new Promise((r) => setTimeout(r, 200)); // let the route cooldown lapse
+      const openProbe = api(hPr.base, "/v1/chat/completions", { body: { model: "pPr", messages: [] } });
+      await new Promise((r) => setTimeout(r, 80)); // let it claim the probe
+      const probeHits = paHits;
+      const rival = await api(hPr.base, "/v1/chat/completions", { body: { model: "pPr", messages: [] } });
+      const rivalBody = await rival.json();
+      assert(
+        probeHits === 2 && rival.status === 200 && /^mock:pb/.test(rivalBody.choices[0].message.content) && paHits === 2,
+        "zProbe1b) a rival request does not join an open probe (probeHits=" + probeHits + ", status=" + rival.status + ", paHits=" + paHits + ")"
+      );
+      await (await openProbe).text(); // the probe settles (its 500 cools the route again)
+      assert(paHits === 2, "zProbe1c) the recovering route saw exactly one probe (paHits=" + paHits + ")");
+    } finally {
+      hPr.child.kill(); pa.close(); pb.srv.close();
+      await rm(hPr.dir, { recursive: true, force: true });
+    }
+  }
+
+  // zEsc1) One failing route is a route problem. Two DIFFERENT routes of the same
+  //   account failing inside a minute is an account-level outage. Counterexample: a
+  //   sibling route succeeding must NOT escalate.
+  {
+    const srvEsc = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      const model = JSON.parse(Buffer.concat(chunks).toString("utf8")).model;
+      if (model === "good-upstream") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ id: "m", choices: [{ message: { role: "assistant", content: "ok" } }] }));
+        return;
+      }
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "route down" } }));
+    });
+    const portEsc = await listen(srvEsc);
+    const baseEsc = `http://${HOST}:${portEsc}`;
+    const cfgEsc = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "ea", baseURL: baseEsc, apiKeyEnv: "KEY_EA" },
+        { id: "eb", baseURL: baseEsc, apiKeyEnv: "KEY_EB" },
+      ],
+      models: {
+        mEscBad1: { providers: [{ backend: "ea", upstream: "bad-1" }], affinityPool: 1 },
+        mEscBad2: { providers: [{ backend: "ea", upstream: "bad-2" }], affinityPool: 1 },
+        mEscEbBad: { providers: [{ backend: "eb", upstream: "bad-1" }], affinityPool: 1 },
+        mEscEbGood: { providers: [{ backend: "eb", upstream: "good-upstream" }], affinityPool: 1 },
+      },
+      presets: {
+        pEsc1: { strategy: "affinity", models: ["mEscBad1"] },
+        pEsc2: { strategy: "affinity", models: ["mEscBad2"] },
+        pEscEbBad: { strategy: "affinity", models: ["mEscEbBad"] },
+        pEscEbGood: { strategy: "affinity", models: ["mEscEbGood"] },
+      },
+      backoff: { ...BO, serverBaseMs: 60000, serverMaxMs: 300000 },
+    };
+    const hEsc = await startRouterCfg(cfgEsc, "KEY_EA=k\nKEY_EB=k\n");
+    const hitEsc = async (m) => { const r = await api(hEsc.base, "/v1/chat/completions", { body: { model: m, messages: [] } }); await r.text(); };
+    const acct = async (id) => (await (await api(hEsc.base, "/health", { method: "GET" })).json()).backends.find((b) => b.id === id);
+    try {
+      await hitEsc("pEsc1");
+      const ea1 = await acct("ea");
+      assert(ea1.state === "healthy", "zEsc1a) one failing route does not blame the account (" + ea1.state + ")");
+      await hitEsc("pEsc2");
+      const ea2 = await acct("ea");
+      assert(
+        ea2.state === "cooling" && ea2.lastError && ea2.lastError.kind === "server",
+        "zEsc1b) two distinct failing routes escalate to an account outage (" + JSON.stringify({ state: ea2.state, kind: ea2.lastError && ea2.lastError.kind }) + ")"
+      );
+      await hitEsc("pEscEbBad");
+      const eb1 = await acct("eb");
+      assert(eb1.state === "healthy", "zEsc1c) one failing route on another account stays healthy");
+      await hitEsc("pEscEbGood");
+      const eb2 = await acct("eb");
+      assert(eb2.state === "healthy", "zEsc1d) a succeeding sibling route prevents escalation (" + eb2.state + ")");
+    } finally {
+      hEsc.child.kill(); srvEsc.close();
+      await rm(hEsc.dir, { recursive: true, force: true });
+    }
+  }
+
+  // zRel1) /health exposes route-scoped rows; a failure streak survives its timer
+  //   expiring (only a real success resets it); and a reload prunes removed routes
+  //   WITHOUT forgiving the routes that remain.
+  {
+    let raHits = 0;
+    const ra = http.createServer((req, res) => {
+      raHits++;
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "down" } }));
+    });
+    const rc = mockBackend("rc", {});
+    const portRa = await listen(ra);
+    rc.port = await listen(rc.srv);
+    const cfgRel = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "ra", baseURL: `http://${HOST}:${portRa}`, apiKeyEnv: "KEY_RA" },
+        { id: "rc", baseURL: `http://${HOST}:${rc.port}`, apiKeyEnv: "KEY_RC" },
+      ],
+      models: { mA: { providers: [{ backend: "ra", upstream: "u1" }, { backend: "rc", upstream: "u3" }], affinityPool: 1 } },
+      presets: { pA: { strategy: "affinity", models: ["mA"] } },
+      backoff: { ...BO, serverBaseMs: 150, serverMaxMs: 3000 },
+    };
+    const hRel = await startRouterCfg(cfgRel, "KEY_RA=k\nKEY_RC=k\n");
+    const routeRows = async () => (await (await api(hRel.base, "/health", { method: "GET" })).json()).routes || [];
+    const pA = async () => { const r = await api(hRel.base, "/v1/chat/completions", { body: { model: "pA", messages: [] } }); await r.text(); };
+    try {
+      await pA();
+      const row1 = (await routeRows()).find((x) => x.backend === "ra" && x.upstream === "u1");
+      assert(
+        row1 && row1.state === "cooling" && row1.fails === 1 && row1.models.includes("mA") && row1.retryInMs > 0,
+        "zRel1a) /health lists the cooling route with its logical model and retry time (" + JSON.stringify(row1) + ")"
+      );
+      await new Promise((r) => setTimeout(r, 250)); // let the 150ms cooldown lapse
+      await pA(); // a probe: fails again, so the streak must grow rather than restart
+      const row2 = (await routeRows()).find((x) => x.backend === "ra" && x.upstream === "u1");
+      assert(
+        row2 && row2.fails === 2 && row2.retryInMs > 150,
+        "zRel1b) the failure streak survives timer expiry (fails=" + (row2 && row2.fails) + ", retryInMs=" + (row2 && row2.retryInMs) + ")"
+      );
+      // Reload with the ra/u1 provider removed: that route is pruned.
+      const cfgAfter = JSON.parse(JSON.stringify(cfgRel));
+      cfgAfter.models.mA.providers = [{ backend: "rc", upstream: "u3" }];
+      await writeFile(join(hRel.dir, "config.json"), JSON.stringify(cfgAfter, null, 2));
+      let pruned = false;
+      for (let i = 0; i < 20 && !pruned; i++) {
+        await new Promise((r) => setTimeout(r, 200));
+        pruned = !(await routeRows()).some((x) => x.backend === "ra" && x.upstream === "u1");
+      }
+      const raHitsBefore = raHits;
+      await pA();
+      assert(
+        pruned && raHits === raHitsBefore,
+        "zRel1c) a reload prunes the removed route and keeps routing to the survivor (pruned=" + pruned + ", raHits=" + raHits + ")"
+      );
+    } finally {
+      hRel.child.kill(); ra.close(); rc.srv.close();
+      await rm(hRel.dir, { recursive: true, force: true });
+    }
+  }
+
+  // rUnit) Route-health helpers: the 30/60/120-second progression to the
+  //   five-minute cap, computed from the failure streak. Pure functions, so the
+  //   clock never has to advance to test them.
+  {
+    const cfgB = { backoff: { serverBaseMs: 30000, serverMaxMs: 300000 } };
+    const haveHelpers = typeof SRV.routeBackoffMs === "function" && typeof SRV.routeKey === "function";
+    assert(haveHelpers, "rUnit1) routeKey and routeBackoffMs are exported for deterministic testing");
+    if (haveHelpers) {
+      const seq = [1, 2, 3, 5, 9].map((f) => SRV.routeBackoffMs(f, cfgB));
+      assert(
+        JSON.stringify(seq) === JSON.stringify([30000, 60000, 120000, 300000, 300000]),
+        "rUnit2) route backoff progresses 30/60/120s then caps at five minutes (got " + JSON.stringify(seq) + ")"
+      );
+      const k1 = SRV.routeKey({ backend: "b1", upstream: "u1" });
+      assert(
+        k1 === SRV.routeKey({ backend: "b1", upstream: "u1" }) &&
+          k1 !== SRV.routeKey({ backend: "b1", upstream: "u2" }) &&
+          k1 !== SRV.routeKey({ backend: "b2", upstream: "u1" }),
+        "rUnit3) routeKey identifies backend+upstream and separates both axes (" + k1 + ")"
+      );
     }
   }
 
@@ -3355,17 +3748,20 @@ async function main() {
       }
     }
 
-    // zM3) error counting + cache denominators: a 429-exhausted flow bumps
+    // zM3) error counting + cache denominators: an exhausted 5xx flow bumps
     //      kpis.errors/errorRate; a signal request sets cacheHitRate 0.4 and a
-    //      signal-less request (no usage at all) must NOT corrupt it.
+    //      signal-less request (no usage at all) must NOT corrupt it. A 5xx is used
+    //      because its backoff is genuinely configurable (see backoffFor: the 429
+    //      class reads "rateBaseMs" while configs set "rateLimitBaseMs", so a 429
+    //      would pin for the 30s default and this fixture could not wait it out).
     {
       let callsM3 = 0;
       const srvM3 = http.createServer(async (req, res) => {
         for await (const c of req) { /* drain */ }
         callsM3++;
         if (callsM3 === 1) {
-          res.writeHead(429, { "content-type": "application/json" });
-          res.end(JSON.stringify({ error: { message: "rate limited" } }));
+          res.writeHead(500, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: { message: "upstream exploded" } }));
           return;
         }
         if (callsM3 === 2) {
@@ -3386,6 +3782,7 @@ async function main() {
       const { child: childM3, base: baseM3, dir: dirM3 } = await startRouterCfg(cfgM3, "KEY_ZB=k\n");
       try {
         await api(baseM3, "/v1/chat/completions", { body: { model: "mf", messages: [] } }); // 503 exhausted
+        await new Promise((res) => setTimeout(res, 120)); // let the route backoff lapse
         await api(baseM3, "/v1/chat/completions", { body: { model: "mf", messages: [] } }); // 200 with cache split
         await api(baseM3, "/v1/chat/completions", { body: { model: "mf", messages: [] } }); // 200 without any usage
         const d = await (await api(baseM3, "/api/dashboard", { method: "GET" })).json();

@@ -471,7 +471,7 @@ function markHealthy(id, origin) {
     recordCoolingEvent({ backend: id, action: origin || "success", kind: prev.lastError ? prev.lastError.kind : null, manual: !!(prev.lastError && prev.lastError.kind === "manual") });
     ANALYTICS.expiredNotified.delete(id);
   }
-  health.set(id, { state: "healthy", nextAvailableAt: 0, fails: 0, backoffMs: 0, lastError: null });
+  health.set(id, { state: "healthy", nextAvailableAt: 0, fails: 0, backoffMs: 0, lastError: null, generation: nextGeneration(), probeInFlight: false });
 }
 
 function ensureBackends(cfg) {
@@ -593,6 +593,7 @@ function markFailure(cfg, id, status, bodyText) {
   // session-scoped exclusion, which is likewise not account health.
   if (kind === "client" || kind === "upstream_rejection") {
     h.lastError = { status, kind, body: (bodyText || "").slice(0, 300) };
+    h.generation = nextGeneration();
     health.set(id, h);
     return;
   }
@@ -616,6 +617,8 @@ function markFailure(cfg, id, status, bodyText) {
   h.state = "cooling";
   h.nextAvailableAt = Date.now() + nextMs;
   h.lastError = { status, kind, body: (bodyText || "").slice(0, 300) };
+  h.generation = nextGeneration();
+  h.probeInFlight = false;
   health.set(id, h);
   if (!wasCoolingActive) recordCoolingEvent({ backend: id, action: "cool", kind, manual: false });
 }
@@ -642,8 +645,8 @@ function resetAllHealth() {
 const COOLING_EVENTS = []; // newest at head: {t, backend, action, kind, manual}
 const COOLING_EVENT_CAP = 500;
 
-function recordCoolingEvent({ backend, action, kind, manual }) {
-  COOLING_EVENTS.unshift({ t: Date.now(), backend, action, kind: kind || null, manual: !!manual });
+function recordCoolingEvent({ backend, action, kind, manual, scope }) {
+  COOLING_EVENTS.unshift({ t: Date.now(), backend, action, kind: kind || null, manual: !!manual, scope: scope || "account" });
   if (COOLING_EVENTS.length > COOLING_EVENT_CAP) COOLING_EVENTS.length = COOLING_EVENT_CAP;
 }
 
@@ -662,6 +665,258 @@ function isUsableCurrently(id, now) {
     return true;
   }
   return false;
+}
+
+// ---- scoped cooldowns: route health + session exclusions ---------------------
+//
+// A ROUTE is one physical (backend, upstream) pair. Cooling is scoped to the
+// route, so one upstream of an account failing does not disable that account's
+// other upstreams, while account-wide faults (auth, billing, weekly limit, rate
+// limit, network) still cool the account itself. An unexplained rejection is
+// evidence of neither, so it excludes the route for the session that saw it and
+// nothing else.
+const ROUTES = new Map(); // routeKey -> {generation, fails, nextAvailableAt, probeInFlight, lastErrorKind, lastStatus, lastError}
+const SESSION_EXCLUSIONS = new Map(); // "sessionKey routeKey" -> {blockedUntil, generation}
+const OPAQUE_EXCLUSION_MS = 30000;
+
+// Monotonic across the whole process and NEVER reset - not by reset-health, not by
+// a config reload, not by a route being removed and re-added. A generation is how a
+// late callback proves the state it captured is still the state it would write to.
+let stateGeneration = 0;
+function nextGeneration() {
+  return ++stateGeneration;
+}
+
+function routeKey(attempt) {
+  return JSON.stringify([attempt.backend, attempt.upstream]);
+}
+
+function routeBackoffMs(fails, cfg) {
+  return backoffFor("server", cfg, Math.max(1, fails));
+}
+
+// NUL cannot appear in a header value, so the session key can never be confused
+// with the separator.
+function sessionExclusionKey(sessionKey, attempt) {
+  return sessionKey + "\u0000" + routeKey(attempt);
+}
+
+// Lazy expiry: an elapsed exclusion is dropped on sight rather than swept.
+function isSessionExcluded(sessionKey, attempt, now) {
+  if (!sessionKey || sessionKey === "no-session") return false;
+  const key = sessionExclusionKey(sessionKey, attempt);
+  const e = SESSION_EXCLUSIONS.get(key);
+  if (!e) return false;
+  if (e.blockedUntil <= now) {
+    SESSION_EXCLUSIONS.delete(key);
+    return false;
+  }
+  return true;
+}
+
+// A server-class failure is a property of the ROUTE, not the account: the streak is
+// preserved across timer expiry (only a real success resets it), so a flapping
+// route backs off further each time instead of restarting at the base delay.
+function markRouteFailure(cfg, attempt, status, bodyText, kind) {
+  const key = routeKey(attempt);
+  const r = ROUTES.get(key) || { generation: nextGeneration(), fails: 0, nextAvailableAt: 0, probeInFlight: false, lastErrorKind: null, lastStatus: null, lastError: null };
+  r.fails = (r.fails || 0) + 1;
+  r.nextAvailableAt = Date.now() + routeBackoffMs(r.fails, cfg);
+  r.lastErrorKind = kind;
+  r.lastStatus = status;
+  r.lastError = { status, kind, body: (bodyText || "").slice(0, 300) };
+  r.generation = nextGeneration();
+  r.probeInFlight = false;
+  ROUTES.set(key, r);
+  recordCoolingEvent({ backend: attempt.backend, action: "cool", kind, manual: false, scope: "route" });
+  noteAccountOutage(cfg, attempt);
+  return r;
+}
+
+// Called only for a genuinely usable completion, never for mere HTTP 200 headers.
+function markRouteSuccess(attempt) {
+  const key = routeKey(attempt);
+  const r = ROUTES.get(key);
+  if (!r) return;
+  r.fails = 0;
+  r.nextAvailableAt = 0;
+  r.probeInFlight = false;
+  r.generation = nextGeneration();
+}
+
+// An opaque rejection excludes the route for the CALLER that saw it. Keyed by
+// session + route rather than by logical model, so two models aliasing one physical
+// route share the exclusion, matching how route health is shared (zScope2).
+function excludeRouteForSession(sessionKey, attempt) {
+  if (!sessionKey || sessionKey === "no-session") return null;
+  const key = sessionExclusionKey(sessionKey, attempt);
+  SESSION_EXCLUSIONS.set(key, { blockedUntil: Date.now() + OPAQUE_EXCLUSION_MS, generation: nextGeneration(), routeKey: routeKey(attempt) });
+  return key;
+}
+
+// Why a candidate cannot be tried right now, or null when it can.
+function ineligibility(attempt, sessionKey, now) {
+  const h = health.get(attempt.backend);
+  if (h && h.state === "cooling") {
+    if (!isUsableCurrently(attempt.backend, now)) {
+      return h.lastError && h.lastError.kind === "manual" ? "manual" : "account_cooling";
+    }
+    // The timer elapsed but the recovery is unproven: exactly one probe at a time,
+    // so a still-broken account is discovered by one request rather than by every
+    // request at once.
+    if ((h.fails || 0) > 0 && h.probeInFlight) return "probe_in_flight";
+  }
+  const r = ROUTES.get(routeKey(attempt));
+  if (r && (r.fails || 0) > 0) {
+    if (r.nextAvailableAt > now) return "route_cooling";
+    if (r.probeInFlight) return "probe_in_flight";
+  }
+  if (isSessionExcluded(sessionKey, attempt, now)) return "session_excluded";
+  return null;
+}
+
+// Nearest finite moment at which some blocked candidate returns, or null when
+// nothing recovers on its own (every blocker is a manual cool).
+function nearestRecoveryMs(ordered, sessionKey, now) {
+  let best = null;
+  for (const a of ordered) {
+    const why = ineligibility(a, sessionKey, now);
+    if (!why || why === "manual") continue;
+    const h = health.get(a.backend);
+    const r = ROUTES.get(routeKey(a));
+    const at = [];
+    if (why === "account_cooling" && h) at.push(h.nextAvailableAt);
+    if (why === "route_cooling" && r) at.push(r.nextAvailableAt);
+    if (why === "session_excluded") {
+      const e = SESSION_EXCLUSIONS.get(sessionExclusionKey(sessionKey, a));
+      if (e) at.push(e.blockedUntil);
+    }
+    // Nothing recovers on its own while a probe is running, but it will settle
+    // shortly: advertise the shortest honest wait rather than no header at all.
+    if (why === "probe_in_flight") at.push(now + 1000);
+    for (const t of at) if (t > now && (best === null || t < best)) best = t;
+  }
+  return best === null ? null : best - now;
+}
+
+// Single dispatch point for an attempt's failure, so the three scopes cannot drift
+// apart: caller's fault changes nothing, an opaque rejection excludes the route for
+// this session, a server fault cools the route, and everything else cools the account.
+function noteAttemptFailure(cfg, attempt, sessionKey, status, bodyText) {
+  const kind = classify(status, bodyText);
+  if (kind === "client") return kind;
+  if (kind === "upstream_rejection") {
+    excludeRouteForSession(sessionKey, attempt);
+    const h = health.get(attempt.backend) || { state: "healthy", fails: 0, backoffMs: 0 };
+    h.lastError = { status, kind, body: (bodyText || "").slice(0, 300) };
+    health.set(attempt.backend, h);
+    return kind;
+  }
+  if (kind === "server") {
+    markRouteFailure(cfg, attempt, status, bodyText, kind);
+    return kind;
+  }
+  markFailure(cfg, attempt.backend, status, bodyText);
+  return kind;
+}
+
+// A recovery lease, taken synchronously BEFORE any network await, so two concurrent
+// requests can never probe the same recovering account or route together; the loser
+// moves on to its next candidate instead. The token records the generation it
+// claimed: a late callback whose generation no longer matches must not reopen state
+// that has since been replaced.
+function claimAttempt(attempt, now) {
+  const token = { routeKey: routeKey(attempt), backend: attempt.backend, routeGeneration: null, routeClaim: false, accountGeneration: null, accountClaim: false };
+  const h = health.get(attempt.backend);
+  if (h && h.state === "cooling" && h.nextAvailableAt <= now && (h.fails || 0) > 0) {
+    if (h.probeInFlight) return null;
+    h.probeInFlight = true;
+    token.accountClaim = true;
+    token.accountGeneration = h.generation ?? null;
+  }
+  const r = ROUTES.get(token.routeKey);
+  if (r && (r.fails || 0) > 0 && r.nextAvailableAt <= now) {
+    if (r.probeInFlight) {
+      releaseAttempt(token);
+      return null;
+    }
+    r.probeInFlight = true;
+    token.routeClaim = true;
+    token.routeGeneration = r.generation;
+  }
+  return token;
+}
+
+// Frees only what this token still owns. A probe that already settled moved the
+// generation on (and cleared the flag itself), so that newer state is left alone.
+function releaseAttempt(token) {
+  if (!token) return;
+  const r = ROUTES.get(token.routeKey);
+  if (token.routeClaim && r && r.generation === token.routeGeneration) r.probeInFlight = false;
+  const h = health.get(token.backend);
+  if (token.accountClaim && h && (h.generation ?? null) === token.accountGeneration) h.probeInFlight = false;
+}
+
+// One failing upstream is a route problem. Two DIFFERENT routes of the same account
+// failing inside a minute is an account-level outage, so the account is cooled too.
+// Only server-class failures reach here, so an unexplained rejection or a caller's
+// bad payload can never escalate.
+const ACCOUNT_OUTAGE_WINDOW_MS = 60000;
+const ACCOUNT_OUTAGE_ROUTES = new Map(); // backendId -> [{routeKey, t}]
+function noteAccountOutage(cfg, attempt, now = Date.now()) {
+  const key = routeKey(attempt);
+  const recent = (ACCOUNT_OUTAGE_ROUTES.get(attempt.backend) || []).filter((e) => now - e.t <= ACCOUNT_OUTAGE_WINDOW_MS);
+  if (!recent.some((e) => e.routeKey === key)) recent.push({ routeKey: key, t: now });
+  ACCOUNT_OUTAGE_ROUTES.set(attempt.backend, recent);
+  if (recent.length >= 2) markFailure(cfg, attempt.backend, 503, "multiple routes of this account failed inside a minute: account-level outage");
+}
+
+// A reload must not silently forgive a cooling route, so unchanged rows survive and
+// only routes the new config no longer references are dropped.
+function pruneRoutes(cfg) {
+  const live = new Set();
+  for (const m of Object.values(cfg.models || {})) {
+    for (const p of m.providers || []) live.add(JSON.stringify([p.backend, p.upstream]));
+  }
+  for (const key of [...ROUTES.keys()]) if (!live.has(key)) ROUTES.delete(key);
+  for (const [key, e] of [...SESSION_EXCLUSIONS]) if (!live.has(e.routeKey)) SESSION_EXCLUSIONS.delete(key);
+  for (const id of [...ACCOUNT_OUTAGE_ROUTES.keys()]) {
+    if (!cfg.backends.some((b) => b.id === id)) ACCOUNT_OUTAGE_ROUTES.delete(id);
+  }
+}
+
+// Route-scoped health for the dashboard: which logical models use the route, how
+// long until it may be retried, its failure streak, and probe state. Session
+// exclusions are deliberately NOT exposed - they are per-caller state and can carry
+// session identifiers.
+function routeHealthSnapshot(cfg, now) {
+  const modelsByRoute = new Map();
+  for (const [id, m] of Object.entries(cfg.models || {})) {
+    for (const p of m.providers || []) {
+      const key = JSON.stringify([p.backend, p.upstream]);
+      if (!modelsByRoute.has(key)) modelsByRoute.set(key, []);
+      modelsByRoute.get(key).push(id);
+    }
+  }
+  const rows = [];
+  for (const [key, r] of ROUTES) {
+    const [backend, upstream] = JSON.parse(key);
+    const cooling = r.nextAvailableAt > now;
+    rows.push({
+      route: key,
+      backend,
+      upstream,
+      models: modelsByRoute.get(key) || [],
+      state: cooling ? "cooling" : (r.fails || 0) > 0 ? "probing" : "healthy",
+      fails: r.fails || 0,
+      nextAvailableAtMs: r.nextAvailableAt || 0,
+      retryInMs: cooling ? r.nextAvailableAt - now : 0,
+      probeInFlight: !!r.probeInFlight,
+      lastErrorKind: r.lastErrorKind || null,
+      lastStatus: r.lastStatus ?? null,
+    });
+  }
+  return rows;
 }
 
 // ---- history + stats ----------------------------------------------------------
@@ -1938,11 +2193,13 @@ async function handleChat(req, res, cfg, bodyText) {
     return writeError(res, e);
   }
 
-  // Prefer healthy candidates. If all cooling, fall back to system-cooled
-  // backends only (soonest nextAvailableAt first); manually cooled backends
-  // NEVER participate in the all-cooling fallback.
+  // Strict eligibility. Every candidate must be serviceable right now: its account
+  // must not be cooled (auth / billing / weekly / rate) and its own route must not
+  // be cooling from a server-class failure, and this session must not have been
+  // refused by it. There is deliberately NO fallback that tries a cooling provider
+  // anyway - sending a request to a provider already known to be failing wastes the
+  // caller's time and hides the real state behind a bogus "all cooling" story.
   const now = Date.now();
-  const healthy = c.ordered.filter((a) => isUsableCurrently(a.backend, now));
   const manualCooled = new Set(
     c.ordered
       .filter((a) => {
@@ -1951,50 +2208,65 @@ async function handleChat(req, res, cfg, bodyText) {
       })
       .map((a) => a.backend)
   );
-  let pool;
-  if (healthy.length) {
-    pool = healthy;
-  } else {
-    pool = c.ordered.filter((a) => !manualCooled.has(a.backend)).sort((a, b) => {
-      return (health.get(a.backend)?.nextAvailableAt || 0) - (health.get(b.backend)?.nextAvailableAt || 0);
-    });
-    if (pool.length === 0) {
-      const latencyMs = Date.now() - started;
-      const detailT = Date.now();
-      const entry = applyCost(newHistoryEntry({ t: detailT, callId, model: modelId, backend: "none", stream, status: 503, latencyMs, session: sessionKey, routedModel: c.ordered[0] ? c.ordered[0].model : null, errorKind: null }), cfg);
-      recordHistory(entry);
-      recordAnalytics(entry);
+  const pool = [];
+  const blocked = {};
+  for (const a of c.ordered) {
+    const reason = ineligibility(a, sessionKey, now);
+    if (reason) blocked[reason] = (blocked[reason] || 0) + 1;
+    else pool.push(a);
+  }
+  if (pool.length === 0) {
+    const latencyMs = Date.now() - started;
+    const detailT = Date.now();
+    const allManual = manualCooled.size >= c.ordered.length;
+    // The all-manual case keeps its long-standing wording (the dashboard's
+    // "uncool to restore" affordance is the actionable one); every other empty
+    // pool names the actual blocker counts instead of blaming cooling in general.
+    const reasonText = allManual
+      ? `all available backends are cooling (${manualCooled.size} manually cooled - uncool to restore)`
+      : `no provider is currently eligible for this request (${Object.entries(blocked).map(([k, n]) => `${n} ${k.replace(/_/g, " ")}`).join(", ")})`;
+    // Advertise the soonest automatic recovery. A pool held only by manual cools
+    // has no automatic recovery, so the header is omitted rather than guessed.
+    const recoveryMs = nearestRecoveryMs(c.ordered, sessionKey, now);
+    if (recoveryMs !== null) res.setHeader("Retry-After", String(Math.max(1, Math.ceil(recoveryMs / 1000))));
+    const entry = applyCost(newHistoryEntry({ t: detailT, callId, model: modelId, backend: "none", stream, status: 503, latencyMs, session: sessionKey, routedModel: c.ordered[0] ? c.ordered[0].model : null, errorKind: null }), cfg);
+    recordHistory(entry);
+    recordAnalytics(entry);
+    // A session-scoped exclusion is not an outage: alert only when something is
+    // actually cooling.
+    if ((blocked.account_cooling || 0) + (blocked.route_cooling || 0) + manualCooled.size > 0) {
       fireAlert(cfg, "all_cooling", { manualCooled: manualCooled.size });
-      recordStats({ backend: "none", model: modelId, status: 503, latencyMs });
-      // Detail record even with no attempts: captures the payload + a "no
-      // candidates were eligible" note so the empty-pool 503 is inspectable.
-      // Always recorded; oversized bodies are stored bounded (see
-      // boundedPayload) so the panel never silently 404s.
-      recordDetail(detailT, callId, bodyText.length <= DETAIL_MAX_BODY_BYTES ? { ...body } : boundedPayload(body), null);
-      finalizeDetail(detailT, {
-        status: 503,
-        ttftMs: 0,
-        latencyMs,
-        genMs: 0,
-        promptTokens: 0,
-        completionTokens: 0,
-        reasoningTokens: 0,
-        cacheHit: null,
-        cacheHitPct: null,
-        preview: null,
-        errorBody: `all available backends are cooling (${manualCooled.size} manually cooled - uncool to restore)`,
-        noEligibleBackends: true,
-      });
-      res.setHeader("x-router-backend", "none");
-      res.setHeader("x-router-call", callId);
-      const msg = JSON.stringify({
-        error: {
-          message: `all available backends are cooling (${manualCooled.size} manually cooled - uncool to restore)`,
-          type: "router_unavailable",
-        },
-      });
-      return writeError(res, newError(503, msg));
     }
+    recordStats({ backend: "none", model: modelId, status: 503, latencyMs });
+    // Detail record even with no attempts: captures the payload + a "no
+    // candidates were eligible" note so the empty-pool 503 is inspectable.
+    // Always recorded; oversized bodies are stored bounded (see
+    // boundedPayload) so the panel never silently 404s.
+    recordDetail(detailT, callId, bodyText.length <= DETAIL_MAX_BODY_BYTES ? { ...body } : boundedPayload(body), null);
+    finalizeDetail(detailT, {
+      status: 503,
+      ttftMs: 0,
+      latencyMs,
+      genMs: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      reasoningTokens: 0,
+      cacheHit: null,
+      cacheHitPct: null,
+      preview: null,
+      errorBody: reasonText,
+      noEligibleBackends: true,
+      cooldownScope: blocked,
+    });
+    res.setHeader("x-router-backend", "none");
+    res.setHeader("x-router-call", callId);
+    const msg = JSON.stringify({
+      error: {
+        message: reasonText,
+        type: "router_unavailable",
+      },
+    });
+    return writeError(res, newError(503, msg));
   }
 
   let lastErr = null;
@@ -2013,6 +2285,11 @@ async function handleChat(req, res, cfg, bodyText) {
     const model = (cfg.models || {})[attempt.model];
     const provider = (model && (model.providers || []).find((p) => p.backend === attempt.backend)) || null;
     if (!backend || !model || !provider) continue; // defensive: candidates built the attempt
+    // Take the recovery lease BEFORE any network await (see claimAttempt) and give
+    // it back on every exit: a client or opaque failure settles no route state, so
+    // nothing else would release it.
+    const lease = claimAttempt(attempt, now);
+    if (!lease) continue; // another request is already probing this recovering route
     const payload = buildPayload(body, cfg, c.preset, model, provider, backend);
     // Per-model retry: on retryable failures, retry the SAME provider with
     // exponential backoff before falling through to the next candidate. This
@@ -2062,17 +2339,19 @@ async function handleChat(req, res, cfg, bodyText) {
       const errKind = classify(result.err.status, result.err.body);
       failedAttempts++;
       if (errKind === "upstream_rejection") opaqueFailures++;
-      markFailure(cfg, attempt.backend, result.err.status, result.err.body);
+      noteAttemptFailure(cfg, attempt, sessionKey, result.err.status, result.err.body);
       // An EXPLAINED client error is the caller's payload, so it would fail
       // identically on every provider: fail fast, no retry, no failover. An
       // unexplained rejection proves nothing about the payload, so it falls
       // through to the next provider instead.
+      releaseAttempt(lease);
       if (errKind === "client") break;
       continue;
     }
     // Success: mark healthy, relay (ttft = time to first upstream response),
     // then record full metrics once the body has been forwarded to the client.
     markSuccess(attempt.backend);
+    markRouteSuccess(attempt);
     const latencyMs = Date.now() - started;
     let metrics;
     try {
@@ -2147,6 +2426,7 @@ async function handleChat(req, res, cfg, bodyText) {
       preview: metrics.preview || null,
       relayError: metrics.relayError || null,
     });
+    releaseAttempt(lease);
     return;
   }
 
@@ -2988,6 +3268,7 @@ async function loadConfig() {
     );
   }
   ensureBackends(cfg);
+  pruneRoutes(cfg);
   return cfg;
 }
 
@@ -3012,10 +3293,11 @@ function server() {
           fails: h.fails || 0,
           lastError: h.lastError || null,
           manual: !!(isCooling && h.lastError && h.lastError.kind === "manual"),
+          probeInFlight: !!h.probeInFlight,
         };
       });
       res.writeHead(200, { "content-type": "application/json" });
-      return res.end(JSON.stringify({ ok: true, port: cfg.port, backends }));
+      return res.end(JSON.stringify({ ok: true, port: cfg.port, backends, routes: routeHealthSnapshot(cfg, now) }));
     }
 
     if (req.method === "POST" && url === "/admin/reset-health") {
@@ -3577,4 +3859,4 @@ if (isMain) {
   });
 }
 
-export { candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost, writeConfigAtomic };
+export { candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost, writeConfigAtomic, routeKey, routeBackoffMs };
