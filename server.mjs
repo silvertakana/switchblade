@@ -452,11 +452,22 @@ function mask(key) {
 
 const health = new Map(); // backendId -> {state, nextAvailableAt, fails, backoffMs, lastError}
 
+// The config contract documents rateLimit*/server*/auth* key names; the pre-v3
+// docs used rate*/billing* aliases. Honour both, canonical first: an operator
+// who sets a documented key and gets the default anyway has a cooldown they
+// believe is configured and is not. Each class also carries its own default
+// (auth is deliberately slower than server/rate), and fails is clamped so a
+// zero-fail call cannot produce a fractional, sub-base backoff.
 function backoffFor(kind, cfg, fails) {
-  const bp = cfg.backoff;
-  const base = bp[kind + "BaseMs"] ?? 30000;
-  const max = bp[kind + "MaxMs"] ?? 300000;
-  return Math.min(base * 2 ** (fails - 1), max);
+  const bp = cfg.backoff || {};
+  const token = kind === "rate" ? "rateLimit" : kind === "billing" ? "server" : kind;
+  const defaults =
+    token === "rateLimit" ? [30000, 600000] :
+    token === "auth" ? [60000, 1800000] :
+    [30000, 300000];
+  const base = bp[token + "BaseMs"] ?? bp[kind + "BaseMs"] ?? defaults[0];
+  const max = bp[token + "MaxMs"] ?? bp[kind + "MaxMs"] ?? defaults[1];
+  return Math.min(base * 2 ** (Math.max(1, fails) - 1), max);
 }
 
 function sleep(ms) {
@@ -4500,4 +4511,4 @@ if (isMain) {
   });
 }
 
-export { classify, readUpstreamError, terminalChatError, redactSecrets, capAttemptsSummary, attemptOutcome, candidates, touchSessionPreference, evictSessionPreferences, SESSION_PREFS, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost, writeConfigAtomic, routeKey, routeBackoffMs, authScopeOf, sessionPreferenceKey, beginSessionRequest, orderSessionProviders, rememberProvider, sessionPreferenceStats, clearSessionPreferences };
+export { backoffFor, classify, readUpstreamError, terminalChatError, redactSecrets, capAttemptsSummary, attemptOutcome, candidates, touchSessionPreference, evictSessionPreferences, SESSION_PREFS, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost, writeConfigAtomic, routeKey, routeBackoffMs, authScopeOf, sessionPreferenceKey, beginSessionRequest, orderSessionProviders, rememberProvider, sessionPreferenceStats, clearSessionPreferences };

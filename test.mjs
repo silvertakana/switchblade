@@ -5457,6 +5457,36 @@ async function main() {
     }
   }
 
+  // ---- recovery: documented cooldown settings (plan Task 2.1) ---------------
+  // The config contract documents rateLimit*/server*/auth* key names, and the
+  // pre-v3 docs used rate*/billing* aliases. backoffFor must honour BOTH, with
+  // the canonical name winning when a config carries both spellings. A config
+  // that sets the documented key but is ignored by the code is worse than one
+  // with no key at all: the operator believes a cooldown is 17ms and gets 30s.
+  {
+    const bfCases = [
+      ["recBackoff1", "rate", { rateLimitBaseMs: 17, rateLimitMaxMs: 60 }, 1, 17],
+      ["recBackoff2", "rate", { rateLimitBaseMs: 17, rateLimitMaxMs: 60 }, 3, 60],
+      ["recBackoff3", "rate", { rateBaseMs: 9, rateMaxMs: 30 }, 2, 18],
+      ["recBackoff4", "rate", { rateLimitBaseMs: 17, rateLimitMaxMs: 60, rateBaseMs: 9, rateMaxMs: 30 }, 1, 17],
+      ["recBackoff5", "auth", { authBaseMs: 19, authMaxMs: 60 }, 1, 19],
+      ["recBackoff6", "auth", {}, 1, 60000],
+      ["recBackoff7", "billing", { serverBaseMs: 21, serverMaxMs: 70 }, 1, 21],
+      ["recBackoff8", "billing", { billingBaseMs: 11, billingMaxMs: 50 }, 2, 22],
+      ["recBackoff9", "server", {}, 1, 30000],
+      ["recBackoff10", "rate", {}, 20, 600000],
+      ["recBackoff11", "auth", {}, 20, 1800000],
+    ];
+    for (const [id, kind, backoff, fails, want] of bfCases) {
+      const got = SRV.backoffFor(kind, { backoff }, fails);
+      assert(
+        got === want,
+        id + ") backoffFor(" + kind + ", " + JSON.stringify(backoff) + ", fails " + fails + ") must be " + want +
+          " - the documented config key names (rateLimit*/server*/auth*) and their legacy aliases (rate*/billing*) both apply, canonical wins, and the per-class default is used when the config sets nothing; got " + got
+      );
+    }
+  }
+
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
 }
