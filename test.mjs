@@ -2820,6 +2820,125 @@ async function main() {
     assert(SRV.sessionPreferenceStats().size === 0, "zSess4m) an operator action clears learned preferences");
   }
 
+  // zStage1) WHERE a request failed decides WHAT it may charge. A connection that dies
+  //   before any headers is the ENDPOINT being unreachable, which is true of every route
+  //   on that account, so it must cool the account. Charging only the route leaves each
+  //   sibling route to rediscover the same dead endpoint one request at a time.
+  {
+    let conns = 0;
+    const srv = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: "m", object: "chat.completion", choices: [{ message: { role: "assistant", content: "ok:uD" } }] }));
+    });
+    srv.on("connection", (sock) => { conns++; if (conns === 1) sock.destroy(); });
+    const port = await listen(srv);
+    const cfgSt = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "oa", baseURL: `http://${HOST}:${port}`, apiKeyEnv: "KEY_OA" }],
+      models: {
+        mU: { providers: [{ backend: "oa", upstream: "u1" }], affinityPool: 1 },
+        mD: { providers: [{ backend: "oa", upstream: "uD" }], affinityPool: 1 },
+      },
+      presets: {
+        pU: { strategy: "affinity", models: ["mU"] },
+        pD: { strategy: "affinity", models: ["mD"] },
+      },
+      backoff: { ...BO, serverBaseMs: 60000, serverMaxMs: 300000 },
+    };
+    const hSt = await startRouterCfg(cfgSt, "KEY_OA=k\n");
+    try {
+      await (await api(hSt.base, "/v1/chat/completions", { body: { model: "pU", messages: [] } })).text();
+      const after = await api(hSt.base, "/v1/chat/completions", { body: { model: "pD", messages: [] } });
+      const afterBody = await after.json();
+      const msg = afterBody && afterBody.error && String(afterBody.error.message);
+      assert(
+        after.status === 503 && /account/i.test(msg),
+        "zStage1) a connection that dies before headers cools the ACCOUNT, not just the one route (status=" + after.status + ", message=" + msg + ")"
+      );
+    } finally {
+      hSt.child.kill(); srv.close();
+      await rm(hSt.dir, { recursive: true, force: true });
+    }
+  }
+
+  // zStage2) The mirror image: headers and a chunk already delivered, THEN the relay dies.
+  //   That is a property of the ROUTE, so the route cools and the account stays healthy,
+  //   and because the caller already holds part of the response the router must NOT
+  //   replay it on the model\u2019s next provider.
+  {
+    const srvCut = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      const body = Buffer.concat(chunks).toString("utf8");
+      if (body.includes(String.fromCharCode(34) + "stream" + String.fromCharCode(34) + ":true")) {
+        res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+        res.write("data: " + JSON.stringify({ id: "m", choices: [{ delta: { content: "first-chunk" } }] }) + "\n\n");
+        setTimeout(() => res.destroy(), 20);
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: "m", object: "chat.completion", choices: [{ message: { role: "assistant", content: "ok:uD" } }] }));
+    });
+    const srvAlt = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: "m", object: "chat.completion", choices: [{ message: { role: "assistant", content: "ok:uR2" } }] }));
+    });
+    const portCut = await listen(srvCut);
+    const portAlt = await listen(srvAlt);
+    const cfgRc = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "oa", baseURL: `http://${HOST}:${portCut}`, apiKeyEnv: "KEY_OA" },
+        { id: "oa2", baseURL: `http://${HOST}:${portAlt}`, apiKeyEnv: "KEY_OA2" },
+      ],
+      models: {
+        mR: { providers: [{ backend: "oa", upstream: "uR" }, { backend: "oa2", upstream: "uR2" }], affinityPool: 1 },
+        mD: { providers: [{ backend: "oa", upstream: "uD" }], affinityPool: 1 },
+      },
+      presets: {
+        pR: { strategy: "affinity", models: ["mR"] },
+        pD: { strategy: "affinity", models: ["mD"] },
+      },
+      backoff: { ...BO, serverBaseMs: 60000, serverMaxMs: 300000 },
+    };
+    const hRc = await startRouterCfg(cfgRc, "KEY_OA=k\nKEY_OA2=k\n");
+    try {
+      // Read incrementally: a cut stream aborts the client connection, so a single
+      // await text() would throw and discard the bytes that DID arrive before the cut.
+      let text = "";
+      let readErr = null;
+      try {
+        const rr = await fetch(hRc.base + "/v1/chat/completions", {
+          method: "POST",
+          headers: { "content-type": "application/json", authorization: "Bearer local-master" },
+          body: JSON.stringify({ model: "pR", messages: [], stream: true }),
+          signal: AbortSignal.timeout(10000),
+        });
+        const reader = rr.body.getReader();
+        const dec = new TextDecoder();
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          text += dec.decode(value, { stream: true });
+        }
+      } catch (e) { readErr = String(e && e.message); }
+      const after = await api(hRc.base, "/v1/chat/completions", { body: { model: "pD", messages: [] } });
+      const afterBody = await after.json();
+      assert(
+        text.includes("first-chunk") && !text.includes("ok:uR2") &&
+          after.status === 200 && afterBody.choices && afterBody.choices[0].message.content === "ok:uD",
+        "zStage2) a relay cut after delivered chunks cools only that route, never replays it on the next provider, and leaves the account serving (delivered=" + text.includes("first-chunk") + ", replayed=" + text.includes("ok:uR2") + ", siblingStatus=" + after.status + ", readErr=" + readErr + ")"
+      );
+    } finally {
+      hRc.child.kill(); srvCut.close(); srvAlt.close();
+      await rm(hRc.dir, { recursive: true, force: true });
+    }
+  }
+
   // zOutage1) Distinct-route escalation is EVIDENCE-FENCED. A success retires the
   //   account's outage evidence only when it is current: a slow response that started
   //   before a later failure proves nothing about the state that failure recorded, and

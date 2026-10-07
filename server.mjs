@@ -872,7 +872,7 @@ function nearestRecoveryMs(ordered, exclScope, now) {
 // Single dispatch point for an attempt's failure, so the three scopes cannot drift
 // apart: caller's fault changes nothing, an opaque rejection excludes the route for
 // this session, a server fault cools the route, and everything else cools the account.
-function noteAttemptFailure(cfg, attempt, exclScope, status, bodyText, errorBodyState = "present") {
+function noteAttemptFailure(cfg, attempt, exclScope, status, bodyText, errorBodyState = "present", stage = null) {
   // The settle path must classify from the SAME body-read state the terminal surface used,
   // or one request reports an opaque rejection and settles as a client error, writing no
   // exclusion (review finding 14). The ownership guards keep a late settlement from
@@ -889,6 +889,15 @@ function noteAttemptFailure(cfg, attempt, exclScope, status, bodyText, errorBody
     return kind;
   }
   if (kind === "server") {
+    // A relay cut or an unusable 200 is a property of the ROUTE: the relay answered and
+    // then failed, so its siblings on the same account are untouched. A failure BEFORE any
+    // headers (stage "connect") is a property of the ACCOUNT - the endpoint itself was
+    // unreachable - and charging a single route would make every sibling route rediscover
+    // the same dead endpoint one request at a time.
+    if (stage === "connect") {
+      if (ownsAccountSettlement(attempt)) markFailure(cfg, attempt.backend, status, bodyText);
+      return kind;
+    }
     if (ownsRouteSettlement(attempt)) markRouteFailure(cfg, attempt, status, bodyText, kind);
     return kind;
   }
@@ -2630,7 +2639,16 @@ async function forward(req, cfg, backend, payload, incomingHeaders, stream, sess
     });
   } catch (e) {
     clearTimeout(connectTimer);
-    return { err: newError(0, String(e && e.message)) };
+    // No headers ever came back, and the stage marker is what tells the settle path WHY.
+    // A HEADER TIMEOUT (our own connect abort fired: the endpoint accepted the connection and
+    // then stayed silent) is a property of the ROUTE - the gateway is up and one upstream is
+    // stalling - which is what z17 pins. A TRANSPORT failure (DNS, refused, TLS, reset before
+    // any headers) means the endpoint itself is unreachable, which is equally true of every
+    // route on that account, so charging one route would make each sibling rediscover the same
+    // dead endpoint in turn. The HTTP status is 0 for both, so the number cannot carry this.
+    const err = newError(0, String(e && e.message));
+    err.stage = connectController.signal.aborted ? "header_timeout" : "connect";
+    return { err };
   }
   clearTimeout(connectTimer); // headers arrived: the wall clock no longer applies to the body
 
@@ -2920,7 +2938,7 @@ async function handleChat(req, res, cfg, bodyText) {
       const errKind = classify(result.err.status, result.err.body, result.err.errorBodyState);
       failedAttempts++;
       if (errKind === "upstream_rejection") opaqueFailures++;
-      noteAttemptFailure(cfg, attempt, exclScope, result.err.status, result.err.body, result.err.errorBodyState);
+      noteAttemptFailure(cfg, attempt, exclScope, result.err.status, result.err.body, result.err.errorBodyState, result.err.stage || null);
       const scope = cooldownScopeOf(attempt, errKind);
       attemptsSummary.push(attemptOutcome({
         attempt,
@@ -2989,7 +3007,7 @@ async function handleChat(req, res, cfg, bodyText) {
       usableFailure = metrics.relayError || "upstream returned no usable output";
       metrics.relayError = usableFailure;
       usableDecision = "unusable";
-      noteAttemptFailure(cfg, attempt, exclScope, 0, usableFailure);
+      noteAttemptFailure(cfg, attempt, exclScope, 0, usableFailure, "present", "relay");
     }
     {
       const uKind = usableFailure ? classify(0, usableFailure) : null;
