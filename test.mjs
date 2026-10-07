@@ -2820,6 +2820,230 @@ async function main() {
     assert(SRV.sessionPreferenceStats().size === 0, "zSess4m) an operator action clears learned preferences");
   }
 
+  // zOutage1) Distinct-route escalation is EVIDENCE-FENCED. A success retires the
+  //   account's outage evidence only when it is current: a slow response that started
+  //   before a later failure proves nothing about the state that failure recorded, and
+  //   accepting it would silently abolish the very escalation it was meant to keep.
+  {
+    const cfgOut = { backoff: BO, backends: [{ id: "zz-outage" }] };
+    // Dispatch sequences sit far above this process's own generation counter so the
+    // EVIDENCE fence - not the row-ownership guard - is what decides both cases.
+    const seq = 1e12;
+    SRV.ACCOUNT_OUTAGE_ROUTES.clear();
+    SRV.noteAccountOutage(cfgOut, { backend: "zz-outage", upstream: "u1", dispatchSeq: seq });
+    SRV.noteAccountOutage(cfgOut, { backend: "zz-outage", upstream: "u2", dispatchSeq: seq + 1 });
+    const afterFails = (SRV.ACCOUNT_OUTAGE_ROUTES.get("zz-outage") || []).length;
+    SRV.markSuccess("zz-outage", { backend: "zz-outage", upstream: "u1", dispatchSeq: seq - 1 });
+    const afterStaleSuccess = (SRV.ACCOUNT_OUTAGE_ROUTES.get("zz-outage") || []).length;
+    SRV.markSuccess("zz-outage", { backend: "zz-outage", upstream: "u1", dispatchSeq: seq + 5 });
+    const afterFreshSuccess = (SRV.ACCOUNT_OUTAGE_ROUTES.get("zz-outage") || []).length;
+    SRV.ACCOUNT_OUTAGE_ROUTES.clear();
+    assert(
+      afterFails === 2 && afterStaleSuccess === 2 && afterFreshSuccess === 0,
+      "zOutage1) an account success retires outage evidence only when no newer failure is retained (afterFails=" + afterFails + ", afterStaleSuccess=" + afterStaleSuccess + ", afterFreshSuccess=" + afterFreshSuccess + ")"
+    );
+  }
+
+  // zOutage2) A 200 with nothing usable in it is a ROUTE fault, not an account fault.
+  //   The relay really is unfit and its route cools, but two such routes say nothing
+  //   about the account, so the account must stay eligible and a third route on it must
+  //   still serve. Folding status 0 into the distinct-route heuristic declares an
+  //   account-wide outage on evidence that never described the account.
+  {
+    let un1 = 0;
+    let un2 = 0;
+    const srv = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const ch of req) chunks.push(ch);
+      const up = JSON.parse(Buffer.concat(chunks).toString("utf8")).model;
+      if (up === "u-good") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ id: "m", object: "chat.completion", choices: [{ message: { role: "assistant", content: "ok:u-good" } }] }));
+        return;
+      }
+      if (up === "u1") un1++;
+      if (up === "u2") un2++;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end("");
+    });
+    const port = await listen(srv);
+    const cfgUn = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "oa", baseURL: `http://${HOST}:${port}`, apiKeyEnv: "KEY_OA" }],
+      models: {
+        mUn1: { providers: [{ backend: "oa", upstream: "u1" }], affinityPool: 1 },
+        mUn2: { providers: [{ backend: "oa", upstream: "u2" }], affinityPool: 1 },
+        mGood: { providers: [{ backend: "oa", upstream: "u-good" }], affinityPool: 1 },
+      },
+      presets: {
+        pUn1: { strategy: "affinity", models: ["mUn1"] },
+        pUn2: { strategy: "affinity", models: ["mUn2"] },
+        pGood: { strategy: "affinity", models: ["mGood"] },
+      },
+      backoff: { ...BO, serverBaseMs: 60000, serverMaxMs: 300000 },
+    };
+    const hUn = await startRouterCfg(cfgUn, "KEY_OA=k\n");
+    try {
+      await (await api(hUn.base, "/v1/chat/completions", { body: { model: "pUn1", messages: [] } })).text();
+      await (await api(hUn.base, "/v1/chat/completions", { body: { model: "pUn2", messages: [] } })).text();
+      const good = await api(hUn.base, "/v1/chat/completions", { body: { model: "pGood", messages: [] } });
+      const goodBody = await good.json();
+      assert(
+        good.status === 200 && goodBody.choices && goodBody.choices[0].message.content === "ok:u-good" && un1 === 1 && un2 === 1,
+        "zOutage2) unusable 200s cool their own routes without declaring an account outage (u1=" + un1 + ", u2=" + un2 + ", status=" + good.status + ", body=" + JSON.stringify(goodBody).slice(0, 120) + ")"
+      );
+    } finally {
+      hUn.child.kill(); srv.close();
+      await rm(hUn.dir, { recursive: true, force: true });
+    }
+  }
+
+  // zOutage3a) One failing route is a ROUTE problem: the rest of the account keeps
+  //   serving, so a single 5xx must not touch account health.
+  {
+    const srv = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const ch of req) chunks.push(ch);
+      const up = JSON.parse(Buffer.concat(chunks).toString("utf8")).model;
+      if (up === "uD") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ id: "m", object: "chat.completion", choices: [{ message: { role: "assistant", content: "ok:uD" } }] }));
+        return;
+      }
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "upstream exploded" } }));
+    });
+    const port = await listen(srv);
+    const cfgA1 = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "oa", baseURL: `http://${HOST}:${port}`, apiKeyEnv: "KEY_OA" }],
+      models: {
+        mA: { providers: [{ backend: "oa", upstream: "uA" }], affinityPool: 1 },
+        mD: { providers: [{ backend: "oa", upstream: "uD" }], affinityPool: 1 },
+      },
+      presets: {
+        pA: { strategy: "affinity", models: ["mA"] },
+        pD: { strategy: "affinity", models: ["mD"] },
+      },
+      backoff: { ...BO, serverBaseMs: 60000, serverMaxMs: 300000 },
+    };
+    const hA1 = await startRouterCfg(cfgA1, "KEY_OA=k\n");
+    try {
+      await (await api(hA1.base, "/v1/chat/completions", { body: { model: "pA", messages: [] } })).text();
+      const oneRoute = await api(hA1.base, "/v1/chat/completions", { body: { model: "pD", messages: [] } });
+      const oneRouteBody = await oneRoute.json();
+      assert(
+        oneRoute.status === 200 && oneRouteBody.choices && oneRouteBody.choices[0].message.content === "ok:uD",
+        "zOutage3a) one failing route leaves the rest of its account usable (status=" + oneRoute.status + ", body=" + JSON.stringify(oneRouteBody).slice(0, 120) + ")"
+      );
+    } finally {
+      hA1.child.kill(); srv.close();
+      await rm(hA1.dir, { recursive: true, force: true });
+    }
+  }
+
+  // zOutage3b) The escalation itself must survive this fix: TWO DIFFERENT 5xx routes of
+  //   one account cool the ACCOUNT. No successful call may intervene - a usable completion
+  //   retires the evidence by design (zOutage4), so the two failures are consecutive here.
+  {
+    const srv = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const ch of req) chunks.push(ch);
+      const up = JSON.parse(Buffer.concat(chunks).toString("utf8")).model;
+      if (up === "uD") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ id: "m", object: "chat.completion", choices: [{ message: { role: "assistant", content: "ok:uD" } }] }));
+        return;
+      }
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "upstream exploded" } }));
+    });
+    const port = await listen(srv);
+    const cfgA2 = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "oa", baseURL: `http://${HOST}:${port}`, apiKeyEnv: "KEY_OA" }],
+      models: {
+        mA: { providers: [{ backend: "oa", upstream: "uA" }], affinityPool: 1 },
+        mB: { providers: [{ backend: "oa", upstream: "uB" }], affinityPool: 1 },
+        mD: { providers: [{ backend: "oa", upstream: "uD" }], affinityPool: 1 },
+      },
+      presets: {
+        pA: { strategy: "affinity", models: ["mA"] },
+        pB: { strategy: "affinity", models: ["mB"] },
+        pD: { strategy: "affinity", models: ["mD"] },
+      },
+      backoff: { ...BO, serverBaseMs: 60000, serverMaxMs: 300000 },
+    };
+    const hA2 = await startRouterCfg(cfgA2, "KEY_OA=k\n");
+    try {
+      await (await api(hA2.base, "/v1/chat/completions", { body: { model: "pA", messages: [] } })).text();
+      await (await api(hA2.base, "/v1/chat/completions", { body: { model: "pB", messages: [] } })).text();
+      const escalated = await api(hA2.base, "/v1/chat/completions", { body: { model: "pD", messages: [] } });
+      const escalatedBody = await escalated.json();
+      const escMsg = escalatedBody && escalatedBody.error && String(escalatedBody.error.message);
+      assert(
+        escalated.status === 503 && /account/i.test(escMsg),
+        "zOutage3b) two different failing routes of one account escalate to an account outage (status=" + escalated.status + ", message=" + escMsg + ")"
+      );
+    } finally {
+      hA2.child.kill(); srv.close();
+      await rm(hA2.dir, { recursive: true, force: true });
+    }
+  }
+
+  // zOutage4) A usable completion on a SIBLING route retires the outage evidence, so a
+  //   later single failure has to start the count again. Without it, one old failure
+  //   kept every later unrelated failure one step from escalating.
+  {
+    const srv = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const ch of req) chunks.push(ch);
+      const up = JSON.parse(Buffer.concat(chunks).toString("utf8")).model;
+      if (up === "uB" || up === "uD") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ id: "m", object: "chat.completion", choices: [{ message: { role: "assistant", content: "ok:" + up } }] }));
+        return;
+      }
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "upstream exploded" } }));
+    });
+    const port = await listen(srv);
+    const cfgWin = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "oa", baseURL: `http://${HOST}:${port}`, apiKeyEnv: "KEY_OA" }],
+      models: {
+        mA: { providers: [{ backend: "oa", upstream: "uA" }], affinityPool: 1 },
+        mB: { providers: [{ backend: "oa", upstream: "uB" }], affinityPool: 1 },
+        mC: { providers: [{ backend: "oa", upstream: "uC" }], affinityPool: 1 },
+        mD: { providers: [{ backend: "oa", upstream: "uD" }], affinityPool: 1 },
+      },
+      presets: {
+        pA: { strategy: "affinity", models: ["mA"] },
+        pB: { strategy: "affinity", models: ["mB"] },
+        pC: { strategy: "affinity", models: ["mC"] },
+        pD: { strategy: "affinity", models: ["mD"] },
+      },
+      backoff: { ...BO, serverBaseMs: 60000, serverMaxMs: 300000 },
+    };
+    const hWin = await startRouterCfg(cfgWin, "KEY_OA=k\n");
+    try {
+      await (await api(hWin.base, "/v1/chat/completions", { body: { model: "pA", messages: [] } })).text();
+      const sibling = await api(hWin.base, "/v1/chat/completions", { body: { model: "pB", messages: [] } });
+      const siblingBody = await sibling.json();
+      await (await api(hWin.base, "/v1/chat/completions", { body: { model: "pC", messages: [] } })).text();
+      const after = await api(hWin.base, "/v1/chat/completions", { body: { model: "pD", messages: [] } });
+      const afterBody = await after.json();
+      assert(
+        sibling.status === 200 && siblingBody.choices && siblingBody.choices[0].message.content === "ok:uB" &&
+          after.status === 200 && afterBody.choices && afterBody.choices[0].message.content === "ok:uD",
+        "zOutage4) a usable completion on a sibling route retires the outage evidence, so the next single failure does not escalate (sibling=" + sibling.status + ", after=" + after.status + ", body=" + JSON.stringify(afterBody).slice(0, 120) + ")"
+      );
+    } finally {
+      hWin.child.kill(); srv.close();
+      await rm(hWin.dir, { recursive: true, force: true });
+    }
+  }
+
   // zAlias1) The pin is keyed by the RESOLVED logical model, not by the id the caller
   //   asked for. A preset, another preset expanding to the same model, and the bare
   //   model id are three names for ONE routing decision: keyed by the requested id, a

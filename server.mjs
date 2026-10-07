@@ -637,11 +637,23 @@ function markFailure(cfg, id, status, bodyText) {
   if (!wasCoolingActive) recordCoolingEvent({ backend: id, action: "cool", kind, manual: false });
 }
 
-function markSuccess(id) {
+function markSuccess(id, attempt) {
   const h = health.get(id);
   // A manual cool is a user decision: a success must NEVER clear it. Only the
   // Uncool button (or expiry of a timed manual cool) restores the backend.
   if (h && h.state === "cooling" && h.lastError && h.lastError.kind === "manual") return;
+  // A usable completion is current proof that the ACCOUNT is answering, so it retires the
+  // distinct-route outage evidence that would otherwise escalate on the next unrelated
+  // failure. Only a CURRENT completion may do it: one that owns the account row and is not
+  // older than a failure already retained. A slow response that started before a later
+  // failure proves nothing about the state that failure recorded, and honouring it would
+  // abolish the very escalation it was meant to feed.
+  const ev = ACCOUNT_OUTAGE_ROUTES.get(id);
+  if (ev) {
+    const newestSeq = ev.reduce((m, e) => (e.dispatchSeq != null && e.dispatchSeq > m ? e.dispatchSeq : m), -Infinity);
+    const current = !!attempt && attempt.dispatchSeq != null && ownsAccountSettlement(attempt) && !(newestSeq > attempt.dispatchSeq);
+    if (current) ACCOUNT_OUTAGE_ROUTES.delete(id);
+  }
   markHealthy(id);
 }
 
@@ -759,7 +771,11 @@ function markRouteFailure(cfg, attempt, status, bodyText, kind) {
   r.probeInFlight = false;
   ROUTES.set(key, r);
   recordCoolingEvent({ backend: attempt.backend, action: "cool", kind, manual: false, scope: "route" });
-  noteAccountOutage(cfg, attempt);
+  // Only a real HTTP 5xx is evidence about the ACCOUNT. A relay cut, a stalled or empty
+  // 200 cools this route - the relay really is unfit - but it says nothing about the
+  // account's other routes, so feeding it to the distinct-route heuristic declares an
+  // account-wide outage on evidence that never described the account.
+  if (status >= 500 && status <= 599) noteAccountOutage(cfg, attempt);
   return r;
 }
 
@@ -926,9 +942,24 @@ const ACCOUNT_OUTAGE_ROUTES = new Map(); // backendId -> [{routeKey, t}]
 function noteAccountOutage(cfg, attempt, now = Date.now()) {
   const key = routeKey(attempt);
   const recent = (ACCOUNT_OUTAGE_ROUTES.get(attempt.backend) || []).filter((e) => now - e.t <= ACCOUNT_OUTAGE_WINDOW_MS);
-  if (!recent.some((e) => e.routeKey === key)) recent.push({ routeKey: key, t: now });
+  const prior = recent.find((e) => e.routeKey === key);
+  // A route that fails AGAIN is fresh evidence: refresh its timestamp and booking rather
+  // than ignoring the repeat, so the window closes 60s after each route's LATEST failure.
+  // Counting only first failures let a route that had just failed twice age out of the
+  // account's evidence while it was still the most obviously broken route on it.
+  if (prior) {
+    prior.t = now;
+    if (attempt.dispatchSeq != null) prior.dispatchSeq = attempt.dispatchSeq;
+  } else {
+    recent.push({ routeKey: key, t: now, dispatchSeq: attempt.dispatchSeq == null ? null : attempt.dispatchSeq });
+  }
   ACCOUNT_OUTAGE_ROUTES.set(attempt.backend, recent);
-  if (recent.length >= 2) markFailure(cfg, attempt.backend, 503, "multiple routes of this account failed inside a minute: account-level outage");
+  // Escalating writes the ACCOUNT, so only the attempt that currently owns the account
+  // row may do it: a straggler finishing late must not cool an account over a newer state
+  // a later request already established (the same rule the other account writes follow).
+  if (recent.length >= 2 && ownsAccountSettlement(attempt)) {
+    markFailure(cfg, attempt.backend, 503, "multiple routes of this account failed inside a minute: account-level outage");
+  }
 }
 
 // A reload must not silently forgive a cooling route, so unchanged rows survive and
@@ -2951,7 +2982,7 @@ async function handleChat(req, res, cfg, bodyText) {
     } else if (metrics.usable) {
       // The pin is still remembered (this route really did serve the session), but the
       // health writes are refused when a newer attempt already owns these rows.
-      if (ownsAccountSettlement(attempt)) markSuccess(attempt.backend);
+      if (ownsAccountSettlement(attempt)) markSuccess(attempt.backend, attempt);
       if (ownsRouteSettlement(attempt)) markRouteSuccess(attempt);
       rememberProvider(prefTokens.get(attempt.model), attempt, metrics);
     } else {
@@ -4551,4 +4582,4 @@ if (isMain) {
   });
 }
 
-export { backoffFor, classify, readUpstreamError, terminalChatError, redactSecrets, capAttemptsSummary, attemptOutcome, candidates, touchSessionPreference, evictSessionPreferences, SESSION_PREFS, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost, writeConfigAtomic, routeKey, routeBackoffMs, authScopeOf, sessionPreferenceKey, beginSessionRequest, orderSessionProviders, rememberProvider, sessionPreferenceStats, clearSessionPreferences };
+export { backoffFor, noteAccountOutage, markSuccess, ACCOUNT_OUTAGE_ROUTES, classify, readUpstreamError, terminalChatError, redactSecrets, capAttemptsSummary, attemptOutcome, candidates, touchSessionPreference, evictSessionPreferences, SESSION_PREFS, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost, writeConfigAtomic, routeKey, routeBackoffMs, authScopeOf, sessionPreferenceKey, beginSessionRequest, orderSessionProviders, rememberProvider, sessionPreferenceStats, clearSessionPreferences };
