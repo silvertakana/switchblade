@@ -1725,7 +1725,9 @@ function renderBackends() {
     host.innerHTML = '<p class="empty">No backends.</p>';
     return;
   }
-  if (!sectionChanged("backends", { backends: data, cooling: state.dash.cooling })) return;
+  const routeRows = Array.isArray(state.healthRoutes) ? state.healthRoutes : [];
+  const routesFor = (id) => routeRows.filter((r) => r && r.backend === id);
+  if (!sectionChanged("backends", { backends: data, cooling: state.dash.cooling, routes: routeRows })) return;
   host.innerHTML = data.map((b, idx) => {
     const cooling = b.state === "cooling";
     const manual = cooling && !!b.manual;
@@ -1745,6 +1747,35 @@ function renderBackends() {
       '<div class="row"><span>Cost</span><b>' + (b.cost != null ? fmtMoney(b.cost) : "n/a") + "</b></div>" +
       '<div class="row"><span>Cache hit</span><b>' + cacheTxt + "</b></div>" +
       '<div class="row"><span>Fails</span><b>' + (b.fails || 0) + "</b></div>" +
+      // Account recovery and route recovery are DIFFERENT facts: the account line
+      // covers every upstream of this backend, each route line is one
+      // (backend, upstream) pair. They are never merged into one "cooling" count.
+      '<div class="row"><span>Recovery scope</span><b>' + (!cooling
+        ? '<span class="kind ok">healthy</span>'
+        : '<span class="kind ' + (manual ? "manual" : esc(kind || "server")) + '">' + esc(scopeLabel(manual ? "manual" : "account")) + "</span>") +
+      "</b></div>" +
+      (cooling && b.nextAvailableAtMs
+        ? '<div class="row"><span>Next recovery</span><b><span class="countdown" data-next="' + esc(String(b.nextAvailableAtMs)) + '">' + esc(manual ? "until uncooled" : fmtCountdown(b.nextAvailableAtMs)) + "</span></b></div>"
+        : "") +
+      (cooling && !b.nextAvailableAtMs && manual ? '<div class="row"><span>Next recovery</span><b>until uncooled</b></div>' : "") +
+      (() => {
+        const rs = routesFor(b.id);
+        if (!rs.length) return "";
+        return '<div class="row" style="display:block"><span>Model routes <span class="scope">' + rs.length + "</span></span>" + rs.map((r) => {
+          // Server states: cooling (timer running), probing (timer elapsed, recovery
+          // UNPROVEN because this route is still failing), healthy. A probing route is
+          // not a cooled one, but it is not a working one either.
+          const routeCooling = r.state === "cooling";
+          const stateLbl = routeCooling ? "route cooling" : r.state === "probing" ? (r.probeInFlight ? "probing (probe in flight)" : "recovery unproven") : "healthy";
+          const stateCls = routeCooling ? "server" : r.state === "probing" ? "rate" : "ok";
+          return '<div class="row" style="padding-left:10px"><span class="mono" title="' + esc(r.route) + '">' + esc(r.upstream || "?") +
+            (r.models && r.models.length ? ' <span class="scope">' + esc(r.models.join(", ")) + "</span>" : "") + "</span><b>" +
+            '<span class="kind ' + stateCls + '">' + esc(stateLbl) + "</span>" +
+            (routeCooling ? ' <span class="countdown" data-next="' + esc(String(r.nextAvailableAtMs)) + '">' + esc(fmtCountdown(r.nextAvailableAtMs)) + "</span>" +
+              (r.lastErrorKind || r.lastStatus != null ? ' <span class="scope">' + esc(String(r.lastErrorKind || "") + (r.lastStatus != null ? " " + r.lastStatus : "")) + "</span>" : "") : "") +
+            "</b></div>";
+        }).join("") + "</div>";
+      })() +
       (kind ? '<div class="row"><span>Reason</span><b><span class="kind ' + esc(kind) + '">' + esc(kindLabel) + "</span></b></div>" : "") +
       (kind === "weekly" ? '<div class="note">Cooled due to weekly usage limit - retries when the limit resets.</div>' : "") +
       (manual ? '<div class="note">Manually cooled from the UI. Uncool to restore.</div>' : "") +
@@ -2140,7 +2171,14 @@ function renderHistory() {
     '<td class="mono call-cell" data-label="Call">' + callIdHtml(e.callId || "t" + e.t) + "</td>" +
     '<td class="mono" data-label="Time">' + fmtTime(e.t) + "</td>" +
     '<td data-label="Model">' + esc(e.model) + (errText ? ' <span class="kind ' + esc(errText) + '">' + esc(errText) + "</span>" : "") + "</td>" +
-    '<td data-label="Backend">' + esc(e.backend) + "</td>" +
+    // The Backend cell carries the selection story, so no column is added or
+    // renamed: why the FIRST provider was chosen, the fallback count (cross-provider
+    // transitions), and same-provider retries - three different facts.
+    '<td data-label="Backend">' + esc(e.backend) +
+      (e.selectionReason ? '<div class="scope">first pick: ' + esc(scopeLabel(e.selectionReason)) + "</div>" : "") +
+      ((e.fallbackCount || 0) > 0 ? '<div class="scope">fallback' + (e.fallbackCount > 1 ? " x" + esc(String(e.fallbackCount)) : "") + (e.cacheMayBeCold ? " - cache may be cold" : "") + "</div>" : "") +
+      ((e.retries || 0) > 0 ? '<div class="scope">retries: ' + esc(String(e.retries)) + "</div>" : "") +
+    "</td>" +
     '<td data-label="Stream">' + (e.stream ? "yes" : "no") + "</td>" +
     '<td class="mono ' + (e.status >= 400 ? "status-err" : "status-ok") + '" data-label="Status">' + e.status + "</td>" +
     '<td class="mono num" data-label="Latency">' + (e.latencyMs != null ? Math.round(e.latencyMs) : "-") + "</td>" +
@@ -2234,6 +2272,21 @@ async function safeJson(url) {
 }
 
 // Dashboard poll (3s): drives the KPI strip, charts, and backend cards.
+// Route-scoped health. /health carries the account rows (the backend cards
+// already render those from /api/dashboard) PLUS routes[], which is where a
+// cooling (backend, upstream) pair and its recovery time live.
+async function pollHealth() {
+  let h = null;
+  try {
+    h = await safeJson("/health");
+    if (!h || !Array.isArray(h.routes)) throw new Error("bad health payload");
+  } catch {
+    return; // keep the last good snapshot rather than blanking the cards
+  }
+  state.healthRoutes = h.routes;
+  renderBackends();
+}
+
 async function pollDashboard() {
   let dash = null;
   try {
@@ -2273,7 +2326,7 @@ async function pollHistory() {
 }
 
 async function poll() {
-  await Promise.all([pollDashboard(), pollHistory()]);
+  await Promise.all([pollDashboard(), pollHistory(), pollHealth()]);
 }
 
 let playgroundStateLoaded = false;
@@ -2662,6 +2715,70 @@ function fmtNum(v) {
   return v != null ? String(v) : "-";
 }
 
+// ---- recovery scope vocabulary (server: cooldownScopeOf / ineligibility) ----
+// Recovery is SCOPED, and the scopes are different facts: a cooling ACCOUNT
+// blocks every upstream of that backend, a cooling ROUTE blocks one
+// (backend, upstream) pair, a probe is one in-flight recovery attempt, a manual
+// cool is an operator decision, and a session exclusion is per-caller state
+// that must never be aggregated into a global list of sessions.
+const RECOVERY_SCOPES = {
+  account: "account cooling",
+  account_cooling: "account cooling",
+  route: "route cooling",
+  route_cooling: "route cooling",
+  session: "session exclusion",
+  session_excluded: "session exclusion",
+  probe_in_flight: "probe in flight",
+  manual: "manual cool",
+};
+function scopeLabel(s) {
+  if (s == null || s === "") return "no recovery needed";
+  return RECOVERY_SCOPES[s] || String(s);
+}
+// Body-read state of a failed upstream response (server: readUpstreamError).
+// Only "present" is a provider explaining itself; the other states must never
+// be read as an explanation.
+function bodyStateLabel(s) {
+  if (s === "present") return "body present";
+  if (s === "empty") return "body empty";
+  if (s === "truncated") return "body truncated";
+  if (s === "timeout") return "read timeout";
+  if (s === "read_error") return "read error";
+  return s ? String(s) : "not read";
+}
+function fmtBytes(n) {
+  const v = Number(n) || 0;
+  return v < 1024 ? v + " B" : (Math.round((v / 1024) * 10) / 10) + " KiB";
+}
+function fmtWhen(v) {
+  const ms = v - Date.now();
+  return ms <= 0 ? "now" : "in " + fmtCountdown(v);
+}
+// Body-free durable outcome for one attempt (server: attemptOutcome). Tolerates
+// records written before this feature (a missing key renders as "not recorded"
+// rather than blank).
+function attemptOutcomeRows(a) {
+  const rows = [
+    ["Backend", esc(a.backend != null ? a.backend : "-") + (a.model ? ' <span style="color:var(--muted)">' + esc(a.model) + "</span>" : "")],
+    ["Upstream", esc(a.upstream != null ? a.upstream : "-")],
+    ["Status", a.status != null ? esc(String(a.status)) : "-"],
+    ["Decision", '<span class="kind ' + esc(a.decision || "") + '">' + esc(a.decision || "not recorded") + "</span>"],
+    ["Error kind", a.kind ? '<span class="kind ' + esc(a.kind) + '">' + esc(a.kind) + "</span>" : "none"],
+    ["Latency", fmtMs(a.latencyMs)],
+    ["Same-provider retries", esc(String(a.retries != null ? a.retries : 0))],
+    ["Error body", esc(bodyStateLabel(a.errorBodyState)) + " - " + fmtBytes(a.errorBodyBytes) + " captured"],
+    ["Cooldown scope", esc(scopeLabel(a.cooldownScope))],
+    ["Next recovery", a.nextAvailableAt != null
+      ? '<span class="countdown" data-next="' + esc(String(a.nextAvailableAt)) + '">' + esc(fmtWhen(a.nextAvailableAt)) + "</span>"
+      : "no automatic recovery"],
+  ];
+  const ids = a.requestIds && typeof a.requestIds === "object" ? Object.keys(a.requestIds) : [];
+  if (ids.length) {
+    rows.push(["Upstream request ids", ids.map((k) => '<span class="mono">' + esc(k) + "=" + esc(a.requestIds[k]) + "</span>").join(" ")]);
+  }
+  return rows.map(([k, v]) => '<div class="a-row"><span class="k">' + esc(k) + '</span><span class="v">' + v + "</span></div>").join("");
+}
+
 function detailMetaRows(d) {
   const e = detail.entry || {};
   const resp = d.response || {};
@@ -2680,6 +2797,19 @@ function detailMetaRows(d) {
     ["Cache", resp.cacheHitPct != null ? resp.cacheHitPct + "%" : (resp.cacheHit == null ? "-" : (resp.cacheHit ? "hit" : "miss"))],
     ["Attempts", d.attempts ? d.attempts.length : 0],
   ];
+  // Why the FIRST provider was chosen, and whether the request had to switch.
+  // fallbackCount counts CROSS-PROVIDER transitions only: a same-provider retry
+  // is a different number and is shown separately.
+  const rc = (d.response && d.response.selectionReason) || e.selectionReason || null;
+  const fcount = d.response && d.response.fallbackCount !== undefined ? d.response.fallbackCount : (e.fallbackCount || 0);
+  const cold = d.response && d.response.cacheMayBeCold !== undefined ? d.response.cacheMayBeCold : e.cacheMayBeCold;
+  if (rc || fcount || cold != null) {
+    rows.push(["First provider chosen by", '<span class="kind ' + esc(rc || "") + '">' + esc(rc ? scopeLabel(rc) : "not recorded") + "</span>"]);
+    rows.push(["Fallbacks", "<b>" + esc(String(fcount)) + "</b> cross-provider transition" + (fcount === 1 ? "" : "s") + ' <span style="color:var(--muted)">(separate from same-provider retries)</span>']);
+    if (cold != null) rows.push(["Prompt cache", cold ? '<span class="kind server">switched provider - may be cold</span>' : '<span style="color:var(--muted)">same provider - no switch</span>']);
+    const omittedN = d.response && d.response.attemptsOmitted ? d.response.attemptsOmitted : (e.attemptsOmitted || 0);
+    if (omittedN) rows.push(["Outcomes dropped", esc(String(omittedN))]);
+  }
   return rows.map(([k, v]) => '<div class="dm"><span class="k">' + esc(k) + "</span><span class=\"v\">" + v + "</span></div>").join("");
 }
 
@@ -2694,6 +2824,68 @@ function renderDetail(d) {
     ? d.response.preview
     : (attempts.length ? attempts[attempts.length - 1].errorBody || null : null);
   const errBody = d.response && d.response.errorBody != null ? d.response.errorBody : null;
+  const outcomes = (d.response && Array.isArray(d.response.attemptsSummary)) ? d.response.attemptsSummary : [];
+  const omitted = (d.response && d.response.attemptsOmitted) || 0;
+  const errKind = (d.response && d.response.errorKind) || null;
+  // The ACTUAL attempts this request made, with their decisions. Persisted and
+  // body-free, so the story survives after the detailed attempts below are
+  // evicted from the in-memory ring.
+  const outcomesHtml = outcomes.length
+    ? outcomes.map((a, i) => {
+        const dec = a.decision || "unknown";
+        const badgeCls = dec === "success" ? "ok" : dec === "client_error" || dec === "client_cancelled" ? "" : "err";
+        return (
+          "<details class='detail-attempt'" + (i === 0 ? " open" : "") + ">" +
+          "<summary><span class='a-badge " + badgeCls + "'>" + esc(dec) + "</span>" +
+          "<span class='mono'>" + esc(a.backend || "?") + "</span>" +
+          "<span class='mono' style='color:var(--muted)'>" + fmtMs(a.latencyMs) + "</span>" +
+          "<span class='mono' style='color:var(--muted)'>" + esc(scopeLabel(a.cooldownScope)) + "</span>" +
+          "</summary><div class='a-body'><div class='a-rows'>" + attemptOutcomeRows(a) + "</div></div></details>"
+        );
+      }).join("") +
+      (omitted ? '<div class="detail-note">' + esc(String(omitted)) + " earlier outcome(s) were dropped by the persistence cap; the first attempts and the final one are kept.</div>" : "")
+    : '<div class="detail-empty">No compact attempt outcomes were persisted for this request (older record, or none were captured).</div>';
+  // Session exclusions live HERE and only here: they are per-caller state, so
+  // they are never aggregated into a global list of sessions.
+  const sessionExcluded = outcomes.filter((a) => a.cooldownScope === "session");
+  const sessionHtml = sessionExcluded.length
+    ? sessionExcluded.map((a) => '<div class="a-row"><span class="k">Excluded for this session</span><span class="v"><span class="mono">' +
+        esc(a.backend || "?") + "</span> / " + esc(a.upstream || "?") +
+        ' - an unexplained rejection excluded this route for this caller only</span></div>').join("")
+    : '<div class="detail-empty">No session-scoped exclusions were recorded for this request.</div>';
+  const recoveries = [];
+  for (const a of outcomes) {
+    if (!a.cooldownScope) continue;
+    const manualCool = a.cooldownScope === "account" && a.kind === "manual";
+    recoveries.push({
+      when: a.nextAvailableAt != null ? a.nextAvailableAt : (manualCool ? Number.MAX_SAFE_INTEGER : null),
+      label: manualCool ? scopeLabel("manual") : scopeLabel(a.cooldownScope),
+      detail: (a.backend || "?") + (a.upstream ? " / " + a.upstream : "") + (a.kind ? " (" + a.kind + ")" : ""),
+    });
+  }
+  const nearest = recoveries.slice().sort((x, y) => (x.when == null ? Infinity : x.when) - (y.when == null ? Infinity : y.when))[0] || null;
+  const recoveryHtml = recoveries.length
+    ? '<div class="detail-meta">' +
+      (nearest
+        ? '<div class="dm"><span class="k">Next recovery</span><span class="v">' +
+          (nearest.when == null ? "no automatic recovery" : '<span class="countdown" data-next="' + esc(String(nearest.when)) + '">' + esc(fmtWhen(nearest.when)) + "</span>") +
+          "</span></div>"
+        : "") +
+      recoveries.map((r) => '<div class="dm"><span class="k">' + esc(r.label) + '</span><span class="v">' + esc(r.detail) +
+        (r.when != null ? ' <span class="countdown" data-next="' + esc(String(r.when)) + '">' + esc(fmtWhen(r.when)) + "</span>" : "") +
+        "</span></div>").join("") +
+      "</div>"
+    : '<div class="detail-empty">This request charged no cooling.</div>';
+  const terminalFields = [
+    ["Failed-attempt errorKind", errKind],
+    ["Terminal code", d.response ? d.response.code : null],
+    ["Terminal callId", d.response ? d.response.callId : null],
+    ["Terminal backend", d.response ? d.response.backend : null],
+    ["Terminal upstreamStatus", d.response ? d.response.upstreamStatus : null],
+  ].filter(([, v]) => v != null && v !== "");
+  const terminalHtml = terminalFields.length
+    ? '<div class="detail-meta">' + terminalFields.map(([k, v]) => '<div class="dm"><span class="k">' + esc(k) + '</span><span class="v"><span class="mono">' + esc(String(v)) + "</span></span></div>").join("") + "</div>"
+    : '<div class="detail-empty">This request did not end in a provider error envelope.</div>';
   const attemptsHtml = attempts.length
     ? attempts.map((a, i) => {
         const ok = a.status >= 200 && a.status < 400;
@@ -2721,6 +2913,15 @@ function renderDetail(d) {
     : '<div class="detail-empty">No attempts were made (e.g. all backends were cooling or unavailable).</div>';
 
   dBody.innerHTML =
+
+      "<h4>Attempt outcomes <span class='chip'>" + outcomes.length + " persisted</span></h4>" + outcomesHtml +
+      '<div class="detail-note" style="margin-top:8px"><b>Session exclusions</b> - this call only; never listed globally</div>' +
+      sessionHtml +
+    "</div>" +
+    '<div class="detail-section">' +
+      "<h4>Recovery &amp; terminal error</h4>" + recoveryHtml + terminalHtml +
+    "</div>" +
+
     '<div class="detail-section">' +
       "<h4>Overview</h4>" +
       '<div class="detail-meta">' + detailMetaRows(d) + "</div>" +
@@ -5296,12 +5497,15 @@ $("hfErrors").addEventListener("change", () => { historyFilters.errorsOnly = $("
 // every 3s; history drives the table every 5s. Both are gated by autoRefresh.
 let dashTimer = null;
 let histTimer = null;
+let healthTimer = null;
 function syncPollTimer() {
   clearInterval(dashTimer);
   clearInterval(histTimer);
+  clearInterval(healthTimer);
   if ($("autoRefresh").checked) {
     dashTimer = setInterval(pollDashboard, 3000);
     histTimer = setInterval(pollHistory, 5000);
+    healthTimer = setInterval(pollHealth, 3000);
   }
 }
 $("autoRefresh").addEventListener("change", () => {
