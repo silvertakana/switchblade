@@ -1012,12 +1012,20 @@ function sessionPreferenceKey(authScope, sessionKey, logicalModel) {
   return crypto.createHash("sha256").update(JSON.stringify([authScope, sessionKey, logicalModel])).digest("hex");
 }
 
-// The token carries this request's sequence number, so a slow response that STARTED
-// before a newer request cannot overwrite that newer decision when it finally lands.
-function beginSessionRequest(authScope, sessionKey, logicalModel) {
+// The token carries a sequence number, so a slow response that STARTED before a newer
+// decision cannot overwrite it when it finally lands. One request builds one token per
+// RESOLVED model and hands them all the SAME sequence: the decision they race against
+// is the request's, not each other's.
+function beginSessionRequest(authScope, sessionKey, logicalModel, sequence) {
   const key = sessionPreferenceKey(authScope, sessionKey, logicalModel);
   if (!key) return null;
-  return { key, sequence: nextRequestSequence(), sessionKey, logicalModel, exclScope: sessionScopeOf(authScope, sessionKey) };
+  return {
+    key,
+    sequence: sequence == null ? nextRequestSequence() : sequence,
+    sessionKey,
+    logicalModel,
+    exclScope: sessionScopeOf(authScope, sessionKey),
+  };
 }
 
 // Promote a pinned route to the FRONT OF ITS OWN MODEL GROUP only. Models are never
@@ -1032,6 +1040,14 @@ function orderSessionProviders(ordered, token, now = Date.now()) {
     let j = i;
     while (j < ordered.length && ordered[j].model === ordered[i].model) j++;
     const group = ordered.slice(i, j);
+    // A token belongs to ONE resolved model. Promoting inside another model's group
+    // would move a route this caller never pinned there, so every other group passes
+    // through untouched (zSess4j).
+    if (group[0].model !== token.logicalModel) {
+      out.push(...group);
+      i = j;
+      continue;
+    }
     const idx = group.findIndex((a) => routeKey(a) === row.routeKey);
     // A pinned route that cannot be used right now must not be promoted into a
     // doomed attempt; leave the group in its configured order.
@@ -2633,10 +2649,6 @@ async function handleChat(req, res, cfg, bodyText) {
   // referenced by a single short id.
   const callId = newCallId();
   const c = candidates(cfg, modelId, sessionKey);
-  // Session provider preference: the route THIS caller's session last succeeded on
-  // for this logical model is promoted inside its model group, so a session stays on
-  // the fallback that worked instead of re-walking to a provider that keeps failing.
-  const prefToken = beginSessionRequest(authScope, sessionKey, modelId);
   if (!c) {
     const e = newError(404, JSON.stringify({ error: { message: `model '${modelId}' not found`, type: "model_not_found" } }));
     return writeError(res, e);
@@ -2650,11 +2662,21 @@ async function handleChat(req, res, cfg, bodyText) {
     return writeError(res, e);
   }
 
+  // Session provider preference: the route THIS caller's session last succeeded on is
+  // promoted inside its model group, so a session stays on the fallback that worked
+  // instead of re-walking to a provider that keeps failing. The pin is per RESOLVED
+  // MODEL: a preset, a second preset expanding to the same model, and the bare model id
+  // are three names for one decision, and keying by the REQUESTED id split one session's
+  // history three ways and let it re-walk a provider it had already given up on.
   const declaredHead = c.ordered[0] || null;
-  if (prefToken) {
-    c.ordered = orderSessionProviders(c.ordered, prefToken, Date.now());
-    c.primary = c.ordered.length ? c.ordered[0] : null;
+  const preferenceSequence = nextRequestSequence();
+  const prefTokens = new Map();
+  for (const a of c.ordered) {
+    if (!prefTokens.has(a.model)) prefTokens.set(a.model, beginSessionRequest(authScope, sessionKey, a.model, preferenceSequence));
   }
+  const activePrefTokens = [...prefTokens.values()].filter(Boolean);
+  for (const tok of activePrefTokens) c.ordered = orderSessionProviders(c.ordered, tok, Date.now());
+  if (activePrefTokens.length) c.primary = c.ordered.length ? c.ordered[0] : null;
   // True when the session's own preference moved a DIFFERENT provider to the front:
   // that is a different story from "the configured order was used as declared".
   const pinnedHead = !!(declaredHead && c.ordered[0] && c.ordered[0] !== declaredHead);
@@ -2931,7 +2953,7 @@ async function handleChat(req, res, cfg, bodyText) {
       // health writes are refused when a newer attempt already owns these rows.
       if (ownsAccountSettlement(attempt)) markSuccess(attempt.backend);
       if (ownsRouteSettlement(attempt)) markRouteSuccess(attempt);
-      rememberProvider(prefToken, attempt, metrics);
+      rememberProvider(prefTokens.get(attempt.model), attempt, metrics);
     } else {
       usableFailure = metrics.relayError || "upstream returned no usable output";
       metrics.relayError = usableFailure;

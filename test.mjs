@@ -2820,6 +2820,61 @@ async function main() {
     assert(SRV.sessionPreferenceStats().size === 0, "zSess4m) an operator action clears learned preferences");
   }
 
+  // zAlias1) The pin is keyed by the RESOLVED logical model, not by the id the caller
+  //   asked for. A preset, another preset expanding to the same model, and the bare
+  //   model id are three names for ONE routing decision: keyed by the requested id, a
+  //   session that abandoned a failing provider through one alias walks straight back
+  //   to it through the next. oa's route cooldown is deliberately short (BO) and each
+  //   alias call waits it out, so every call really is free to choose oa again - the
+  //   fresh session at the end proves that by still reaching oa.
+  {
+    const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+    let aHits = 0;
+    let bHits = 0;
+    const srvA = http.createServer((req, res) => { aHits++; res.writeHead(500, { "content-type": "application/json" }); res.end(JSON.stringify({ error: { message: "down" } })); });
+    const srvB = http.createServer((req, res) => { bHits++; res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ id: "m", object: "chat.completion", choices: [{ message: { role: "assistant", content: "ok:ob" } }] })); });
+    const portA = await listen(srvA);
+    const portB = await listen(srvB);
+    const cfgAl = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "oa", baseURL: `http://${HOST}:${portA}`, apiKeyEnv: "KEY_OA" },
+        { id: "ob", baseURL: `http://${HOST}:${portB}`, apiKeyEnv: "KEY_OB" },
+      ],
+      models: { m: { providers: [{ backend: "oa", upstream: "u1" }, { backend: "ob", upstream: "u1b" }], affinityPool: 1 } },
+      presets: {
+        p1: { strategy: "affinity", models: ["m"] },
+        p2: { strategy: "affinity", models: ["m"] },
+      },
+      backoff: BO,
+    };
+    const hAl = await startRouterCfg(cfgAl, "KEY_OA=k\nKEY_OB=k\n");
+    try {
+      const s = { "x-session-affinity": "alias-sess" };
+      const ask = (model, headers) => api(hAl.base, "/v1/chat/completions", { body: { model, messages: [] }, headers });
+      const c1 = await (await ask("p1", s)).json();
+      const after1 = aHits;
+      await wait(300); // outlast oa's route cooldown, so the pin is the only thing keeping us off it
+      const c2 = await (await ask("p2", s)).json();
+      const after2 = aHits;
+      await wait(300);
+      const c3 = await (await ask("m", s)).json();
+      const after3 = aHits;
+      await wait(300);
+      const c4 = await (await ask("m", { "x-session-affinity": "alias-sess-fresh" })).json();
+      const after4 = aHits;
+      assert(
+        after1 === 1 && after2 === 1 && after3 === 1 && after4 === 2 && bHits === 4 &&
+          c1.choices && c2.choices && c3.choices && c4.choices &&
+          c2.choices[0].message.content === "ok:ob" && c3.choices[0].message.content === "ok:ob",
+        "zAlias1) one resolved model means one pin, shared by every name that resolves to it: after p1 failed over to ob, the other preset and the bare model id stay on ob until a fresh session proves oa is eligible again (p1=" + after1 + ", aliasPreset=" + after2 + ", bareModel=" + after3 + ", freshSession=" + after4 + ", bHits=" + bHits + ")"
+      );
+    } finally {
+      hAl.child.kill(); srvA.close(); srvB.close();
+      await rm(hAl.dir, { recursive: true, force: true });
+    }
+  }
+
   // zSess5) A caller that hangs up mid-stream is NOT an upstream outage: the route is
   //   not cooled and no preference is published, so the provider keeps serving others.
   {
