@@ -54,9 +54,13 @@ The distinction that matters is *user decision* vs *system reaction*:
   it. Only the Uncool button (or expiry of a timed manual cool) restores the
   backend.
 - A **system cool** (rate limit, server error, auth, weekly) is the router
-  reacting to observed failures. It keeps today's fallback behavior: when
-  everything is cooling, the router may still try the soonest system-cooled
-  backend.
+  reacting to observed failures. It is still respected, never bypassed: there
+  is no "try the soonest cooling backend anyway" fallback. A system-cooled
+  candidate simply is not eligible until its cooldown expires, and the router
+  moves to the next eligible one (failover first). If none is eligible it
+  returns an honest 503 with a `Retry-After`. Server-class cooling is scoped to
+  the physical `(backend, upstream)` route; the account is cooled only when two
+  distinct routes of it fail inside 60s. See DESIGN-3LAYER section 3b.
 
 Sticky vs timed only changes when a manual cool auto-expires:
 
@@ -71,12 +75,16 @@ Sticky vs timed only changes when a manual cool auto-expires:
 `markSuccess(id)`: if the backend is cooling and `lastError.kind === "manual"`,
 return without clearing. Otherwise `markHealthy` as today.
 
-All-cooling fallback in `handleChat`: build `manualCooled` = set of backend ids
-that are cooling with `lastError.kind === "manual"`. The fallback pool is
-`ordered.filter(id => !manualCooled.has(id)).sort(soonest nextAvailableAt)`.
-If that pool is empty, return 503 with body
+Eligibility in `handleChat`: build `manualCooled` = set of backend ids that
+are cooling with `lastError.kind === "manual"`. A candidate is eligible only
+when it is not manual-cooled, not account-cooling, not route-cooling, not
+session-excluded, and not being probed; the pool is `ordered` filtered to the
+eligible candidates, in order. If that pool is empty, return 503 with body
 `{"error":{"message":"all available backends are cooling (N manually cooled - uncool to restore)","type":"router_unavailable"}}`
-(N = count of manual-cooled), and record history/stats as today's 503 path does.
+(N = count of manual-cooled) when every blocker is manual, or the scoped
+`no provider is currently eligible for this request (...) ` message otherwise,
+and record history/stats as today's 503 path does. Manual cools remain the one
+blocker with no automatic recovery.
 
 `/health`: each backend entry gains `"manual": true|false` (cooling AND
 lastError.kind === "manual"), so the UI can show "until uncooled" instead of a
@@ -89,9 +97,12 @@ countdown.
 ## 3. Preset strategies
 
 All strategies return an ordered candidate list; `handleChat` keeps its
-existing healthy-filter + in-order retry over that list. Health, backoff,
-weekly pinning, and metrics are per-backend and inherited by every strategy
-for free. The preset layer never needs to know about backoff.
+existing eligibility filter + in-order failover over that list. Account health,
+backoff, weekly pinning, and metrics are per-backend; server-class cooling is
+additionally scoped to the physical route, and `handleChat` promotes a
+session's last successful route inside its own model group (DESIGN-3LAYER
+section 3b). Every strategy inherits all of that for free; the preset layer
+never needs to know about backoff.
 
 ### affinity (today's behavior, generalized)
 

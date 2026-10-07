@@ -283,19 +283,30 @@ Request flow:
    order into one attempt list of `{model, backend, upstream}`.
 5. Dedup the flattened list by backend id (first occurrence wins, keeping that
    occurrence's model+upstream).
-6. Health filter + fallback (semantics identical to DESIGN-PRESETS section 2):
-   healthy = attempts whose backend is not cooling (or whose cool expired).
-   If any healthy exist, pool = healthy in order. Else pool = all attempts
-   whose backend is NOT manually cooled, sorted by soonest
-   `nextAvailableAt`. Manual cools NEVER participate in the fallback and are
-   never success-cleared. If that pool is empty, 503 with the existing message
-   `all available backends are cooling (N manually cooled - uncool to
-   restore)` (N = count of distinct manual-cooled backend ids in the attempt
-   list), recording history/stats on the 503 path exactly as today.
-7. Attempt loop: for each attempt, build the payload (section 4) and forward.
-   Failure -> markFailure, continue (client-classified errors break the loop,
-   unchanged). Success -> markSuccess, relay, record history/stats, return.
-   Exhausted -> 503 with the last upstream error body (unchanged shape).
+6. Session preference: the route this (credential, session, logical model)
+   group last succeeded on is promoted to the FRONT OF ITS OWN MODEL GROUP
+   (section 3b). It is skipped when that route is not eligible, and it can
+   never reorder models or undo backend dedup.
+7. Strict eligibility, no fallback (2026-10-07): pool = the attempts that are
+   eligible RIGHT NOW, in order. An attempt is ineligible when its account is
+   cooling (weekly, auth, billing, rate, or a proven account outage), its ROUTE
+   is cooling (5xx/network/timeout/unusable `200`), this session has been
+   excluded from it (opaque `400`/`422`), or a recovery probe already holds
+   its lease. There is deliberately NO path that retries a cooling provider
+   anyway: "try it even though it is cooling" hid the real state behind a bogus
+   all-cooling story. If the pool is empty, 503 naming the scope and the
+   blocker counts, with `Retry-After` for the nearest finite recovery (omitted
+   when nothing recovers on its own). The all-manual case keeps its
+   long-standing wording `all available backends are cooling (N manually
+   cooled - uncool to restore)`.
+8. Attempt loop: for each attempt, claim its recovery lease, build the payload
+   (section 4) and forward. Failover comes FIRST: a retryable error moves to
+   the next eligible provider; the per-model same-provider retry applies only
+   when no other attempt in the pool is eligible. An EXPLAINED client error
+   breaks the loop and is returned as the real `400`/`422`; an opaque one
+   excludes the route for this session and continues. Success is marked only at
+   a clean usable completion. Exhausted -> `503`, or the genuine client status
+   when the last failure was an explained caller error.
 
 Forwarding: resolve the key from `backend.apiKeyEnv`, URL =
 `backend.baseURL` (trailing slash stripped) + `/chat/completions`,
@@ -397,6 +408,74 @@ chain of a tier preset.
 Unchanged: preset ids first (config order), then model ids not already listed.
 A preset-of-presets does NOT change the id list - nested presets are already
 listed as their own ids.
+
+---
+
+## 3b. Route vs account health, eligibility, and session preference
+
+This is load-bearing contract, not implementation detail: the failure scope
+decides which requests are affected, and a wrong scope either strands a session
+or disables a healthy fleet.
+
+**The two scopes.** A ROUTE is one physical `(backend, upstream)` pair. Route
+state is shared by every logical model that aliases that pair, and separate
+routes of one account are independent. Server-class failures (5xx, network,
+timeout, a completed `200` with no usable output) cool the ROUTE with the
+server backoff policy (30s base, 5 min cap). The ACCOUNT is cooled only on
+evidence of a real account outage: at least two DISTINCT routes of that backend
+failing inside 60s (one route failing twice does not escalate). Auth, billing,
+weekly, and rate-limit classes keep their existing account-wide meaning. The
+escalation is a conservative heuristic over a 60s window, not proof of the
+provider's internal cause, and a success resets only its own route's streak.
+
+**Routes, not status lines.** A route is marked healthy only at a clean usable
+completion (parsed content, reasoning, or a tool call). A `200` with none of
+those, a stalled stream, or a cut stream is a route failure that is still
+delivered to the caller unchanged — never replayed, never re-statused. A caller
+that disconnects is charged to no provider, because the provider did nothing
+wrong.
+
+**Opaque rejection is a session exclusion, not a cooldown.** A `400`/`422`
+whose body carries no explanation is `upstream_rejection`: it has no evidence
+that the payload was at fault, so it fails over, and it excludes that route for
+that SESSION only for 30s. The exclusion is keyed by session + physical route,
+so two models aliasing one route share it. Callers with the shared
+`no-session` key get no exclusion (and no preference), because pinning or
+excluding a shared bucket would apply one anonymous caller's experience to
+every other.
+
+**Strict eligibility.** An attempt is eligible only when its account health, its
+shared route health, the applicable session exclusion, and recovery-lease
+ownership all allow it. Eligibility is rechecked immediately before each
+dispatch, and a recovery lease is claimed synchronously before any network
+await, so exactly ONE request probes a recovering route or account while
+concurrent requests wait or take another provider. If no attempt is eligible,
+the router returns a structured `503` naming the scope and a `Retry-After`
+for the earliest finite recovery. An empty pool of manually cooled providers
+has no automatic recovery and carries no such header. A `503` while a probe is
+in flight is correct behavior, not a bug.
+
+**Retry boundary.** Failover comes first: if another eligible provider exists,
+the router moves to it immediately rather than spending same-provider retries.
+The configured per-model retry policy applies only when nothing else in the pool
+is eligible, and never for an opaque rejection (the same payload on the same
+provider is the same request). No retry bypasses an active cooldown.
+
+**Session preference.** The route that produced usable output becomes the first
+choice for its `(credential, session, logical model)` group, so a session stays
+on the fallback that worked instead of re-probing the provider that failed.
+Moving costs the prompt cache, and that cost is accepted deliberately. The map
+is bounded at 10,000 entries with LRU eviction (the explicit exception to
+stickiness) and has no idle TTL for a healthy pin. A pin is promoted only inside
+its own logical-model group, is skipped when not eligible, and never reorders
+models or undoes backend dedup. An operator cool, uncool, or reset clears it -
+an explicit routing decision must not be overruled by learned preference - and a
+config reload prunes pins whose route is gone. `/admin/reset-health` is an
+operator override and clears all of it - account cooling, route cooldowns,
+session exclusions, the account-outage window, and the pins - because a reset
+that left route cooldowns behind would report "healthy" while still refusing to
+route. Distinct credentials with identical session ids never share a
+pin.
 
 ---
 
@@ -509,8 +588,15 @@ Request-time 404 messages (type `model_not_found`, same shape as today):
   - nested preset refs recursively expanded, first-occurrence order, deduped)
   kept for UI/test compatibility across the phased rollout, top-level `params`
   when present, backoff. Never key values.
-- `/health`, `/api/stats`, `/api/history` (entries gain `routedModel`),
-  `/v1/chat/completions`, `/admin/*`: unchanged shapes apart from `routedModel`.
+- `/health`: backend rows unchanged apart from `probeInFlight`; adds a
+  `routes` array of route-scoped rows - one per route that has recorded a
+  failure - with `backend`, `upstream`, `models`, `state`, `fails`,
+  `nextAvailableAtMs`, `retryInMs`, `probeInFlight`, `lastErrorKind`,
+  `lastStatus`. Session exclusions are never exposed: they are per-caller
+  state.
+- `/api/stats`, `/api/history` (entries gain `routedModel`),
+  `/v1/chat/completions`, `/admin/*`: unchanged shapes apart from
+  `routedModel`.
 - `GET /api/auth/status`, `POST /api/auth/login`, `POST /api/auth/logout`:
   dashboard password gate, NEVER gated by `requireAuth` (they ARE the login).
   `/api/auth/status` -> `{passwordSet, uiAuthed}`; login compares
@@ -710,18 +796,20 @@ Notes:
    the header wait (TTFT), never the body. The body has an idle/stall watchdog
    in `relay()` (`idleTimeoutMs`, default 120s) that aborts only on silence.
    Motivation + evidence in the "Timeout semantics" section below.
-4. `handleChat`: resolve via `candidates`, apply the health filter + manual
-   exclusion + fallback over the flattened attempt list, attempt loop calls
-   buildPayload per attempt. `newHistoryEntry` gains `routedModel: f.
+4. `handleChat`: resolve via `candidates`, apply strict eligibility (section
+   3b) over the flattened attempt list, attempt loop calls buildPayload per
+   attempt. `newHistoryEntry` gains `routedModel: f.
    routedModel ?? null`; `entry.model` stays the requested id. 404/503 message
    paths per sections 3/4.
 5. `/v1/models` per section 5; `/api/config` unchanged endpoint, new normalized
    body (with derived preset `members`).
 6. Config-time validation warnings per section 4.
-7. No regressions: health registry keyed by backend id, weekly pinning,
-   backoff, metrics fields, JSONL history, stream tee, hot-reload, prefix,
-   localhost binding, sticky manual cool (markSuccess guard, fallback
-   exclusion, /health manual flag, sticky/timed admin cool).
+7. No regressions: weekly pinning, metrics fields, JSONL history, stream tee,
+   hot-reload, prefix, localhost binding, sticky manual cool (markSuccess guard,
+   /health manual flag, sticky/timed admin cool). The account health registry
+   is still keyed by backend id; route health is a second, route-scoped layer
+   (section 3b) and an account cool is no longer the only way a provider is
+   held out of a request.
 8. Exports: `export { candidates, normalizeConfig, buildPayload }` (remove
    `normalizePresets`).
 9. Existing 63 tests: all names/assertions pass; the y1..y9 unit block is
@@ -1075,7 +1163,23 @@ cost = missTokens * (inputPerM * mult) / 1e6
 |---|---|---|
 | `promptCacheHitTokens` | number | raw prompt tokens served from cache (0 = upstream did not report a split) |
 | `promptCacheMissTokens` | number | raw miss tokens; derived from `prompt - hit` when the upstream only reports hits |
-| `errorKind` | string \| null | classified upstream failure kind: `weekly` / `rate` / `auth` / `server` / `client`; null = no upstream failure |
+| `errorKind` | string \| null | classified upstream failure kind: `weekly` / `rate` / `auth` / `server` / `client` / `upstream_rejection` (a `400`/`422` that explained nothing; fails over and excludes the route for that session only) / `billing` (a literal `402 Payment Required`, or a body naming insufficient credits / quota / balance / funds; fails over and cools the dry account); null = no upstream failure |
+| `selectionReason` | string \| null | why the FIRST attempt was the one it was: `configured` (declared order), `session_preference` (this session's pin won), `cooldown` (candidates ahead of it were ineligible); null when nothing was eligible |
+| `fallbackCount` | number | how many times the request moved to a DIFFERENT backend; a same-provider retry is not a fallback, so this is never the retry count |
+| `cacheMayBeCold` | boolean | true when the request changed provider, so its prompt cache MAY be cold - a possibility, never a measured miss |
+| `attemptsSummary` | array | one bounded, body-free outcome per attempt: `{backend, upstream, status, kind, decision, latencyMs, errorBodyState, errorBodyBytes, retries, cooldownScope, nextAvailableAt, requestIds}`; `decision` is `success` / `failover` / `client_error` / `unusable` / `client_cancelled`, and `errorBodyState` is `present` / `empty` / `truncated` / `timeout` / `read_error` |
+| `attemptsOmitted` | number | outcomes dropped by the summary cap (the first 31 and the last are kept, so both ends of a long attempt chain survive) |
+
+The same summary rides the in-memory detail record under `detail.response` (alongside
+`errorKind`, `upstreamStatus` and the redacted `errorBody`), so a failure is inspectable
+even after its summary has aged out of the ring buffer. Every terminal chat failure -
+including the no-provider-eligible `503` - returns one envelope:
+`{error:{message, type, code, callId, backend, upstreamStatus, nextAvailableAt}}`, where a
+missing `nextAvailableAt` means no automatic recovery. `code` names the blocking scope
+(`manual`, `account_cooling`, `route_cooling`, `probe_in_flight`, `session_excluded`,
+`mixed`) on the eligibility path and the failure kind on the exhaustion path. The message is
+never empty and never a raw dump: the provider's own words pass through redaction and a
+512-character cap, primitives only.
 | `cost` | number \| null | request cost in USD; null = the model has no `meta.pricing` |
 | `cacheSavings` | number \| null | USD saved by cache hits vs full-price miss (peak rates) |
 | `offPeakSavings` | number \| null | USD saved by the off-peak discount (0 when it did not apply) |

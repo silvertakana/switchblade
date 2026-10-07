@@ -50,18 +50,88 @@ backend, and the router retries through healthy members in order.
 
 ### Health & backoff
 
-Per-backend state machine (`healthy` → `cooling` → healthy on success):
+Health is tracked at two scopes. A **route** is one physical
+`(backend, upstream)` pair — one account can serve many routes. An **account**
+is the backend itself.
 
-- 429 weekly-limit errors cool until the weekly reset (parses `Resets in N
-  days`).
-- 429 generic: exponential backoff, 30s base → 10 min cap.
-- 5xx/network: 30s base → 5 min cap. 401/403: 1 min base → 30 min cap.
-- 400/422 client payload errors: returned immediately, backend NOT cooled.
-- Success resets backoff and returns the backend to healthy.
+Account-level cooling (unchanged classes): 429 weekly-limit errors cool until
+the weekly reset (parses `Resets in N days`); 429 generic is exponential
+backoff, 30s base → 10 min cap; 401/403 is 1 min base → 30 min cap. Billing
+failures cool the dry ACCOUNT and fail over to the next provider instead of
+blocking the pool or blaming the caller: a literal `402 Payment Required`
+(whatever its body says), or a `400`/`422` whose body matches
+`insufficient (credits|quota|balance|funds)`, `insufficient_quota`,
+`insufficient_balance`, `out of credits`, `no credits`, `billing error` or
+`payment required`. 30s base → 5 min cap.
+
+Route-level cooling: a server-class failure — 5xx, network, timeout, or a
+completed `200` that carried no usable output — cools only the route that
+produced it. One bad upstream model route no longer disables every other model
+on the same account. The route backs off with the server policy (30s base → 5
+min cap); the failure streak survives the timer, so a flapping route backs off
+further each time instead of restarting at the base delay.
+
+The **account** is cooled only on a real account outage: two DISTINCT routes of
+the same backend failing inside 60s. One route failing twice does not count -
+the escalation needs two different upstreams. A success clears its own route's
+failure streak; the outage window itself is purely a 60s timeout.
+
+**Opaque upstream rejections.** A `400`/`422` whose body carries no
+explanation (empty, whitespace, message-less JSON, an unparseable fragment) is
+classified `upstream_rejection`: it fails over to the next provider, it does
+NOT blame the caller, and it excludes that route for that SESSION only, for
+30s. The same payload may be fine on another provider. A body that DOES explain
+itself (or a billing body) keeps its old meaning: the caller's payload was
+rejected, and the real `400`/`422` is returned without failover.
+
+**Strict eligibility — no fallback that tries a cooling provider anyway.** A
+candidate is eligible only if its account is not cooling, its route is not
+cooling, this session has not been excluded from it, and it is not already
+being probed. Eligibility is rechecked immediately before each dispatch. When
+nothing is eligible the router returns an honest `503` naming the scope
+(`no provider is currently eligible for this request (1 route cooling, ...)`;
+the all-manual case keeps its long-standing
+`all available backends are cooling (N manually cooled - uncool to restore)`
+wording) plus a `Retry-After` for the earliest finite recovery. A pool held
+only by manual cools has no automatic recovery, so no `Retry-After` is sent.
+
+**Recovery probes.** When a route's or account's cooldown expires, exactly ONE
+request may probe it: the lease is claimed synchronously before any network
+wait, and concurrent requests either wait or take another provider instead of
+piling onto the recovering route. A `503` is therefore legitimate while a
+probe is in flight (the router advertises a 1s hint).
+
+**Failover first.** A retryable upstream error moves to the next eligible
+provider immediately. The same-provider retry config (see below) only applies
+when nothing else in the pool is eligible.
+
+**Surface success, not the status line.** A route is marked healthy only at a
+clean USABLE completion — parsed content, reasoning, or a tool call. A `200`
+that carried none of those, a stalled stream, or a cut stream is charged to the
+route as a failure and is still delivered to the caller unchanged (never
+replayed). A caller that hangs up mid-stream is charged to nobody.
+
+**Session provider preference.** The route that produced usable output becomes
+that `(credential, session, logical model)` group's first choice, so a session
+stays on the fallback that worked instead of re-probing the provider that
+failed. Moving costs the prompt cache, and that is accepted. The map holds
+10,000 entries with LRU eviction and no idle TTL: a healthy pin persists for
+the life of the process (a restart clears it, like all health state). A pin is
+only ever promoted inside its own logical-model group, so it never reorders
+models; it is skipped when the pinned route is not currently eligible. It is
+cleared when an operator cools, uncools, or resets a backend (the explicit
+action wins over learned preference), and it is dropped when a config reload no
+longer references the route. `/admin/reset-health` is an operator override, so it clears EVERY
+layer that can hold a request off a provider: account cooling, route cooldowns,
+session exclusions, the account-outage window, and the learned preferences. A
+reset that left route cooldowns behind would report "healthy" while still
+refusing to route. Callers whose session key resolves to
+`no-session` get no preference at all.
 
 Manual cools (from the UI or `POST /admin/backend`) are **sticky**: they never
-participate in the all-cooling fallback and are never cleared by a success.
-Only the Uncool action (or a timed `forMs`) restores the backend.
+participate in a fallback and are never cleared by a success. Only the Uncool
+action (or a timed `forMs`) restores the backend — and that action also clears
+the learned session preferences, so nothing keeps routing around it.
 
 ### Timeouts (connect vs idle)
 
@@ -91,9 +161,11 @@ The operation was aborted due to timeout").
 ### Per-model retries
 
 On top of cooling, a model can retry a **transient** failure on the SAME
-provider before falling through to the next candidate. This preserves the
-session's prompt cache (a fallback backend has zero cached context) and gives
-chronically-overloaded free models a chance to catch a free slot.
+provider — but only when nothing else in the pool is eligible. Failover comes
+FIRST: if another eligible provider exists, the router moves to it immediately
+instead of consuming same-provider retries. The retry config still matters for
+single-provider pools and gives chronically-overloaded free models a chance to
+catch a free slot.
 
 ```jsonc
 {
@@ -114,7 +186,9 @@ chronically-overloaded free models a chance to catch a free slot.
 
 Retryable failures: 502/503/504, 429 with an `overload` message, network
 errors (status 0). NOT retried: 429 weekly limits (GoUsageLimitError), auth
-errors, 400/422 client payload errors, and anything that has already started
+errors, explained 400/422 client payload errors, opaque 400/422
+`upstream_rejection` bodies (retrying the same payload on the same provider
+proves nothing — those fail over instead), and anything that has already started
 streaming (a partially-relayed response can never be retried without
 duplicating content). Retries never re-cool the backend; `markFailure` runs
 once after retries are exhausted, exactly as before. History entries carry
@@ -259,7 +333,7 @@ three-layer shape at load, byte-identically for identical effective configs.
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| GET | `/health` | per-backend health, state, manual flag |
+| GET | `/health` | per-backend health (`state`, `fails`, `lastError`, `manual`, `probeInFlight`) plus a `routes` array: one row per route that has recorded a failure, with `backend`, `upstream`, `models`, `state` (`cooling`/`probing`/`healthy`), `fails`, `nextAvailableAtMs`, `retryInMs`, `probeInFlight`, `lastErrorKind`, `lastStatus` |
 | GET | `/v1/models` | OpenAI-compatible model list (preset ids) |
 | POST | `/v1/chat/completions` | chat completions (stream + non-stream) |
 | GET | `/api/stats` | traffic stats |
@@ -277,7 +351,7 @@ three-layer shape at load, byte-identically for identical effective configs.
 | POST | `/api/env` | `{name, value, baseRevision}` -> writes the managed secrets store; 400 for protected or shell-owned names; 409 on a stale revision; admin required |
 | POST | `/api/env/reveal` | `{name}` -> `{name, value}` for ONE variable; 400 for protected auth names and for names outside the editor's set (config-referenced, managed, or `.env`-declared); admin required |
 | DELETE | `/api/env?name=X` | removes a managed variable; 409 for `.env`/shell-sourced names; admin required |
-| POST | `/admin/reset-health` | reset all cooling states |
+| POST | `/admin/reset-health` | reset every cooling layer (accounts, routes, session exclusions, the account-outage window) and the learned session preferences |
 | POST | `/admin/backend` | `{id, action: "cool"\|"uncool", forMs?}` manual cool/uncool |
 | GET | `/` | web UI |
 
@@ -367,21 +441,27 @@ restarts; the contract is in DESIGN-3LAYER.md section 14.
 npm test   # node test.mjs
 ```
 
-The suite (357 assertions) spins up mock backends plus router instances on temp
-configs — no keys, no network. It covers health, streaming, session affinity,
-failover, weighted selection, sticky/timed manual cools, fallback exclusion,
-dialect handling, synthesis from both legacy eras, the layered-params merge
-order, preset-of-presets nesting (expansion, cycle detection, ordering rules),
-per-model retry/backoff, the request-detail endpoint, the analytics
-dashboard (cost engine, /api/dashboard aggregates, cooling timeline), and the
-env editor (auth gate, list scoping, precedence, protected names, stale-revision
-conflicts, snapshots, and hot reload).
+The suite spins up mock backends plus router instances
+on temp configs — no keys, no network. It covers health, streaming, session
+affinity, failover, weighted selection, sticky/timed manual cools, fallback
+exclusion, route-scoped cooling (a sibling route succeeding is not an account
+outage), opaque 400/422 rejections (fail over, session-scoped exclusion, never
+blame the caller), strict eligibility and the honest 503 + `Retry-After`,
+recovery probes (one at a time), failover-first retries, session stickiness
+after a fallback, unusable-`200` handling (charged to the route, delivered to
+the caller unchanged), dialect handling, synthesis from both legacy eras, the
+layered-params merge order, preset-of-presets nesting (expansion, cycle
+detection, ordering rules), per-model retry/backoff, the request-detail
+endpoint, the analytics dashboard (cost engine, /api/dashboard aggregates,
+cooling timeline), and the env editor (auth gate, list scoping, precedence,
+protected names, stale-revision conflicts, snapshots, and hot reload).
 
 ## Design docs
 
 - `DESIGN-3LAYER.md` — the three-layer contract (backends/models/presets,
   routing, layered params, verification checklist).
-- `DESIGN-PRESETS.md` — the presets layer and sticky manual-cool semantics.
+- `DESIGN-PRESETS.md` — the presets layer, sticky manual-cool semantics, and
+  what a manual cool clears.
 - `SPEC.md` — original spec and verification plan.
 
 ## Contributing
