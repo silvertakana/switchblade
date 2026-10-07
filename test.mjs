@@ -2064,19 +2064,36 @@ async function main() {
       res.end(JSON.stringify({ error: { message: "bad payload", type: "invalid_request_error" } }));
     });
     const z20port = await listen(clientSrv);
+    // A SECOND, healthy provider is what gives this test teeth: with a
+    // single-provider pool the pool merely exhausts and the status assertion still
+    // passes even if an explained client error stopped being terminal. With a
+    // healthy fallback present, any failover shows up as z20b hits.
+    const z20b = mockBackend("z20b", {});
+    z20b.port = await listen(z20b.srv);
+    // Live ntfy sink. It exists to PROVE the alert wiring works (zOpaque3 asserts a
+    // POST arrives on an equivalent sink), which is what makes this test's "no
+    // alert" assertion meaningful rather than vacuous. cooldownMs 0 leaves the
+    // path unthrottled.
+    const z20Ntfy = mockBackend("z20ntfy", {});
+    z20Ntfy.port = await listen(z20Ntfy.srv);
     const cfgZ20 = {
       port: 0, prefix: "/v1", masterKeyEnv: null,
-      backends: [{ id: "z20", baseURL: `http://${HOST}:${z20port}`, apiKeyEnv: "KEY_Z20" }],
+      alerts: { ntfy: { baseUrl: `http://${HOST}:${z20Ntfy.port}`, topic: "t", cooldownMs: 0 } },
+      backends: [
+        { id: "z20", baseURL: `http://${HOST}:${z20port}`, apiKeyEnv: "KEY_Z20" },
+        { id: "z20b", baseURL: `http://${HOST}:${z20b.port}`, apiKeyEnv: "KEY_Z20B" },
+      ],
       models: {
         "m20": {
-          providers: [{ backend: "z20", upstream: "u20" }], affinityPool: 1,
+          // affinityPool 1 pins declared order, so z20 is always attempted first.
+          providers: [{ backend: "z20", upstream: "u20" }, { backend: "z20b", upstream: "u20b" }], affinityPool: 1,
           retry: { maxRetries: 3, baseMs: 10, maxMs: 50 },
         },
       },
       presets: { "p20": { strategy: "affinity", models: ["m20"] } },
       backoff: BO,
     };
-    const { child: childZ20, base: baseZ20, dir: dirZ20 } = await startRouterCfg(cfgZ20, "KEY_Z20=k\n");
+    const { child: childZ20, base: baseZ20, dir: dirZ20 } = await startRouterCfg(cfgZ20, "KEY_Z20=k\nKEY_Z20B=k\n");
     try {
       const rr = await fetch(baseZ20 + "/v1/chat/completions", {
         method: "POST",
@@ -2097,9 +2114,20 @@ async function main() {
         /bad payload/.test(JSON.stringify(z20body)),
         "z20b) the 422 carries the upstream explanation (body=" + JSON.stringify(z20body).slice(0, 120) + ")"
       );
+      assert(
+        z20b.hits.length === 0 && rr.headers.get("x-router-backend") === "z20",
+        "z20c) the explained client error never reached the healthy fallback (otherHits=" + z20b.hits.length + ", backend=" + rr.headers.get("x-router-backend") + ")"
+      );
+      // request_exhausted must NOT fire for a caller-side payload error. The
+      // sibling assertion in zOpaque3 proves this sink would have caught it.
+      await new Promise((r) => setTimeout(r, 250));
+      assert(
+        z20Ntfy.hits.length === 0,
+        "z20d) an explained client error raises no exhaustion alert (alerts=" + z20Ntfy.hits.length + ")"
+      );
     } finally {
       childZ20.kill();
-      clientSrv.close();
+      clientSrv.close(); z20b.srv.close(); z20Ntfy.srv.close();
       await rm(dirZ20, { recursive: true, force: true });
     }
   }
@@ -2156,6 +2184,8 @@ async function main() {
     ["whitespace", 422, "   \n  "],
     ["empty-object", 400, "{}"],
     ["message-less-json", 400, JSON.stringify({ error: { type: "invalid_request_error" } })],
+    ["terse-model-only-json", 400, JSON.stringify({ model: "some-model" })],
+    ["empty-messages", 422, JSON.stringify({ messages: [] })],
   ]) {
     let aHits = 0;
     const aSrv = http.createServer((req, res) => {
@@ -2192,6 +2222,51 @@ async function main() {
     }
   }
 
+  // zExplained1) The other half of the same contract, and the direction a
+  //   regression would take: a 400/422 that DOES explain itself is the caller's
+  //   payload, so it stops at the first provider with its real status. It never
+  //   fails over to a healthy provider, never becomes a 503, and never retries.
+  for (const [label, exStatus, exBody] of [
+    ["json-string-error", 400, JSON.stringify("the payload is malformed")],
+    ["error-message", 422, JSON.stringify({ error: { message: "messages[0].role is invalid" } })],
+    ["top-level-message", 400, JSON.stringify({ message: "unsupported parameter: logit_bias" })],
+    ["plain-text", 422, "context length exceeded for this model"],
+  ]) {
+    let aHits = 0;
+    const aSrv = http.createServer((req, res) => {
+      aHits++;
+      res.writeHead(exStatus, { "content-type": "application/json" });
+      res.end(exBody);
+    });
+    const aPort = await listen(aSrv);
+    const bMock = mockBackend("exB", {});
+    bMock.port = await listen(bMock.srv);
+    const cfgEx = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "exA", baseURL: `http://${HOST}:${aPort}`, apiKeyEnv: "KEY_EXA" },
+        { id: "exB", baseURL: `http://${HOST}:${bMock.port}`, apiKeyEnv: "KEY_EXB" },
+      ],
+      // affinityPool 1 pins declared order, so exA is always tried first. retry is
+      // configured deliberately: an explained error must ALSO decline the
+      // same-provider retry, not just the failover.
+      models: { mEx: { providers: [{ backend: "exA", upstream: "uA" }, { backend: "exB", upstream: "uB" }], affinityPool: 1, retry: { maxRetries: 3, baseMs: 10, maxMs: 50 } } },
+      presets: { pEx: { strategy: "affinity", models: ["mEx"] } },
+      backoff: BO,
+    };
+    const hEx = await startRouterCfg(cfgEx, "KEY_EXA=k\nKEY_EXB=k\n");
+    try {
+      const rr = await api(hEx.base, "/v1/chat/completions", { body: { model: "pEx", messages: [] } });
+      assert(
+        rr.status === exStatus && aHits === 1 && bMock.hits.length === 0,
+        "zExplained1-" + label + ") explained " + exStatus + " stops with no failover and no retry (status=" + rr.status + ", aHits=" + aHits + ", otherHits=" + bMock.hits.length + ")"
+      );
+    } finally {
+      hEx.child.kill(); aSrv.close(); bMock.srv.close();
+      await rm(hEx.dir, { recursive: true, force: true });
+    }
+  }
+
   // zOpaque3) When EVERY provider returns an unexplained rejection the request
   //   still cannot be answered, but the router must exhaust the pool (one attempt
   //   each) instead of aborting on the first one, and report it as provider
@@ -2203,8 +2278,13 @@ async function main() {
     const srvB = http.createServer((req, res) => { bHits++; res.writeHead(400, { "content-type": "application/json" }); res.end(); });
     const portA = await listen(srvA);
     const portB = await listen(srvB);
+    // Alert sink. Its assertion below is the CONTROL that makes z20d's "no alert"
+    // meaningful: it proves the wiring delivers a request_exhausted POST at all.
+    const o3Ntfy = mockBackend("o3ntfy", {});
+    o3Ntfy.port = await listen(o3Ntfy.srv);
     const cfgO3 = {
       port: 0, prefix: "/v1", masterKeyEnv: null,
+      alerts: { ntfy: { baseUrl: `http://${HOST}:${o3Ntfy.port}`, topic: "t", cooldownMs: 0 } },
       backends: [
         { id: "opqA3", baseURL: `http://${HOST}:${portA}`, apiKeyEnv: "KEY_OPQA3" },
         { id: "opqB3", baseURL: `http://${HOST}:${portB}`, apiKeyEnv: "KEY_OPQB3" },
@@ -2219,12 +2299,25 @@ async function main() {
     const h3 = await startRouterCfg(cfgO3, "KEY_OPQA3=k\nKEY_OPQB3=k\n");
     try {
       const rr = await api(h3.base, "/v1/chat/completions", { body: { model: "pO3", messages: [] } });
+      const o3body = await rr.json();
       assert(
         rr.status === 503 && aHits === 1 && bHits === 1,
         "zOpaque3) all-opaque exhausts the pool once per provider and returns 503 (status=" + rr.status + ", hits=" + aHits + "/" + bHits + ")"
       );
+      // The 503 must blame the unexplained rejection, not a cooling state the
+      // router never entered: a regression to the old wording passes the status
+      // assertion above and is caught only here.
+      assert(
+        /without explaining why/.test(JSON.stringify(o3body)),
+        "zOpaque3b) the 503 blames the unexplained rejection, not cooling (body=" + JSON.stringify(o3body).slice(0, 150) + ")"
+      );
+      await new Promise((r) => setTimeout(r, 250));
+      assert(
+        o3Ntfy.hits.length >= 1,
+        "zOpaque3c) provider exhaustion DOES raise an exhaustion alert (alerts=" + o3Ntfy.hits.length + ")"
+      );
     } finally {
-      h3.child.kill(); srvA.close(); srvB.close();
+      h3.child.kill(); srvA.close(); srvB.close(); o3Ntfy.srv.close();
       await rm(h3.dir, { recursive: true, force: true });
     }
   }

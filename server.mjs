@@ -1999,6 +1999,12 @@ async function handleChat(req, res, cfg, bodyText) {
 
   let lastErr = null;
   let lastTried = null;
+  // Failed-attempt tallies: the terminal message may only claim that EVERY
+  // provider rejected the request unexplained when that is literally what
+  // happened. If an earlier provider failed WITH an explanation (a 500, say) and
+  // only the last one was opaque, the universal claim would mislabel the request.
+  let failedAttempts = 0;
+  let opaqueFailures = 0;
   const captureDetail = bodyText.length <= DETAIL_MAX_BODY_BYTES; // size guard: skip huge payloads
   const detailT = Date.now();
   for (const attempt of pool) {
@@ -2053,12 +2059,15 @@ async function handleChat(req, res, cfg, bodyText) {
     recordDetail(detailT, callId, captureDetail ? payload : boundedPayload(payload), attemptRec);
     if (result.err) {
       lastErr = result.err;
+      const errKind = classify(result.err.status, result.err.body);
+      failedAttempts++;
+      if (errKind === "upstream_rejection") opaqueFailures++;
       markFailure(cfg, attempt.backend, result.err.status, result.err.body);
       // An EXPLAINED client error is the caller's payload, so it would fail
       // identically on every provider: fail fast, no retry, no failover. An
       // unexplained rejection proves nothing about the payload, so it falls
       // through to the next provider instead.
-      if (classify(result.err.status, result.err.body) === "client") break;
+      if (errKind === "client") break;
       continue;
     }
     // Success: mark healthy, relay (ttft = time to first upstream response),
@@ -2177,14 +2186,18 @@ async function handleChat(req, res, cfg, bodyText) {
   // Never dress an unexplained rejection up as "all backends cooling": that
   // claimed a cooling state the router never entered, which is what made the
   // 2026-10-07 incident unreadable. Genuine eligibility failures have their own
-  // path above and keep their own wording.
+  // path above and keep their own wording. The universal claim is reserved for an
+  // exhaustion in which NO provider explained itself.
+  const allRejectionsOpaque = failedAttempts > 0 && opaqueFailures === failedAttempts;
   // Named errBody, not body: the enclosing handler already binds "body" to the
   // parsed request payload.
   let errBody;
   if (explainedClient) {
     errBody = typeof msg === "string" && msg ? msg : JSON.stringify({ error: { message: "the upstream rejected this request", type: "invalid_request_error" } });
+  } else if (lastKind === "upstream_rejection" && allRejectionsOpaque) {
+    errBody = JSON.stringify({ error: { message: `every provider rejected this request without explaining why (${failedAttempts} tried)`, type: "upstream_rejection" } });
   } else if (lastKind === "upstream_rejection") {
-    errBody = JSON.stringify({ error: { message: `every provider rejected this request without explaining why (${pool.length} tried)`, type: "upstream_rejection" } });
+    errBody = JSON.stringify({ error: { message: `the last provider (${lastTried ? lastTried.backend : "unknown"}) rejected this request without explaining why, after ${failedAttempts} failed attempt(s)`, type: "upstream_rejection" } });
   } else {
     errBody = typeof msg === "string" && msg ? msg : JSON.stringify({ error: { message: "all backends cooling", type: "router_unavailable" } });
   }
