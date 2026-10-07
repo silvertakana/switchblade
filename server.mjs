@@ -713,16 +713,28 @@ function routeBackoffMs(fails, cfg) {
   return backoffFor("server", cfg, Math.max(1, fails));
 }
 
-// NUL cannot appear in a header value, so the session key can never be confused
-// with the separator.
-function sessionExclusionKey(sessionKey, attempt) {
-  return sessionKey + "\u0000" + routeKey(attempt);
+// The opaque-rejection scope: WHO reported it (the authenticated credential, as a
+// non-reversible fingerprint) plus the session that caller claims. Hashed so no raw
+// credential or session id ever becomes a map key a diagnostic could print, and so
+// two clients that happen to send the same x-session-affinity cannot see or clear
+// each other's exclusions - the spec's "different authentication scopes with
+// identical session IDs must not share state".
+function sessionScopeOf(authScope, sessionKey) {
+  return crypto.createHash("sha256").update(JSON.stringify([authScope, sessionKey || "no-session"])).digest("hex");
+}
+
+// An opaque rejection excludes ONE physical route for ONE caller/session/resolved
+// model. The resolved logical model is part of the key on purpose: two logical models
+// may alias the same physical route, and a blank 400 returned for model A is not
+// evidence that model B will be refused too. Route HEALTH stays shared across models
+// (zScope1/zScope2) - only this caller-scoped exclusion narrows.
+function sessionExclusionKey(exclScope, attempt) {
+  return crypto.createHash("sha256").update(JSON.stringify([exclScope, attempt.model, attempt.backend, attempt.upstream])).digest("hex");
 }
 
 // Lazy expiry: an elapsed exclusion is dropped on sight rather than swept.
-function isSessionExcluded(sessionKey, attempt, now) {
-  if (!sessionKey || sessionKey === "no-session") return false;
-  const key = sessionExclusionKey(sessionKey, attempt);
+function isSessionExcluded(exclScope, attempt, now) {
+  const key = sessionExclusionKey(exclScope, attempt);
   const e = SESSION_EXCLUSIONS.get(key);
   if (!e) return false;
   if (e.blockedUntil <= now) {
@@ -786,18 +798,18 @@ function ownsAccountSettlement(attempt) {
   return (h.generation || 0) <= attempt.dispatchSeq;
 }
 
-// An opaque rejection excludes the route for the CALLER that saw it. Keyed by
-// session + route rather than by logical model, so two models aliasing one physical
-// route share the exclusion, matching how route health is shared (zScope2).
-function excludeRouteForSession(sessionKey, attempt) {
-  if (!sessionKey || sessionKey === "no-session") return null;
-  const key = sessionExclusionKey(sessionKey, attempt);
+// An opaque rejection excludes the route for the CALLER that saw it, for that
+// caller's session and that resolved model. Requests with no session id get a
+// client-scoped "no-session" bucket rather than no memory at all: without one, the
+// same anonymous caller re-offers the refusing provider on every single call.
+function excludeRouteForSession(exclScope, attempt) {
+  const key = sessionExclusionKey(exclScope, attempt);
   SESSION_EXCLUSIONS.set(key, { blockedUntil: Date.now() + OPAQUE_EXCLUSION_MS, generation: nextGeneration(), routeKey: routeKey(attempt) });
   return key;
 }
 
 // Why a candidate cannot be tried right now, or null when it can.
-function ineligibility(attempt, sessionKey, now) {
+function ineligibility(attempt, exclScope, now) {
   const h = health.get(attempt.backend);
   if (h && h.state === "cooling") {
     if (!isUsableCurrently(attempt.backend, now)) {
@@ -813,16 +825,16 @@ function ineligibility(attempt, sessionKey, now) {
     if (r.nextAvailableAt > now) return "route_cooling";
     if (r.probeInFlight) return "probe_in_flight";
   }
-  if (isSessionExcluded(sessionKey, attempt, now)) return "session_excluded";
+  if (isSessionExcluded(exclScope, attempt, now)) return "session_excluded";
   return null;
 }
 
 // Nearest finite moment at which some blocked candidate returns, or null when
 // nothing recovers on its own (every blocker is a manual cool).
-function nearestRecoveryMs(ordered, sessionKey, now) {
+function nearestRecoveryMs(ordered, exclScope, now) {
   let best = null;
   for (const a of ordered) {
-    const why = ineligibility(a, sessionKey, now);
+    const why = ineligibility(a, exclScope, now);
     if (!why || why === "manual") continue;
     const h = health.get(a.backend);
     const r = ROUTES.get(routeKey(a));
@@ -830,7 +842,7 @@ function nearestRecoveryMs(ordered, sessionKey, now) {
     if (why === "account_cooling" && h) at.push(h.nextAvailableAt);
     if (why === "route_cooling" && r) at.push(r.nextAvailableAt);
     if (why === "session_excluded") {
-      const e = SESSION_EXCLUSIONS.get(sessionExclusionKey(sessionKey, a));
+      const e = SESSION_EXCLUSIONS.get(sessionExclusionKey(exclScope, a));
       if (e) at.push(e.blockedUntil);
     }
     // Nothing recovers on its own while a probe is running, but it will settle
@@ -844,7 +856,7 @@ function nearestRecoveryMs(ordered, sessionKey, now) {
 // Single dispatch point for an attempt's failure, so the three scopes cannot drift
 // apart: caller's fault changes nothing, an opaque rejection excludes the route for
 // this session, a server fault cools the route, and everything else cools the account.
-function noteAttemptFailure(cfg, attempt, sessionKey, status, bodyText, errorBodyState = "present") {
+function noteAttemptFailure(cfg, attempt, exclScope, status, bodyText, errorBodyState = "present") {
   // The settle path must classify from the SAME body-read state the terminal surface used,
   // or one request reports an opaque rejection and settles as a client error, writing no
   // exclusion (review finding 14). The ownership guards keep a late settlement from
@@ -852,7 +864,7 @@ function noteAttemptFailure(cfg, attempt, sessionKey, status, bodyText, errorBod
   const kind = classify(status, bodyText, errorBodyState);
   if (kind === "client") return kind;
   if (kind === "upstream_rejection") {
-    excludeRouteForSession(sessionKey, attempt);
+    excludeRouteForSession(exclScope, attempt);
     if (ownsAccountSettlement(attempt)) {
       const h = health.get(attempt.backend) || { state: "healthy", fails: 0, backoffMs: 0 };
       h.lastError = { status, kind, body: (bodyText || "").slice(0, 300) };
@@ -1005,7 +1017,7 @@ function sessionPreferenceKey(authScope, sessionKey, logicalModel) {
 function beginSessionRequest(authScope, sessionKey, logicalModel) {
   const key = sessionPreferenceKey(authScope, sessionKey, logicalModel);
   if (!key) return null;
-  return { key, sequence: nextRequestSequence(), sessionKey, logicalModel };
+  return { key, sequence: nextRequestSequence(), sessionKey, logicalModel, exclScope: sessionScopeOf(authScope, sessionKey) };
 }
 
 // Promote a pinned route to the FRONT OF ITS OWN MODEL GROUP only. Models are never
@@ -1023,7 +1035,7 @@ function orderSessionProviders(ordered, token, now = Date.now()) {
     const idx = group.findIndex((a) => routeKey(a) === row.routeKey);
     // A pinned route that cannot be used right now must not be promoted into a
     // doomed attempt; leave the group in its configured order.
-    if (idx > 0 && ineligibility(group[idx], token.sessionKey, now) === null) {
+    if (idx > 0 && ineligibility(group[idx], token.exclScope, now) === null) {
       out.push(group[idx], ...group.slice(0, idx), ...group.slice(idx + 1));
     } else {
       out.push(...group);
@@ -1063,7 +1075,7 @@ function evictSessionPreferences(cap = SESSION_PREF_CAP) {
 function rememberProvider(token, attempt, completion) {
   if (!token || !attempt || !completion || !completion.usable) return false;
   const now = Date.now();
-  if (ineligibility(attempt, token.sessionKey, now) !== null) {
+  if (ineligibility(attempt, token.exclScope, now) !== null) {
     SESSION_PREF_STATS.rejectedIneligible++;
     return false;
   }
@@ -2610,6 +2622,12 @@ async function handleChat(req, res, cfg, bodyText) {
   }
 
   const sessionKey = sessionKeyOf(req, body);
+  // Two scopes from one request, deliberately separate: the RAW session key drives
+  // affinity hashing and is forwarded upstream, while the hashed exclusion scope is
+  // who may be excluded from which resolution. Keeping them apart is what puts the
+  // credential INTO the opaque-rejection bucket without putting it in a header.
+  const authScope = authScopeOf(req);
+  const exclScope = sessionScopeOf(authScope, sessionKey);
   // One call id per incoming request, shared by the history entry, the detail
   // record, and the x-router-call response header so any request can be
   // referenced by a single short id.
@@ -2618,7 +2636,7 @@ async function handleChat(req, res, cfg, bodyText) {
   // Session provider preference: the route THIS caller's session last succeeded on
   // for this logical model is promoted inside its model group, so a session stays on
   // the fallback that worked instead of re-walking to a provider that keeps failing.
-  const prefToken = beginSessionRequest(authScopeOf(req), sessionKey, modelId);
+  const prefToken = beginSessionRequest(authScope, sessionKey, modelId);
   if (!c) {
     const e = newError(404, JSON.stringify({ error: { message: `model '${modelId}' not found`, type: "model_not_found" } }));
     return writeError(res, e);
@@ -2660,7 +2678,7 @@ async function handleChat(req, res, cfg, bodyText) {
   const blocked = {};
   let skippedAhead = 0; // candidates walked past before the first eligible one
   for (const a of c.ordered) {
-    const reason = ineligibility(a, sessionKey, now);
+    const reason = ineligibility(a, exclScope, now);
     if (reason) {
       blocked[reason] = (blocked[reason] || 0) + 1;
       if (!pool.length) skippedAhead++;
@@ -2685,7 +2703,7 @@ async function handleChat(req, res, cfg, bodyText) {
       : `no provider is currently eligible for this request (${Object.entries(blocked).map(([k, n]) => `${n} ${k.replace(/_/g, " ")}`).join(", ")})`;
     // Advertise the soonest automatic recovery. A pool held only by manual cools
     // has no automatic recovery, so the header is omitted rather than guessed.
-    const recoveryMs = nearestRecoveryMs(c.ordered, sessionKey, now);
+    const recoveryMs = nearestRecoveryMs(c.ordered, exclScope, now);
     if (recoveryMs !== null) res.setHeader("Retry-After", String(Math.max(1, Math.ceil(recoveryMs / 1000))));
     const entry = applyCost(newHistoryEntry({ t: detailT, callId, model: modelId, backend: "none", stream, status: 503, latencyMs, session: sessionKey, routedModel: c.ordered[0] ? c.ordered[0].model : null, errorKind: null }), cfg);
     recordHistory(entry);
@@ -2764,7 +2782,7 @@ async function handleChat(req, res, cfg, bodyText) {
     // session on a provider that keeps failing (review 2026-10-08, finding 1). The
     // `probe_in_flight` reported here is normally the lease taken a line above, so only a
     // probe some OTHER request holds is a reason to skip.
-    const blockedAtDispatch = ineligibility(attempt, sessionKey, Date.now());
+    const blockedAtDispatch = ineligibility(attempt, exclScope, Date.now());
     const ownProbe = blockedAtDispatch === "probe_in_flight" && (lease.routeClaim || lease.accountClaim);
     if (blockedAtDispatch && !ownProbe) {
       releaseAttempt(lease);
@@ -2795,7 +2813,7 @@ async function handleChat(req, res, cfg, bodyText) {
     // keep waiting.
     const hasEligibleAlternative = () => {
       for (let k = poolIndex + 1; k < pool.length; k++) {
-        if (ineligibility(pool[k], sessionKey, Date.now()) === null) return true;
+        if (ineligibility(pool[k], exclScope, Date.now()) === null) return true;
       }
       return false;
     };
@@ -2805,7 +2823,7 @@ async function handleChat(req, res, cfg, bodyText) {
       // transient retry exists to wait out (review finding 1: a retry was dispatched after
       // a manual cool).
       if (retries > 0) {
-        const why = ineligibility(attempt, sessionKey, Date.now());
+        const why = ineligibility(attempt, exclScope, Date.now());
         if (why && !(why === "route_cooling" && ownsRouteSettlement(attempt))) break;
       }
       // Book before EVERY dispatch, first try and retry alike: our own failure moves the
@@ -2849,7 +2867,7 @@ async function handleChat(req, res, cfg, bodyText) {
       const errKind = classify(result.err.status, result.err.body, result.err.errorBodyState);
       failedAttempts++;
       if (errKind === "upstream_rejection") opaqueFailures++;
-      noteAttemptFailure(cfg, attempt, sessionKey, result.err.status, result.err.body, result.err.errorBodyState);
+      noteAttemptFailure(cfg, attempt, exclScope, result.err.status, result.err.body, result.err.errorBodyState);
       const scope = cooldownScopeOf(attempt, errKind);
       attemptsSummary.push(attemptOutcome({
         attempt,
@@ -2918,7 +2936,7 @@ async function handleChat(req, res, cfg, bodyText) {
       usableFailure = metrics.relayError || "upstream returned no usable output";
       metrics.relayError = usableFailure;
       usableDecision = "unusable";
-      noteAttemptFailure(cfg, attempt, sessionKey, 0, usableFailure);
+      noteAttemptFailure(cfg, attempt, exclScope, 0, usableFailure);
     }
     {
       const uKind = usableFailure ? classify(0, usableFailure) : null;
@@ -3063,7 +3081,7 @@ async function handleChat(req, res, cfg, bodyText) {
   // Every terminal CHAT failure leaves through one builder: never empty, always
   // valid JSON, the provider's own words when it gave them (redacted and capped),
   // plus the ids an operator needs to chase the failure upstream.
-  const recoveryMs = explainedClient ? null : nearestRecoveryMs(c.ordered, sessionKey, Date.now());
+  const recoveryMs = explainedClient ? null : nearestRecoveryMs(c.ordered, exclScope, Date.now());
   const errBody = terminalChatError({
     upstream: typeof msg === "string" && msg ? msg : null,
     message: noExplanation,

@@ -2482,20 +2482,28 @@ async function main() {
     }
   }
 
-  // zScope4) An opaque rejection excludes that route for the SESSION that saw it, not
-  //   for every client of the account: a second session must still be free to use
-  //   the provider that refused the first one.
+  // zScope4) An opaque rejection excludes that route for the CALLER that saw it, not
+  //   for every client of the account. B returns an EXPLAINED 400 here on purpose:
+  //   with a successful B the session would be PINNED to B, and a pinned session
+  //   skips A whether or not any exclusion exists - so the earlier fixture passed
+  //   even with exclusions broken. Terminal-and-unsuccessful B leaves the exclusion
+  //   as the only thing that can keep A out.
   {
     let aHits = 0;
+    let bHits = 0;
     const srvA = http.createServer((req, res) => { aHits++; res.writeHead(400, { "content-type": "application/json" }); res.end(); });
-    const srvB = mockBackend("ob", {});
+    const srvB = http.createServer((req, res) => {
+      bHits++;
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "explained refusal from B" } }));
+    });
     const portA = await listen(srvA);
-    srvB.port = await listen(srvB.srv);
+    const portB = await listen(srvB);
     const cfgSc4 = {
       port: 0, prefix: "/v1", masterKeyEnv: null,
       backends: [
         { id: "oa", baseURL: `http://${HOST}:${portA}`, apiKeyEnv: "KEY_OA" },
-        { id: "ob", baseURL: `http://${HOST}:${srvB.port}`, apiKeyEnv: "KEY_OB" },
+        { id: "ob", baseURL: `http://${HOST}:${portB}`, apiKeyEnv: "KEY_OB" },
       ],
       models: { mS: { providers: [{ backend: "oa", upstream: "u1" }, { backend: "ob", upstream: "u1b" }], affinityPool: 1 } },
       presets: { pS: { strategy: "affinity", models: ["mS"] } },
@@ -2508,15 +2516,109 @@ async function main() {
       const afterFirst = aHits;
       await (await api(hSc4.base, "/v1/chat/completions", { body: { model: "pS", messages: [] }, headers: s1 })).text();
       const afterSecond = aHits;
-      const other = await api(hSc4.base, "/v1/chat/completions", { body: { model: "pS", messages: [] }, headers: { "x-session-affinity": "scope-sess-2" } });
-      await other.text();
+      await (await api(hSc4.base, "/v1/chat/completions", { body: { model: "pS", messages: [] }, headers: { "x-session-affinity": "scope-sess-2" } })).text();
       assert(
-        afterFirst === 1 && afterSecond === 1 && aHits === 2,
-        "zScope4) an opaque rejection is excluded for that session only (first=" + afterFirst + ", sameSessionAgain=" + afterSecond + ", otherSession=" + aHits + ")"
+        afterFirst === 1 && afterSecond === 1 && aHits === 2 && bHits === 3,
+        "zScope4) an opaque rejection is excluded for that session only, and B's terminal 400 creates no pin that could hide the exclusion (first=" + afterFirst + ", sameSessionAgain=" + afterSecond + ", otherSession=" + aHits + ", bHits=" + bHits + ")"
       );
     } finally {
-      hSc4.child.kill(); srvA.close(); srvB.srv.close();
+      hSc4.child.kill(); srvA.close(); srvB.close();
       await rm(hSc4.dir, { recursive: true, force: true });
+    }
+  }
+
+  // zScope5) The opaque-rejection scope is caller + session + RESOLVED MODEL + route,
+  //   and it exists for requests with no session id too. Three narrowings are load
+  //   bearing and each was missing: without the credential, one client's blank 400
+  //   blocks every other client that happens to send the same x-session-affinity;
+  //   without the resolved model, a blank 400 for model A blocks model B that merely
+  //   aliases the same physical route; and with no bucket at all, a no-session caller
+  //   re-offers the refusing provider on every single call. Route HEALTH stays shared
+  //   across models (zScope1/zScope2) - only this caller-scoped exclusion narrows.
+  {
+    let aHits = 0;
+    const srvA = http.createServer((req, res) => { aHits++; res.writeHead(400, { "content-type": "application/json" }); res.end(); });
+    const srvB = http.createServer((req, res) => {
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "explained refusal from B" } }));
+    });
+    const portA = await listen(srvA);
+    const portB = await listen(srvB);
+    const cfgSc5 = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "oa", baseURL: `http://${HOST}:${portA}`, apiKeyEnv: "KEY_OA" },
+        { id: "ob", baseURL: `http://${HOST}:${portB}`, apiKeyEnv: "KEY_OB" },
+      ],
+      models: {
+        mS: { providers: [{ backend: "oa", upstream: "u1" }, { backend: "ob", upstream: "u1b" }], affinityPool: 1 },
+        // Same physical route as mS but a different logical model: the exclusion
+        // must not leak across the two.
+        mS2: { providers: [{ backend: "oa", upstream: "u1" }, { backend: "ob", upstream: "u1b" }], affinityPool: 1 },
+        // One route only, so an excluded route leaves nothing eligible and the
+        // 503's recovery hint becomes observable without sleeping 30 seconds.
+        mOnly: { providers: [{ backend: "oa", upstream: "u1" }], affinityPool: 1 },
+      },
+      presets: {
+        pS: { strategy: "affinity", models: ["mS"] },
+        pS2: { strategy: "affinity", models: ["mS2"] },
+        pOnly: { strategy: "affinity", models: ["mOnly"] },
+      },
+      backoff: BO,
+    };
+    const hSc5 = await startRouterCfg(cfgSc5, "KEY_OA=k\nKEY_OB=k\n");
+    try {
+      const s1 = { "x-session-affinity": "scope5-sess-1" };
+      const otherKey = { "x-session-affinity": "scope5-sess-1", authorization: "Bearer another-client" };
+      const call = (b, headers) => api(hSc5.base, "/v1/chat/completions", { body: b, headers }).then((x) => x.text());
+
+      await call({ model: "pS", messages: [] }, s1);
+      const after1 = aHits;
+      await call({ model: "pS", messages: [] }, s1);
+      const after2 = aHits;
+      await call({ model: "pS", messages: [] }, otherKey);
+      const after3 = aHits;
+      await call({ model: "pS2", messages: [] }, s1);
+      const after4 = aHits;
+      await call({ model: "pS", messages: [] }, {});
+      const after5 = aHits;
+      await call({ model: "pS", messages: [] }, {});
+      const after6 = aHits;
+      await call({ model: "pS", messages: [] }, { authorization: "Bearer another-client" });
+      const after7 = aHits;
+
+      // The refused route is the ONLY candidate here, so the second call has
+      // nothing eligible: the 503 must name the blocker and its finite remainder.
+      await call({ model: "pOnly", messages: [] }, s1);
+      const third = await api(hSc5.base, "/v1/chat/completions", { body: { model: "pOnly", messages: [] }, headers: s1 });
+      const thirdBody = await third.json();
+      const retryAfter = third.headers.get("retry-after");
+      const thirdCode = thirdBody && thirdBody.error && thirdBody.error.code;
+
+      assert(
+        after1 === 1 && after2 === 1,
+        "zScope5a) an opaque rejection is remembered for the caller/session/model that saw it (first=" + after1 + ", repeat=" + after2 + ")"
+      );
+      assert(
+        after3 === 2 && after4 === 3,
+        "zScope5b) the exclusion is scoped to the credential and to the RESOLVED model, so a different key sharing the session id and a different model aliasing the same route both still reach the refusing provider (sameSessionOtherKey=" + after3 + ", sameCredentialOtherModel=" + after4 + ")"
+      );
+      assert(
+        after5 === 4 && after6 === 4 && after7 === 5,
+        "zScope5c) requests without a session id get a client-scoped no-session bucket, so the refusing provider is not re-offered to that client and is not blacklisted for other clients (firstNoSession=" + after5 + ", repeatNoSession=" + after6 + ", otherClientNoSession=" + after7 + ")"
+      );
+      assert(
+        third.status === 503 && thirdCode === "session_excluded" && retryAfter === "30",
+        "zScope5d) the exclusion is a finite 30-second block, reported to the caller as the blocking scope rather than an account outage (status=" + third.status + ", code=" + thirdCode + ", retryAfter=" + retryAfter + ")"
+      );
+      const healthBody = await (await api(hSc5.base, "/health", { method: "GET" })).text();
+      assert(
+        healthBody.indexOf("scope5-sess-1") === -1 && healthBody.indexOf("another-client") === -1,
+        "zScope5e) /health exposes route state without naming sessions or credentials"
+      );
+    } finally {
+      hSc5.child.kill(); srvA.close(); srvB.close();
+      await rm(hSc5.dir, { recursive: true, force: true });
     }
   }
 
