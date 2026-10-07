@@ -451,6 +451,7 @@ async function main() {
   try {
     let r = await api(baseF, "/v1/chat/completions", { body: { model: "deepseek-v4-flash", messages: [] } });
     const fb = await r.json();
+
     assert(
       r.status === 200 && /^mock:f2/.test(fb.choices[0].message.content) && r.headers.get("x-router-backend") === "f2",
       "s1) failover: first member 500, second serves (status=" + r.status + ", backend=" + r.headers.get("x-router-backend") + ")"
@@ -2761,6 +2762,232 @@ async function main() {
     }
   }
 
+  // zT4a) Bounded error-body reads, unit level: every state, the exact-limit
+  //   boundary, multichunk truncation, and a multi-byte character split by a chunk.
+  {
+    const mkRes = (chunks, mode) => ({
+      body: {
+        getReader() {
+          let i = 0;
+          return {
+            read: async () => {
+              if (mode === "reset") throw new Error("ECONNRESET");
+              if (mode === "hang") return new Promise(() => {});
+              if (i < chunks.length) return { done: false, value: Buffer.from(chunks[i++]) };
+              return { done: true };
+            },
+            cancel: async () => {},
+          };
+        },
+      },
+    });
+    const text = '{"error":{"message":"nope"}}';
+    const present = await SRV.readUpstreamError(mkRes([text]));
+    assert(
+      present.errorBodyState === "present" && present.errorBodyBytes === Buffer.byteLength(text) && present.body === text,
+      "zT4a1) a complete error body reads as present with its captured byte count (state=" + present.errorBodyState + ", bytes=" + present.errorBodyBytes + ")"
+    );
+    const empty = await SRV.readUpstreamError(mkRes([]));
+    assert(empty.errorBodyState === "empty" && empty.body === "" && empty.errorBodyBytes === 0, "zT4a2) a never-written body is empty, not a failure (state=" + empty.errorBodyState + ")");
+    const noBody = await SRV.readUpstreamError({ body: null });
+    assert(noBody.errorBodyState === "empty", "zT4a3) a body-less response is empty (state=" + noBody.errorBodyState + ")");
+    const exact = await SRV.readUpstreamError(mkRes(["a".repeat(16384)]), { maxBytes: 16384 });
+    assert(exact.errorBodyState === "present" && exact.errorBodyBytes === 16384, "zT4a4) a body exactly at the limit is present, not truncated (state=" + exact.errorBodyState + ", bytes=" + exact.errorBodyBytes + ")");
+    const over = await SRV.readUpstreamError(mkRes(["b".repeat(8192), "b".repeat(8192), "b".repeat(4096)]), { maxBytes: 16384 });
+    assert(over.errorBodyState === "truncated" && over.errorBodyBytes === 16384, "zT4a5) a multichunk body past the limit is truncated AT the limit (state=" + over.errorBodyState + ", bytes=" + over.errorBodyBytes + ")");
+    const multi = Buffer.from("h\u00e9llo w\u00f6rld");
+    const split = await SRV.readUpstreamError(mkRes([multi.subarray(0, 2), multi.subarray(2)]));
+    assert(split.body === "h\u00e9llo w\u00f6rld", "zT4a6) a multi-byte character split across chunks survives the read (body=" + JSON.stringify(split.body) + ")");
+    const t0 = Date.now();
+    const hung = await SRV.readUpstreamError(mkRes([], "hang"), { timeoutMs: 80 });
+    assert(hung.errorBodyState === "timeout" && Date.now() - t0 < 2000, "zT4a7) a body that never ends hits the deadline instead of holding the request open (state=" + hung.errorBodyState + ", ms=" + (Date.now() - t0) + ")");
+    const reset = await SRV.readUpstreamError(mkRes([], "reset"));
+    assert(reset.errorBodyState === "read_error", "zT4a8) a reset socket is a read_error, never an empty body (state=" + reset.errorBodyState + ")");
+  }
+
+  // zT4b) Redaction and the one terminal envelope, unit level.
+  {
+    process.env.T4_SECRET_KEY = "sk-t4-sentinel-0123456789abcdef";
+    process.env.T4_MASTER_KEY = "master-t4-sentinel-0123456789";
+    process.env.T4_SHORT_KEY = "k";
+    const cfgT = { backends: [{ id: "x", apiKeyEnv: "T4_SECRET_KEY" }, { id: "y", apiKeyEnv: "T4_SHORT_KEY" }], masterKeyEnv: "T4_MASTER_KEY" };
+    const reqT = { headers: { authorization: "Bearer sk-t4-sentinel-0123456789abcdef" } };
+    const red = SRV.redactSecrets("leak sk-t4-sentinel-0123456789abcdef and master-t4-sentinel-0123456789", cfgT, reqT);
+    assert(
+      !/sentinel/.test(red) && (red.match(/\[redacted\]/g) || []).length === 2,
+      "zT4b1) configured credential values never survive redaction (out=" + JSON.stringify(red) + ")"
+    );
+    assert(SRV.redactSecrets("k", cfgT, null) === "k", "zT4b2) a too-short value is left alone: redacting it would mangle ordinary text");
+    const env = JSON.parse(SRV.terminalChatError({ message: "", type: "router_unavailable", callId: "c1", backend: "b1", upstreamStatus: 503, nextAvailableAt: 123, cfg: cfgT, req: reqT }));
+    assert(
+      typeof env.error.message === "string" && env.error.message.length > 0 && env.error.type === "router_unavailable" && env.error.callId === "c1" && env.error.backend === "b1" && env.error.upstreamStatus === 503 && env.error.nextAvailableAt === 123,
+      "zT4b3) a terminal chat error is always nonempty valid JSON with the full envelope (env=" + JSON.stringify(env) + ")"
+    );
+    const capped = JSON.parse(SRV.terminalChatError({ message: "x".repeat(900) }));
+    assert(capped.error.message.length === 512, "zT4b4) terminal messages are capped at 512 characters (len=" + capped.error.message.length + ")");
+    const fromUp = JSON.parse(SRV.terminalChatError({
+      upstream: JSON.stringify({ error: { message: "upstream said sk-t4-sentinel-0123456789abcdef", code: "nope", nested: { a: 1 }, list: [1, 2] } }),
+      message: "fallback wording", cfg: cfgT, req: reqT,
+    }));
+    assert(
+      fromUp.error.message === "upstream said [redacted]" && fromUp.error.code === "nope" && fromUp.error.nested === undefined && fromUp.error.list === undefined,
+      "zT4b5) the provider's own explanation is kept, redacted, and stripped of nested payloads (env=" + JSON.stringify(fromUp) + ")"
+    );
+  }
+
+  // zT4c) The durable outcome cap keeps the story at both ends, unit level.
+  {
+    const many = Array.from({ length: 40 }, (_, i) => SRV.attemptOutcome({ attempt: { backend: "b" + i }, status: 500, kind: "server", decision: "failover", latencyMs: i }));
+    const capped = SRV.capAttemptsSummary(many);
+    assert(
+      capped.attemptsSummary.length === 32 && capped.attemptsOmitted === 8 && capped.attemptsSummary[0].backend === "b0" && capped.attemptsSummary[30].backend === "b30" && capped.attemptsSummary[31].backend === "b39",
+      "zT4c1) the outcome cap keeps the first 31 and the last, and counts what it dropped (len=" + capped.attemptsSummary.length + ", omitted=" + capped.attemptsOmitted + ")"
+    );
+    const short = SRV.capAttemptsSummary(many.slice(0, 2));
+    assert(short.attemptsSummary.length === 2 && short.attemptsOmitted === 0, "zT4c2) a short outcome list is kept whole");
+    assert(SRV.attemptOutcome({ attempt: { backend: "b" }, status: 500 }).requestIds === null, "zT4c3) an outcome with no correlation ids records null, not an empty object");
+  }
+
+  // zT4d) A 402 is a dry account: it classifies as billing (fail over + cool the
+  //   account) instead of falling through to the server class, and "insufficient
+  //   balance" is recognised wherever it appears.
+  {
+    assert(SRV.classify(402, "Insufficient Balance") === "billing", "zT4d1) HTTP 402 is billing, whatever its body says");
+    assert(SRV.classify(402, "") === "billing", "zT4d2) a body-less 402 is still billing");
+    assert(SRV.classify(400, '{"error":{"message":"Insufficient Balance"}}') === "billing", "zT4d3) 'insufficient balance' is billing on a 400 too");
+    assert(SRV.classify(422, "insufficient_balance") === "billing", "zT4d4) the snake_case spelling is billing");
+    assert(SRV.classify(400, '{"error":{"message":"bad temperature"}}') === "client", "zT4d5) an explained payload error is still a client error");
+    assert(SRV.classify(500, "") === "server", "zT4d6) a 5xx is still a server failure");
+  }
+
+  // zT4e) A never-ended error body cannot hold a request open, and the durable
+  //   summary explains what happened WITHOUT carrying the request or the key.
+  {
+    const hangSrv = http.createServer(async (req, res) => {
+      for await (const c of req) { /* drain */ }
+      res.writeHead(400, { "content-type": "application/json", "content-length": "500" });
+      res.write('{"error":{"message":"cut off before the end');
+      // never ends: the router has to give up on it
+    });
+    const goodT4 = mockBackend("t4good", {});
+    const pp = await Promise.all([listen(hangSrv), listen(goodT4.srv)]);
+    goodT4.port = pp[1];
+    const tmpBase = process.env.TEMP || process.env.TMPDIR || "/tmp";
+    const hPath = tmpBase + "/t4hist-" + Date.now() + "-" + Math.random().toString(36).slice(2) + ".jsonl";
+    const cfgT4 = {
+      port: 0, prefix: "/v1", masterKeyEnv: null, errorBodyTimeoutMs: 200,
+      backends: [
+        { id: "t4hang", baseURL: `http://${HOST}:${pp[0]}`, apiKeyEnv: "KEY_T4HANG" },
+        { id: "t4good", baseURL: `http://${HOST}:${goodT4.port}`, apiKeyEnv: "KEY_T4GOOD" },
+      ],
+      models: {
+        mT4: { providers: [{ backend: "t4hang", upstream: "uT4" }, { backend: "t4good", upstream: "uT4" }], affinityPool: 1 },
+        mT4only: { providers: [{ backend: "t4hang", upstream: "uT4" }], affinityPool: 1 },
+      },
+      presets: { pT4: { strategy: "affinity", models: ["mT4"] }, pT4only: { strategy: "affinity", models: ["mT4only"] } },
+      backoff: BO,
+    };
+    const hT4 = await startRouterCfg(cfgT4, "KEY_T4HANG=t4-key-sentinel-0123456789\nKEY_T4GOOD=k\n", { ROUTER_HISTORY: hPath });
+    const call = (model) => fetch(hT4.base + "/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer local-master" },
+      body: JSON.stringify({ model, messages: [{ role: "user", content: "SENTINEL_PROMPT_T4" }] }),
+      signal: AbortSignal.timeout(8000),
+    });
+    try {
+      const t0 = Date.now();
+      const rr = await call("pT4");
+      await rr.text();
+      const elapsed = Date.now() - t0;
+      assert(
+        rr.status === 200 && rr.headers.get("x-router-backend") === "t4good" && elapsed < 3000,
+        "zT4e1) a stalled error body is abandoned at the deadline and the request fails over (status=" + rr.status + ", backend=" + rr.headers.get("x-router-backend") + ", ms=" + elapsed + ")"
+      );
+      const hist = await (await api(hT4.base, "/api/history?limit=5", { method: "GET" })).json();
+      const e = hist.entries.find((x) => x.callId === rr.headers.get("x-router-call"));
+      const su = e && Array.isArray(e.attemptsSummary) ? e.attemptsSummary : [];
+      assert(
+        !!e && su.length === 2 && su[0].errorBodyState === "timeout" && su[0].status === 400 && su[0].kind === "upstream_rejection" && su[0].decision === "failover" && su[0].backend === "t4hang" && su[1].backend === "t4good" && su[1].decision === "success",
+        "zT4e2) the durable summary names both attempts, the body-read state and each decision (" + JSON.stringify(su.map((x) => [x.backend, x.status, x.decision, x.errorBodyState])) + ")"
+      );
+      assert(
+        e.fallbackCount === 1 && e.selectionReason === "configured" && e.cacheMayBeCold === true,
+        "zT4e3) a provider switch is counted once and says the cache MAY be cold (fallbackCount=" + e.fallbackCount + ", reason=" + e.selectionReason + ", cacheMayBeCold=" + e.cacheMayBeCold + ")"
+      );
+      const blob = JSON.stringify(e);
+      assert(!blob.includes("SENTINEL_PROMPT_T4") && !blob.includes("t4-key-sentinel"), "zT4e4) a durable summary carries no prompt and no credential (" + blob.length + " bytes)");
+      const fsp = await import("node:fs/promises");
+      let fileLine = "";
+      for (let i = 0; i < 30 && !fileLine; i++) {
+        const txt = await fsp.readFile(hPath, "utf8").catch(() => "");
+        fileLine = txt.split("\n").find((l) => l.includes(e.callId)) || "";
+        if (!fileLine) await new Promise((r) => setTimeout(r, 50));
+      }
+      assert(fileLine.includes("attemptsSummary") && fileLine.includes("timeout"), "zT4e5) the summary is durable in the history file, not only in the ring buffer (" + fileLine.length + " bytes)");
+      const rr2 = await call("pT4only");
+      const b2 = await rr2.json();
+      const hist2 = await (await api(hT4.base, "/api/history?limit=5", { method: "GET" })).json();
+      const e2 = hist2.entries.find((x) => x.callId === rr2.headers.get("x-router-call"));
+      const detail2 = await (await api(hT4.base, "/api/history/detail?call=" + rr2.headers.get("x-router-call"), { method: "GET" })).json();
+      assert(
+        rr2.status === 503 && b2.error && typeof b2.error.message === "string" && b2.error.message.length > 0 && /without explaining why/.test(b2.error.message),
+        "zT4e6) a fully unexplained exhaustion is a 503 with real wording, never an empty body (status=" + rr2.status + ", message=" + JSON.stringify(b2.error && b2.error.message) + ")"
+      );
+      assert(
+        !!e2 && e2.status === rr2.status && (e2.attemptsSummary || []).length === 1 &&
+        detail2.detail && detail2.detail.response && detail2.detail.response.status === rr2.status && (detail2.detail.response.attemptsSummary || []).length === 1,
+        "zT4e7) the terminal status agrees across the response, history row and detail, each carrying the attempt (http=" + rr2.status + ", history=" + (e2 && e2.status) + ", detail=" + (detail2.detail && detail2.detail.response && detail2.detail.response.status) + ", deAttempts=" + ((detail2.detail && detail2.detail.response && detail2.detail.response.attemptsSummary) || []).length + ", hiAttempts=" + ((e2 && e2.attemptsSummary) || []).length + ")"
+      );
+    } finally {
+      hT4.child.kill(); hangSrv.close(); goodT4.srv.close();
+      await rm(hT4.dir, { recursive: true, force: true });
+      await (await import("node:fs/promises")).rm(hPath, { force: true }).catch(() => {});
+    }
+  }
+
+  // zT4f) /admin/reset-health really does reset health: a cooled ROUTE comes
+  //   back, not just the account row. A reset that leaves routes cooling would
+  //   report "healthy" while still refusing to route.
+  {
+    const r1 = mockBackend("r1", { default: { status: 500, body: { error: { message: "boom" } } } });
+    const r2 = mockBackend("r2", {});
+    const pR = await Promise.all([listen(r1.srv), listen(r2.srv)]);
+    r1.port = pR[0]; r2.port = pR[1];
+    const cfgR = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "r1", baseURL: `http://${HOST}:${r1.port}`, apiKeyEnv: "KEY_R1" },
+        { id: "r2", baseURL: `http://${HOST}:${r2.port}`, apiKeyEnv: "KEY_R2" },
+      ],
+      models: { mR: { providers: [{ backend: "r1", upstream: "uR" }, { backend: "r2", upstream: "uR" }], affinityPool: 1 } },
+      presets: { pR: { strategy: "affinity", models: ["mR"] } },
+      backoff: { rateLimitBaseMs: 50, rateLimitMaxMs: 200, serverBaseMs: 60000, serverMaxMs: 300000, authBaseMs: 50, authMaxMs: 200, weeklyDefaultMs: 1000 },
+    };
+    const hR = await startRouterCfg(cfgR, "KEY_R1=k\nKEY_R2=k\n");
+    const hit = () => api(hR.base, "/v1/chat/completions", { body: { model: "pR", messages: [] } });
+    const routesFor = (hb, id) => (hb.routes || []).filter((x) => x.backend === id).length;
+    try {
+      const a = await hit(); await a.text();
+      const hb = await (await api(hR.base, "/health", { method: "GET" })).json();
+      assert(
+        a.headers.get("x-router-backend") === "r2" && r1.hits.length === 1 && routesFor(hb, "r1") === 1,
+        "zT4f1) a 500 cools the route and the next provider serves (backend=" + a.headers.get("x-router-backend") + ", r1routes=" + routesFor(hb, "r1") + ")"
+      );
+      const rst = await api(hR.base, "/admin/reset-health", { method: "POST" });
+      await rst.text();
+      const hb2 = await (await api(hR.base, "/health", { method: "GET" })).json();
+      assert(routesFor(hb2, "r1") === 0, "zT4f2) reset-health clears the ROUTE recovery, not just the account row (r1routes=" + routesFor(hb2, "r1") + ")");
+      const b = await hit(); await b.text();
+      assert(
+        r1.hits.length === 2,
+        "zT4f3) the previously cooled provider is tried again after a reset (r1hits=" + r1.hits.length + ", backend=" + b.headers.get("x-router-backend") + ")"
+      );
+    } finally {
+      hR.child.kill(); r1.srv.close(); r2.srv.close();
+      await rm(hR.dir, { recursive: true, force: true });
+    }
+  }
+
   // zProbe1) Exactly one request may probe a recovering route. Once the cooldown
   //   lapses, the first request takes the probe and hangs on the upstream; a second
   //   request arriving while that probe is still open must NOT pile onto the same
@@ -3326,8 +3553,13 @@ async function main() {
       // with relayError=idle timeout), so relays that were cut are traceable.
       let relayErr = "no-history";
       try {
-        const hist = await (await api(baseZ24, "/api/history?limit=1", { method: "GET" })).json();
-        if (Array.isArray(hist.entries) && hist.entries[0]) relayErr = hist.entries[0].relayError || null;
+        // The summary is recorded after the relay settles, so read it with a short
+        // bounded poll instead of racing the write (a bare read flaked once).
+        for (let i = 0; i < 40 && relayErr === "no-history"; i++) {
+          const hist = await (await api(baseZ24, "/api/history?limit=1", { method: "GET" })).json();
+          if (Array.isArray(hist.entries) && hist.entries[0]) relayErr = hist.entries[0].relayError || null;
+          else await new Promise((r) => setTimeout(r, 25));
+        }
       } catch { /* history read best-effort */ }
       const telOk = typeof relayErr === "string" && /idle timeout/.test(relayErr || "");
       assert(

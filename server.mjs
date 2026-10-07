@@ -515,11 +515,14 @@ function classify(status, bodyText, errorBodyState = "present") {
   if (status === 401 || status === 403) return "auth";
   if (status >= 500) return "server";
   if (status === 0) return "server"; // network error
+  // 402 Payment Required is a dry account by definition, whatever its body says.
+  if (status === 402) return "billing";
   if (status === 400 || status === 422) {
-    // Billing failures (insufficient credits/quota) are a backend-resource
+    // Billing failures (insufficient credits/quota/balance) are a backend-resource
     // problem, not a payload bug: they must fail over to the next provider
     // instead of aborting the whole request, and they cool the dry account.
-    if (/insufficient (credits|quota)|insufficient_quota|out of credits|billing error/i.test(bodyText || "")) return "billing";
+    // "insufficient balance" is DeepSeek's direct-API wording for exactly this.
+    if (/insufficient (credits|quota|balance|funds)|insufficient_quota|insufficient_balance|out of credits|no credits|billing error|payment required/i.test(bodyText || "")) return "billing";
     // Explained = the upstream blames the payload, so the backend is fine and
     // the request stops. Unexplained = "upstream_rejection": no evidence the
     // payload was at fault, so fail over instead of aborting (2026-10-07: an
@@ -632,13 +635,16 @@ function markSuccess(id) {
 }
 
 function resetAllHealth() {
+  // A reset is an operator override, so it must clear EVERY layer that can hold a
+  // request out of a provider: the account rows, the route recoveries, the
+  // account-outage escalation window, and this run's session preferences. A reset
+  // that left routes cooling would report "healthy" and still refuse to route.
   clearSessionPreferences();
+  ROUTES.clear();
+  SESSION_EXCLUSIONS.clear();
+  ACCOUNT_OUTAGE_ROUTES.clear();
   for (const id of health.keys()) markHealthy(id, "reset");
 }
-
-// ---- cooling-event ring (dashboard timeline) ---------------------------------
-//
-// Observes health transitions ONLY - cooling semantics are untouched. The
 // dashboard needs to explain WHY a backend was down: failure cool (with the
 // classified kind), lazy expiry at request time, success clearing, admin
 // uncool, and reset-health. Newest first, capped at 500 rows.
@@ -1310,6 +1316,11 @@ function newHistoryEntry(f) {
     promptCacheHitTokens: f.promptCacheHitTokens ?? 0, // raw prompt tokens served from cache (0 = upstream did not report a split)
     promptCacheMissTokens: f.promptCacheMissTokens != null ? f.promptCacheMissTokens : Math.max(0, (f.promptTokens ?? 0) - (f.promptCacheHitTokens ?? 0)), // raw miss tokens; derived from prompt - hit when the upstream only reports hits
     errorKind: f.errorKind ?? null,              // classified upstream failure kind (weekly/rate/auth/server/client); null = no upstream failure
+    selectionReason: f.selectionReason ?? null,   // why the FIRST attempt was chosen: configured | session_preference | cooldown
+    fallbackCount: f.fallbackCount ?? 0,          // cross-provider transitions (a same-provider retry is NOT a fallback)
+    cacheMayBeCold: f.cacheMayBeCold ?? null,     // true once the request changed provider: the prompt cache MAY be cold (never an asserted miss)
+    attemptsSummary: f.attemptsSummary ?? [],     // body-free durable per-attempt outcomes (capped; see capAttemptsSummary)
+    attemptsOmitted: f.attemptsOmitted ?? 0,      // outcomes dropped from attemptsSummary by that cap
     cost: f.cost ?? null,                        // request cost in USD (see computeCost); null = model has no meta.pricing
     cacheSavings: f.cacheSavings ?? null,        // USD saved by cache hits vs full-price miss (peak rates)
     offPeakSavings: f.offPeakSavings ?? null,    // USD saved by the off-peak discount (0 when it did not apply)
@@ -2142,6 +2153,229 @@ function candidates(cfg, requestedId, sessionKey, rng = Math.random) {
   };
 }
 
+// ---- upstream error bodies, correlation ids, redaction ----------------------
+//
+// An error body is diagnostic: it explains a failure to an operator and to the
+// caller, and it is never worth waiting on. Before this, an upstream that sent
+// headers and then never ended its error body held the whole request open
+// indefinitely. The read is now bounded twice over - 16 KiB of bytes and ONE
+// five-second deadline for the whole read - and the outcome is recorded, so a
+// blank rejection can be told apart from an unreadable one.
+
+const ERROR_BODY_MAX_BYTES = 16384;
+const ERROR_BODY_TIMEOUT_MS = 5000;
+const ERROR_MSG_CAP = 512;
+const CORRELATION_ID_CAP = 160;
+// Only these three are captured. Upstreams echo an arbitrary set of headers, and a
+// diagnostic envelope is not a place to launder the rest of them.
+const CORRELATION_HEADERS = ["x-request-id", "request-id", "cf-ray"];
+
+// Read a bounded prefix of an error body under one total deadline. Returns
+// {body, errorBodyState, errorBodyBytes}; errorBodyBytes counts bytes actually
+// captured, never an advertised length. States: present | empty | truncated |
+// timeout | read_error.
+async function readUpstreamError(response, { maxBytes = ERROR_BODY_MAX_BYTES, timeoutMs = ERROR_BODY_TIMEOUT_MS } = {}) {
+  const out = { body: "", errorBodyState: "empty", errorBodyBytes: 0 };
+  if (!response || !response.body) return out; // no body at all IS an empty body
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let body = "";
+  let bytes = 0;
+  let truncated = false;
+  let readError = null;
+  let timer = null;
+  const work = (async () => {
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) return;
+        if (!value || !value.length) continue;
+        const room = maxBytes - bytes;
+        if (room <= 0) { truncated = true; return; }
+        if (value.length > room) {
+          body += decoder.decode(value.subarray(0, room), { stream: true });
+          bytes += room;
+          truncated = true;
+          return;
+        }
+        body += decoder.decode(value, { stream: true });
+        bytes += value.length;
+        if (bytes >= maxBytes) {
+          // Exactly at the limit: one more read is the only way to tell a body that
+          // fits from one that was cut, so ask before calling it complete.
+          const next = await reader.read().catch(() => ({ done: true }));
+          if (!next.done) truncated = true;
+          return;
+        }
+      }
+    } catch (e) {
+      readError = e;
+    }
+  })();
+  const deadline = new Promise((resolve) => { timer = setTimeout(() => resolve("timeout"), timeoutMs); });
+  const outcome = await Promise.race([work.then(() => "read"), deadline]);
+  if (timer !== null) { clearTimeout(timer); timer = null; }
+  if (outcome === "timeout") {
+    out.errorBodyState = "timeout";
+    // Fire-and-forget release: the deadline is a promise to the CALLER, so waiting
+    // on cancellation could cost the same five seconds again.
+    try {
+      const c = reader.cancel("error body read deadline");
+      if (c && typeof c.catch === "function") c.catch(() => {});
+    } catch { /* release is best-effort */ }
+  } else if (readError) {
+    out.errorBodyState = "read_error";
+  } else if (truncated) {
+    out.errorBodyState = "truncated";
+  } else if (bytes > 0) {
+    out.errorBodyState = "present";
+  }
+  body += decoder.decode(); // flush a partial multi-byte tail; never throws
+  out.errorBodyBytes = bytes;
+  out.body = bytes > 0 ? body : "";
+  return out;
+}
+
+// The request ids an upstream returned, if it returned any we allow.
+function correlationIdsOf(headers) {
+  const out = {};
+  if (!headers || typeof headers.get !== "function") return out;
+  for (const name of CORRELATION_HEADERS) {
+    const v = headers.get(name);
+    if (typeof v === "string" && v.trim()) out[name] = v.trim().slice(0, CORRELATION_ID_CAP);
+  }
+  return out;
+}
+
+function parseJsonMaybe(text) {
+  if (typeof text !== "string") return null;
+  const t = text.trim();
+  if (!t || (t[0] !== "{" && t[0] !== "[")) return null;
+  try {
+    return JSON.parse(t);
+  } catch {
+    return null;
+  }
+}
+
+// Configured credential VALUES must never reach a caller, a log line, or a durable
+// record. Values shorter than 8 characters are skipped: a fixture or stub key like
+// "k" would otherwise redact the alphabet.
+function secretValues(cfg, req) {
+  const out = [];
+  const add = (v) => {
+    if (typeof v === "string" && v.trim().length >= 8 && !out.includes(v)) out.push(v);
+  };
+  if (cfg) {
+    if (cfg.masterKeyEnv) add(process.env[cfg.masterKeyEnv]);
+    if (cfg.uiPasswordEnv) add(process.env[cfg.uiPasswordEnv]);
+    for (const b of cfg.backends || []) if (b && b.apiKeyEnv) add(process.env[b.apiKeyEnv]);
+  }
+  const m = /^Bearer (.+)$/i.exec((req && req.headers && req.headers.authorization) || "");
+  if (m) add(m[1].trim());
+  return out;
+}
+
+function redactSecrets(text, cfg, req) {
+  if (typeof text !== "string" || !text) return typeof text === "string" ? text : "";
+  let out = text;
+  for (const v of secretValues(cfg, req)) out = out.split(v).join("[redacted]");
+  return out;
+}
+
+// Keep only primitive, redacted, capped fields from an upstream error body: the
+// provider's own explanation survives, nothing structural or nested does.
+function safeErrorFields(upstream, cfg, req) {
+  const parsed = parseJsonMaybe(upstream);
+  let e = {};
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    const d = parsed.error;
+    if (d && typeof d === "object" && !Array.isArray(d)) e = { ...d };
+    else if (typeof d === "string") e = { message: d };
+    else if (typeof parsed.message === "string") e = { message: parsed.message };
+  }
+  for (const k of Object.keys(e)) {
+    const v = e[k];
+    if (typeof v === "string") e[k] = redactSecrets(v, cfg, req).slice(0, ERROR_MSG_CAP);
+    else if (v !== null && typeof v !== "number" && typeof v !== "boolean") delete e[k];
+  }
+  return e;
+}
+
+// One builder for every terminal CHAT failure: always nonempty, always valid JSON,
+// always the same shape. An upstream that explained itself keeps its own words
+// (redacted and capped); every other case gets the router's own wording.
+function terminalChatError(o) {
+  const opts = o || {};
+  const e = safeErrorFields(opts.upstream, opts.cfg, opts.req);
+  if (typeof e.message !== "string" || !e.message.trim()) {
+    const text = redactSecrets(String(opts.message == null ? "" : opts.message).trim(), opts.cfg, opts.req).slice(0, ERROR_MSG_CAP);
+    e.message = text || "the request could not be served";
+  }
+  if (!e.type) e.type = opts.type || "router_error";
+  if (e.code == null) e.code = opts.code == null ? null : opts.code;
+  if (e.callId == null) e.callId = opts.callId ? String(opts.callId).slice(0, CORRELATION_ID_CAP) : null;
+  if (e.backend == null) e.backend = opts.backend || null;
+  if (e.upstreamStatus == null) e.upstreamStatus = opts.upstreamStatus == null ? null : opts.upstreamStatus;
+  if (e.nextAvailableAt == null && opts.nextAvailableAt != null) e.nextAvailableAt = opts.nextAvailableAt;
+  return JSON.stringify({ error: e });
+}
+
+// ---- durable per-attempt outcomes ------------------------------------------
+
+const ATTEMPTS_SUMMARY_CAP = 32;
+
+// Body-free, prompt-free and header-free: a durable attempt outcome carries the
+// DECISION and its consequences, never the request or the upstream's words.
+function attemptOutcome(a) {
+  return {
+    backend: a.attempt ? a.attempt.backend ?? null : null,
+    upstream: a.attempt ? a.attempt.upstream ?? null : null,
+    model: a.attempt ? a.attempt.model ?? null : null,
+    status: a.status ?? null,
+    kind: a.kind || null,
+    decision: a.decision || null,
+    latencyMs: a.latencyMs ?? 0,
+    retries: a.retries ?? 0,
+    errorBodyState: a.errorBodyState || null,
+    errorBodyBytes: a.errorBodyBytes ?? 0,
+    cooldownScope: a.cooldownScope || null,
+    nextAvailableAt: a.nextAvailableAt ?? null,
+    requestIds: a.requestIds && Object.keys(a.requestIds).length ? a.requestIds : null,
+  };
+}
+
+// Keep the first 31 outcomes and the last: the opening attempts explain why the
+// request had to move, the final one explains how it ended. What was dropped is
+// counted rather than silently lost.
+function capAttemptsSummary(list) {
+  const all = Array.isArray(list) ? list : [];
+  if (all.length <= ATTEMPTS_SUMMARY_CAP) return { attemptsSummary: all, attemptsOmitted: 0 };
+  return {
+    attemptsSummary: [...all.slice(0, ATTEMPTS_SUMMARY_CAP - 1), all[all.length - 1]],
+    attemptsOmitted: all.length - ATTEMPTS_SUMMARY_CAP,
+  };
+}
+
+// An effectively-infinite deadline means "until an operator uncools it"; that is
+// reported as null (no automatic recovery) rather than as a 285-million-year date.
+function finiteDeadline(v) {
+  return typeof v === "number" && Number.isFinite(v) && v < 1e15 ? v : null;
+}
+
+// Which scope did this failure actually charge? Read from the state the failure
+// just wrote instead of re-deriving it from the kind.
+function cooldownScopeOf(attempt, kind, now = Date.now()) {
+  if (kind === "upstream_rejection") return { cooldownScope: "session", nextAvailableAt: null };
+  const acct = health.get(attempt.backend);
+  if (acct && acct.state === "cooling" && acct.nextAvailableAt > now) {
+    return { cooldownScope: "account", nextAvailableAt: finiteDeadline(acct.nextAvailableAt) };
+  }
+  const row = ROUTES.get(routeKey(attempt));
+  if (row && row.nextAvailableAt > now) return { cooldownScope: "route", nextAvailableAt: finiteDeadline(row.nextAvailableAt) };
+  return { cooldownScope: null, nextAvailableAt: null };
+}
+
 function newError(status, body) {
   return { status, body };
 }
@@ -2252,14 +2486,17 @@ async function forward(req, cfg, backend, payload, incomingHeaders, stream, sess
   clearTimeout(connectTimer); // headers arrived: the wall clock no longer applies to the body
 
   if (!upstreamRes.ok) {
-    let text = "";
-    try {
-      text = await upstreamRes.text();
-    } catch {}
-    return {
-      err: newError(upstreamRes.status, text),
-      statusFromUpstream: upstreamRes.status,
-    };
+    // Bounded and deadline-guarded: an upstream that never ends its error body must
+    // not hold the caller's request open (see readUpstreamError).
+    const eb = await readUpstreamError(upstreamRes, {
+      maxBytes: cfg.errorBodyMaxBytes ?? ERROR_BODY_MAX_BYTES,
+      timeoutMs: cfg.errorBodyTimeoutMs ?? ERROR_BODY_TIMEOUT_MS,
+    });
+    const err = newError(upstreamRes.status, eb.body);
+    err.errorBodyState = eb.errorBodyState;
+    err.errorBodyBytes = eb.errorBodyBytes;
+    err.requestIds = correlationIdsOf(upstreamRes.headers);
+    return { err, statusFromUpstream: upstreamRes.status };
   }
   return { res: upstreamRes };
 }
@@ -2305,10 +2542,14 @@ async function handleChat(req, res, cfg, bodyText) {
     return writeError(res, e);
   }
 
+  const declaredHead = c.ordered[0] || null;
   if (prefToken) {
     c.ordered = orderSessionProviders(c.ordered, prefToken, Date.now());
     c.primary = c.ordered.length ? c.ordered[0] : null;
   }
+  // True when the session's own preference moved a DIFFERENT provider to the front:
+  // that is a different story from "the configured order was used as declared".
+  const pinnedHead = !!(declaredHead && c.ordered[0] && c.ordered[0] !== declaredHead);
 
   // Strict eligibility. Every candidate must be serviceable right now: its account
   // must not be cooled (auth / billing / weekly / rate) and its own route must not
@@ -2327,11 +2568,21 @@ async function handleChat(req, res, cfg, bodyText) {
   );
   const pool = [];
   const blocked = {};
+  let skippedAhead = 0; // candidates walked past before the first eligible one
   for (const a of c.ordered) {
     const reason = ineligibility(a, sessionKey, now);
-    if (reason) blocked[reason] = (blocked[reason] || 0) + 1;
-    else pool.push(a);
+    if (reason) {
+      blocked[reason] = (blocked[reason] || 0) + 1;
+      if (!pool.length) skippedAhead++;
+    } else pool.push(a);
   }
+  // Why the FIRST attempt is the one it is: the session's own preference, a
+  // candidate list that was partly ineligible, or the configured order untouched.
+  const selectionReason = pool.length === 0 ? null : pinnedHead ? "session_preference" : skippedAhead > 0 ? "cooldown" : "configured";
+  // Durable, body-free per-attempt outcomes for this request (see attemptOutcome).
+  const attemptsSummary = [];
+  let fallbackCount = 0; // cross-provider transitions: a same-provider retry is not a fallback
+  let priorBackend = null;
   if (pool.length === 0) {
     const latencyMs = Date.now() - started;
     const detailT = Date.now();
@@ -2377,11 +2628,18 @@ async function handleChat(req, res, cfg, bodyText) {
     });
     res.setHeader("x-router-backend", "none");
     res.setHeader("x-router-call", callId);
-    const msg = JSON.stringify({
-      error: {
-        message: reasonText,
-        type: "router_unavailable",
-      },
+    const scopeKeys = Object.keys(blocked);
+    const msg = terminalChatError({
+      message: reasonText,
+      type: "router_unavailable",
+      // The dominant blocker scope, so a caller can tell "the account is cooling"
+      // from "this session was refused by that route" without reading prose.
+      code: scopeKeys.length === 1 ? scopeKeys[0] : scopeKeys.length ? "mixed" : "none",
+      callId,
+      backend: "none",
+      nextAvailableAt: recoveryMs === null ? null : now + recoveryMs,
+      cfg,
+      req,
     });
     return writeError(res, newError(503, msg));
   }
@@ -2398,6 +2656,8 @@ async function handleChat(req, res, cfg, bodyText) {
   const detailT = Date.now();
   for (let poolIndex = 0; poolIndex < pool.length; poolIndex++) {
     const attempt = pool[poolIndex];
+    if (priorBackend && priorBackend !== attempt.backend) fallbackCount++;
+    priorBackend = attempt.backend;
     lastTried = attempt;
     const backend = cfg.backends.find((b) => b.id === attempt.backend);
     const model = (cfg.models || {})[attempt.model];
@@ -2466,10 +2726,24 @@ async function handleChat(req, res, cfg, bodyText) {
     recordDetail(detailT, callId, captureDetail ? payload : boundedPayload(payload), attemptRec);
     if (result.err) {
       lastErr = result.err;
-      const errKind = classify(result.err.status, result.err.body);
+      const errKind = classify(result.err.status, result.err.body, result.err.errorBodyState);
       failedAttempts++;
       if (errKind === "upstream_rejection") opaqueFailures++;
       noteAttemptFailure(cfg, attempt, sessionKey, result.err.status, result.err.body);
+      const scope = cooldownScopeOf(attempt, errKind);
+      attemptsSummary.push(attemptOutcome({
+        attempt,
+        status: result.err.status,
+        kind: errKind,
+        decision: errKind === "client" ? "client_error" : "failover",
+        latencyMs: Date.now() - attemptStarted,
+        errorBodyState: result.err.errorBodyState || null,
+        errorBodyBytes: result.err.errorBodyBytes ?? 0,
+        retries,
+        cooldownScope: scope.cooldownScope,
+        nextAvailableAt: scope.nextAvailableAt,
+        requestIds: result.err.requestIds || null,
+      }));
       // An EXPLAINED client error is the caller's payload, so it would fail
       // identically on every provider: fail fast, no retry, no failover. An
       // unexplained rejection proves nothing about the payload, so it falls
@@ -2510,8 +2784,10 @@ async function handleChat(req, res, cfg, bodyText) {
     // wire so it is never replayed or re-statused: the route is charged for later
     // requests, it is not pinned as a success, and the row keeps 200 + telemetry.
     let usableFailure = null;
+    let usableDecision = "success";
     if (metrics.clientCancelled) {
       // The caller hung up: the provider did nothing wrong, so nothing is charged.
+      usableDecision = "client_cancelled";
     } else if (metrics.usable) {
       markSuccess(attempt.backend);
       markRouteSuccess(attempt);
@@ -2519,7 +2795,25 @@ async function handleChat(req, res, cfg, bodyText) {
     } else {
       usableFailure = metrics.relayError || "upstream returned no usable output";
       metrics.relayError = usableFailure;
+      usableDecision = "unusable";
       noteAttemptFailure(cfg, attempt, sessionKey, 0, usableFailure);
+    }
+    {
+      const uKind = usableFailure ? classify(0, usableFailure) : null;
+      const uScope = usableFailure ? cooldownScopeOf(attempt, uKind) : { cooldownScope: null, nextAvailableAt: null };
+      attemptsSummary.push(attemptOutcome({
+        attempt,
+        status: 200,
+        kind: uKind,
+        decision: usableDecision,
+        latencyMs,
+        errorBodyState: null,
+        errorBodyBytes: 0,
+        retries,
+        cooldownScope: uScope.cooldownScope,
+        nextAvailableAt: uScope.nextAvailableAt,
+        requestIds: null,
+      }));
     }
     const genSec = (metrics.genMs || 0) / 1000;
     const entry = applyCost(newHistoryEntry({
@@ -2541,6 +2835,10 @@ async function handleChat(req, res, cfg, bodyText) {
       retryWaitedMs,
       relayError: metrics.relayError || null, // relay cut (idle timeout / upstream drop) for a 200 row
       errorKind: usableFailure ? classify(0, usableFailure) : null, // a 2xx that carried nothing usable is still a failure
+      selectionReason,
+      fallbackCount,
+      cacheMayBeCold: fallbackCount > 0, // the request changed provider: the prompt cache MAY be cold (never a measured miss)
+      ...capAttemptsSummary(attemptsSummary),
     }), cfg);
     recordHistory(entry);
     recordStats(entry);
@@ -2569,6 +2867,11 @@ async function handleChat(req, res, cfg, bodyText) {
       cacheHitPct: metrics.cacheHitPct,
       preview: metrics.preview || null,
       relayError: metrics.relayError || null,
+      errorKind: usableFailure ? classify(0, usableFailure) : null,
+      selectionReason,
+      fallbackCount,
+      cacheMayBeCold: fallbackCount > 0,
+      ...capAttemptsSummary(attemptsSummary),
     });
     releaseAttempt(lease);
     return;
@@ -2581,10 +2884,12 @@ async function handleChat(req, res, cfg, bodyText) {
   // exhausted every provider, which IS provider exhaustion and stays a 503. The
   // detail record keyed by detailT holds every attempt's outcome.
   const latencyMs = Date.now() - started;
-  const lastKind = lastErr ? classify(lastErr.status, lastErr.body) : null;
+  // errorBodyState decides explained vs opaque: a body that was cut off mid-read
+  // must never be trusted as the provider explaining itself.
+  const lastKind = lastErr ? classify(lastErr.status, lastErr.body, lastErr.errorBodyState) : null;
   const explainedClient = lastKind === "client" && !!lastErr;
   const finalStatus = explainedClient ? (lastErr.status || 400) : 503;
-  const failEntry = applyCost(newHistoryEntry({ t: detailT, callId, model: modelId, backend: lastTried ? lastTried.backend : "none", stream, status: finalStatus, latencyMs, session: sessionKey, routedModel: c.ordered[0] ? c.ordered[0].model : null, errorKind: lastKind }), cfg);
+  const failEntry = applyCost(newHistoryEntry({ t: detailT, callId, model: modelId, backend: lastTried ? lastTried.backend : "none", stream, status: finalStatus, latencyMs, session: sessionKey, routedModel: c.ordered[0] ? c.ordered[0].model : null, selectionReason, fallbackCount, cacheMayBeCold: fallbackCount > 0, ...capAttemptsSummary(attemptsSummary), errorKind: lastKind }), cfg);
   recordHistory(failEntry);
   recordAnalytics(failEntry);
   if (!explainedClient) fireAlert(cfg, "request_exhausted", { callId, model: modelId, error: lastErr ? String(lastErr.body || lastErr.status) : "all providers unavailable" });
@@ -2602,7 +2907,15 @@ async function handleChat(req, res, cfg, bodyText) {
     cacheHit: null,
     cacheHitPct: null,
     preview: null,
-    errorBody: lastErr ? lastErr.body : null,
+    // Redacted: the detail endpoint is open, and a provider is free to echo a
+    // credential back inside its error text.
+    errorBody: lastErr ? redactSecrets(String(lastErr.body ?? ""), cfg, req) : null,
+    errorKind: lastKind,
+    upstreamStatus: lastErr ? lastErr.status : null,
+    selectionReason,
+    fallbackCount,
+    cacheMayBeCold: fallbackCount > 0,
+    ...capAttemptsSummary(attemptsSummary),
   });
   res.setHeader("x-router-backend", lastTried ? lastTried.backend : "none");
   res.setHeader("x-router-call", callId);
@@ -2613,18 +2926,34 @@ async function handleChat(req, res, cfg, bodyText) {
   // path above and keep their own wording. The universal claim is reserved for an
   // exhaustion in which NO provider explained itself.
   const allRejectionsOpaque = failedAttempts > 0 && opaqueFailures === failedAttempts;
-  // Named errBody, not body: the enclosing handler already binds "body" to the
-  // parsed request payload.
-  let errBody;
-  if (explainedClient) {
-    errBody = typeof msg === "string" && msg ? msg : JSON.stringify({ error: { message: "the upstream rejected this request", type: "invalid_request_error" } });
-  } else if (lastKind === "upstream_rejection" && allRejectionsOpaque) {
-    errBody = JSON.stringify({ error: { message: `every provider rejected this request without explaining why (${failedAttempts} tried)`, type: "upstream_rejection" } });
-  } else if (lastKind === "upstream_rejection") {
-    errBody = JSON.stringify({ error: { message: `the last provider (${lastTried ? lastTried.backend : "unknown"}) rejected this request without explaining why, after ${failedAttempts} failed attempt(s)`, type: "upstream_rejection" } });
-  } else {
-    errBody = typeof msg === "string" && msg ? msg : JSON.stringify({ error: { message: "all backends cooling", type: "router_unavailable" } });
-  }
+  // Used only when the provider gave no usable explanation of its own. "all
+  // backends cooling" is deliberately NOT the fallback here: an eligibility
+  // failure has its own path with its own wording, and dressing a real upstream
+  // failure up as cooling is what made the 2026-10-07 incident unreadable.
+  const noExplanation =
+    lastKind === "upstream_rejection"
+      ? allRejectionsOpaque
+        ? `every provider rejected this request without explaining why (${failedAttempts} tried)`
+        : `the last provider (${lastTried ? lastTried.backend : "unknown"}) rejected this request without explaining why, after ${failedAttempts} failed attempt(s)`
+      : lastErr
+        ? `the last provider (${lastTried ? lastTried.backend : "unknown"}) failed with HTTP ${lastErr.status}, which it did not explain`
+        : "no provider could serve this request";
+  // Every terminal CHAT failure leaves through one builder: never empty, always
+  // valid JSON, the provider's own words when it gave them (redacted and capped),
+  // plus the ids an operator needs to chase the failure upstream.
+  const recoveryMs = explainedClient ? null : nearestRecoveryMs(c.ordered, sessionKey, Date.now());
+  const errBody = terminalChatError({
+    upstream: typeof msg === "string" && msg ? msg : null,
+    message: noExplanation,
+    type: explainedClient ? "invalid_request_error" : lastKind === "upstream_rejection" ? "upstream_rejection" : "router_unavailable",
+    code: lastKind === "upstream_rejection" ? "upstream_rejection" : null,
+    callId,
+    backend: lastTried ? lastTried.backend : "none",
+    upstreamStatus: lastErr ? lastErr.status : null,
+    nextAvailableAt: recoveryMs === null ? null : Date.now() + recoveryMs,
+    cfg,
+    req,
+  });
   return writeError(res, newError(finalStatus, errBody));
 }
 
@@ -4044,4 +4373,4 @@ if (isMain) {
   });
 }
 
-export { candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost, writeConfigAtomic, routeKey, routeBackoffMs, authScopeOf, sessionPreferenceKey, beginSessionRequest, orderSessionProviders, rememberProvider, sessionPreferenceStats, clearSessionPreferences };
+export { classify, readUpstreamError, terminalChatError, redactSecrets, capAttemptsSummary, attemptOutcome, candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost, writeConfigAtomic, routeKey, routeBackoffMs, authScopeOf, sessionPreferenceKey, beginSessionRequest, orderSessionProviders, rememberProvider, sessionPreferenceStats, clearSessionPreferences };
