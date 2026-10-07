@@ -3328,6 +3328,72 @@ async function main() {
     }
   }
 
+  // zPref) The preference cap evicts the least recently USED pin, and /health exposes the
+  //   table as counts only (review finding 13, plan checkbox 204).
+  {
+    const haveSeams = typeof SRV.touchSessionPreference === "function" && typeof SRV.evictSessionPreferences === "function" && SRV.SESSION_PREFS instanceof Map;
+    assert(haveSeams, "zPref1) the preference table exposes its LRU seams for deterministic testing");
+    if (haveSeams) {
+      const M = SRV.SESSION_PREFS;
+      const saved = new Map(M);
+      try {
+        M.clear();
+        for (const k of ["a", "b", "c"]) M.set(k, { routeKey: "r", latestRequestSequence: 1, lastUsedAt: 1 });
+        SRV.touchSessionPreference("a", Date.now()); // 'a' is oldest written, newest used
+        SRV.evictSessionPreferences(2);
+        assert(
+          M.has("a") && M.has("c") && !M.has("b"),
+          "zPref2) the cap evicts the least recently used pin, not the oldest written one (order=" + JSON.stringify([...M.keys()]) + ")"
+        );
+      } finally { M.clear(); for (const [k, v] of saved) M.set(k, v); }
+    }
+  }
+
+  // zUncool) An operator uncool clears the backend's ROUTES as well as its account;
+  //   otherwise /health reports healthy while every route stays refused (finding 12).
+  {
+    let ucHits = 0;
+    const ua = http.createServer(async (req, res) => {
+      for await (const _ of req) { /* drain */ }
+      ucHits++;
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "boom", type: "server_error" } }));
+    });
+    const portUa = await listen(ua);
+    const cfgUc = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "ua", baseURL: `http://${HOST}:${portUa}`, apiKeyEnv: "KEY_UA" }],
+      models: { mU: { providers: [{ backend: "ua", upstream: "u1" }], affinityPool: 1 } },
+      presets: { pU: { strategy: "failover", models: ["mU"] } },
+      backoff: { ...BO, serverBaseMs: 30000, serverMaxMs: 300000 },
+    };
+    const hUc = await startRouterCfg(cfgUc, "KEY_UA=k\n");
+    const uHealth = async () => (await (await api(hUc.base, "/health", { method: "GET" })).json());
+    const uCall = () => api(hUc.base, "/v1/chat/completions", { body: { model: "pU", messages: [{ role: "user", content: "hi" }] } });
+    try {
+      await (await uCall()).text();
+      const before = await uHealth();
+      const r1 = (before.routes || []).find((x) => x.backend === "ua");
+      assert(r1 && r1.state === "cooling", "zUncool1) the failing route is cooling first (state=" + (r1 && r1.state) + ")");
+      assert(
+        before.preferences && typeof before.preferences.size === "number" && typeof before.preferences.evictions === "number",
+        "zUncool2) /health reports the preference table as counts only (" + JSON.stringify(before.preferences) + ")"
+      );
+      await api(hUc.base, "/admin/backend", { body: { id: "ua", action: "uncool" } });
+      const after = await uHealth();
+      const r2 = (after.routes || []).find((x) => x.backend === "ua");
+      const hitsBefore = ucHits;
+      await (await uCall()).text();
+      assert(
+        (!r2 || r2.state === "healthy") && ucHits === hitsBefore + 1,
+        "zUncool3) uncool clears the route cooldown and the route is dispatched to again (state=" + (r2 && r2.state) + ", hits=" + ucHits + ")"
+      );
+    } finally {
+      hUc.child.kill(); ua.close();
+      await rm(hUc.dir, { recursive: true, force: true });
+    }
+  }
+
   // rUnit) Route-health helpers: the 30/60/120-second progression to the
   //   five-minute cap, computed from the failure streak. Pure functions, so the
   //   clock never has to advance to test them.

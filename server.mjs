@@ -1019,8 +1019,32 @@ function orderSessionProviders(ordered, token, now = Date.now()) {
     }
     i = j;
   }
-  row.lastUsedAt = now;
+  touchSessionPreference(token.key, now);
   return out;
+}
+
+// Reading a pin is USING it, so it moves to the MRU end: that is what makes the cap evict
+// the least recently USED pin rather than the least recently written one (review finding
+// 13 -- a session that came back every day could be evicted by one that ran once).
+function touchSessionPreference(key, now) {
+  const row = SESSION_PREFS.get(key);
+  if (!row) return false;
+  row.lastUsedAt = now == null ? Date.now() : now;
+  SESSION_PREFS.delete(key);
+  SESSION_PREFS.set(key, row);
+  return true;
+}
+
+// The cap is a parameter so eviction order can be pinned by a unit test.
+function evictSessionPreferences(cap = SESSION_PREF_CAP) {
+  let evicted = 0;
+  while (SESSION_PREFS.size > cap) {
+    const oldest = SESSION_PREFS.keys().next().value;
+    SESSION_PREFS.delete(oldest);
+    SESSION_PREF_STATS.evictions++;
+    evicted++;
+  }
+  return evicted;
 }
 
 // Published only by a request that actually produced usable output, and only while
@@ -1042,11 +1066,7 @@ function rememberProvider(token, attempt, completion) {
   SESSION_PREF_STATS.published++;
   // A healthy pin has NO idle TTL: coming back tomorrow should still land on the
   // provider that worked. The bound is size, not age.
-  while (SESSION_PREFS.size > SESSION_PREF_CAP) {
-    const oldest = SESSION_PREFS.keys().next().value;
-    SESSION_PREFS.delete(oldest);
-    SESSION_PREF_STATS.evictions++;
-  }
+  evictSessionPreferences();
   return true;
 }
 
@@ -3901,7 +3921,7 @@ function server() {
         };
       });
       res.writeHead(200, { "content-type": "application/json" });
-      return res.end(JSON.stringify({ ok: true, port: cfg.port, backends, routes: routeHealthSnapshot(cfg, now) }));
+      return res.end(JSON.stringify({ ok: true, port: cfg.port, backends, routes: routeHealthSnapshot(cfg, now), preferences: sessionPreferenceStats() }));
     }
 
     if (req.method === "POST" && url === "/admin/reset-health") {
@@ -4278,6 +4298,16 @@ function server() {
         health.set(id, h);
       } else {
         markHealthy(id, "uncool");
+        // An uncool that leaves the backend's ROUTES cooling is a lie: /health would report
+        // the account healthy while the router still refuses every route it was cooling
+        // (review finding 12). The operator's decision clears the whole account layer. A
+        // route row does not store its backend -- the key is [backend, upstream] -- so the
+        // owner is read from the key, not from a field (zUncool3 caught exactly that).
+        for (const rkey of [...ROUTES.keys()]) {
+          let owner = null;
+          try { owner = JSON.parse(rkey)[0]; } catch { owner = null; }
+          if (owner === id) ROUTES.delete(rkey);
+        }
       }
       clearSessionPreferences(); // re-learn rather than overrule the operator
       const h = health.get(id);
@@ -4464,4 +4494,4 @@ if (isMain) {
   });
 }
 
-export { classify, readUpstreamError, terminalChatError, redactSecrets, capAttemptsSummary, attemptOutcome, candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost, writeConfigAtomic, routeKey, routeBackoffMs, authScopeOf, sessionPreferenceKey, beginSessionRequest, orderSessionProviders, rememberProvider, sessionPreferenceStats, clearSessionPreferences };
+export { classify, readUpstreamError, terminalChatError, redactSecrets, capAttemptsSummary, attemptOutcome, candidates, touchSessionPreference, evictSessionPreferences, SESSION_PREFS, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost, writeConfigAtomic, routeKey, routeBackoffMs, authScopeOf, sessionPreferenceKey, beginSessionRequest, orderSessionProviders, rememberProvider, sessionPreferenceStats, clearSessionPreferences };
