@@ -199,17 +199,25 @@ function sessionPreferenceKey(authScope, sessionKey, logicalModel) {
 
 **Interfaces:** Consumes optional new health/history fields; displays scope, actual attempts, recovery time, body-read state, and the session/provider-switch reason. No new framework or dashboard redesign.
 
-- [ ] Add red rendering tests driven by records produced by real mock-router API calls. Cover old records, absent explanation, successful fallback, an account healthy with one model route cooling, and escaped malicious explanatory text.
-- [ ] Show account cooldown and provider/model cooldown separately. Show session-only exclusions in the affected call's detail, not as a public list of sessions. Say plainly when no explanation was supplied.
-- [ ] Render trace data through the existing `esc()` handling. Use compact persisted summaries when detailed attempts were evicted. Add a fallback count separate from retries and show aggregate preference evictions.
+- [x] Add red rendering tests driven by records produced by real mock-router API calls. Cover old records, absent explanation, successful fallback, an account healthy with one model route cooling, and escaped malicious explanatory text.
+- [x] Show account cooldown and provider/model cooldown separately. Show session-only exclusions in the affected call's detail, not as a public list of sessions. Say plainly when no explanation was supplied.
+- [x] Render trace data through the existing `esc()` handling. Use compact persisted summaries when detailed attempts were evicted. Add a fallback count separate from retries and show aggregate preference evictions.
 - [x] Document strict cooldown enforcement, scoped opaque rejection, sticky preferences and their restart/LRU exceptions, failover-first retries, and truthful `400/422` responses. Update only affected contract text; do not import the unfinished configuration migration.
-- [ ] Run syntax checks and the full suite; commit `feat: explain cooldown and session failover decisions`.
+  - Note (202-204): the render tests are `zUi1-5` in `test.mjs`, driven by payloads captured off a
+    real router and checked in under `test-fixtures/ui/`. They fail against the previous
+    `index.html` and pass against this one. Preference evictions reach the dashboard through
+    `/health.preferences` (counts only, no session key); the evicted-detail case renders the
+    persisted `attemptsSummary` plus `attemptsOmitted` (`index.html` ~2810/2828).
+  - Note (206): the Task 5 commit is `8348c42` ("feat(ui): separate account from provider recovery,
+    and show why a call moved"), which says what changed rather than repeating the plan's wording.
+  - Note (212): all four gates run clean at 04:10 (see the morning report for the exact output).
+- [x] Run syntax checks and the full suite; commit `feat: explain cooldown and session failover decisions`.
 
 ## Task 6: Final verification and narrow production release
 
 **Interfaces:** Consumes reviewed commits and CI evidence; produces a verified live revision and rollback record. No live configuration or provider-catalog migration.
 
-- [ ] Run every gate: `node --check server.mjs`, `node --check test.mjs`, `node test.mjs`, `git diff --check`.
+- [x] Run every gate: `node --check server.mjs`, `node --check test.mjs`, `node test.mjs`, `git diff --check`.
 - [ ] Obtain independent code review. Demonstrate the fallback and sticky-session regressions fail on unfixed committed bytes and pass with the fix. Confirm fixture cleanup, no real keys or network in the suite, and actual zero-failed output.
 - [ ] Review staged files for credentials and unrelated artifacts. Push only `fix/provider-recovery` and open its PR against the production release branch. Never push the dirty feature branch. STOP AND ASK before any merge, push, or production release.
 - [ ] Before merge, recheck live revision and remote release history. If unrelated changes would be released, stop and coordinate. Snapshot live config, model catalog/order, credential-source presence, and manual exclusions without printing secret values. Record the previous image/revision for rollback.
