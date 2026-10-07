@@ -481,7 +481,33 @@ function ensureBackends(cfg) {
 }
 
 // Classify an upstream failure into a backoff "kind".
-function classify(status, bodyText) {
+// The explanation an upstream error body actually carries, or "" when it
+// explains nothing. A 400/422 is only attributable to the CALLER when the
+// upstream says so: an empty body, whitespace, a message-less JSON object, or a
+// blob we cannot parse carries no explanation, so the router cannot tell a
+// payload bug from a provider-side rejection.
+function upstreamExplanation(bodyText) {
+  const text = String(bodyText || "").trim();
+  if (!text) return "";
+  try {
+    const value = JSON.parse(text);
+    if (typeof value === "string") return value.trim();
+    if (!value || typeof value !== "object") return "";
+    const parts = [
+      typeof value.error === "string" ? value.error : "",
+      value.error && value.error.message,
+      value.message,
+    ];
+    return parts.find((v) => typeof v === "string" && v.trim())?.trim() || "";
+  } catch {
+    // Unparseable: only a raw prose sentence counts as an explanation. A
+    // truncated JSON/HTML fragment is not readable evidence of anything.
+    if (text.startsWith("{") || text.startsWith("[") || text.startsWith("<")) return "";
+    return text;
+  }
+}
+
+function classify(status, bodyText, errorBodyState = "present") {
   if (status === 429) {
     if (/GoUsageLimitError/i.test(bodyText || "")) return "weekly";
     return "rate";
@@ -494,7 +520,15 @@ function classify(status, bodyText) {
     // problem, not a payload bug: they must fail over to the next provider
     // instead of aborting the whole request, and they cool the dry account.
     if (/insufficient (credits|quota)|insufficient_quota|out of credits|billing error/i.test(bodyText || "")) return "billing";
-    return "client"; // our payload bug, not backend health
+    // Explained = the upstream blames the payload, so the backend is fine and
+    // the request stops. Unexplained = "upstream_rejection": no evidence the
+    // payload was at fault, so fail over instead of aborting (2026-10-07: an
+    // OpenCode Go 400 with an empty body 503'd every affected session after a
+    // single attempt). An incomplete read can never prove the caller was at
+    // fault, so only a complete body earns the client classification.
+    const explained = upstreamExplanation(bodyText);
+    if (explained && errorBodyState === "present") return "client";
+    return "upstream_rejection";
   }
   return "server";
 }
@@ -504,9 +538,12 @@ function classify(status, bodyText) {
 // 5xx, network blip) without being a reason to abandon the provider for
 // everyone, and some cooling failures (429 weekly, auth) must never be retried
 // because retrying cannot succeed and only wastes the retry budget.
-function isRetryableError(status, bodyText) {
-  const kind = classify(status, bodyText);
+function isRetryableError(status, bodyText, errorBodyState = "present") {
+  const kind = classify(status, bodyText, errorBodyState);
   if (kind === "weekly" || kind === "auth" || kind === "client") return false;
+  // An unexplained rejection has no evidence that retrying the SAME provider
+  // helps - the identical payload is sent again - so fail over instead.
+  if (kind === "upstream_rejection") return false;
   if (status === 429) return /overload/i.test(bodyText || "");
   if (status === 502 || status === 503 || status === 504) return true;
   if (status === 0) return true; // network error
@@ -550,9 +587,11 @@ function isEmptyNonStreamResult(parsed, completionTokens, isJson) {
 function markFailure(cfg, id, status, bodyText) {
   const h = health.get(id) || { state: "healthy", fails: 0, backoffMs: 0 };
   const kind = classify(status, bodyText);
-  if (kind === "client") {
-    // Client-side payload error: the backend is fine; do not cool it down.
-    // Record the last error for visibility but keep the backend healthy.
+  // Neither a genuine client error nor an unexplained rejection is evidence that
+  // the ACCOUNT is unhealthy, so neither cools it: record the last error for
+  // visibility and keep the backend healthy. The opaque case additionally gets a
+  // session-scoped exclusion, which is likewise not account health.
+  if (kind === "client" || kind === "upstream_rejection") {
     h.lastError = { status, kind, body: (bodyText || "").slice(0, 300) };
     health.set(id, h);
     return;
@@ -2015,7 +2054,10 @@ async function handleChat(req, res, cfg, bodyText) {
     if (result.err) {
       lastErr = result.err;
       markFailure(cfg, attempt.backend, result.err.status, result.err.body);
-      // Client-side errors are the same for every backend: fail fast, no retry.
+      // An EXPLAINED client error is the caller's payload, so it would fail
+      // identically on every provider: fail fast, no retry, no failover. An
+      // unexplained rejection proves nothing about the payload, so it falls
+      // through to the next provider instead.
       if (classify(result.err.status, result.err.body) === "client") break;
       continue;
     }
@@ -2099,18 +2141,25 @@ async function handleChat(req, res, cfg, bodyText) {
     return;
   }
 
-  // All attempts failed (or were skipped): record the exhausted failure with a
-  // 503. The detail record keyed by detailT holds every attempt's outcome.
+  // All attempts failed (or were skipped). Two outcomes share this path and must
+  // not be conflated: an EXPLAINED client error means the caller's payload was
+  // rejected, so the router surfaces the real status and the upstream's own
+  // explanation and raises no exhaustion alert; an unexplained rejection
+  // exhausted every provider, which IS provider exhaustion and stays a 503. The
+  // detail record keyed by detailT holds every attempt's outcome.
   const latencyMs = Date.now() - started;
-  const failEntry = applyCost(newHistoryEntry({ t: detailT, callId, model: modelId, backend: lastTried ? lastTried.backend : "none", stream, status: 503, latencyMs, session: sessionKey, routedModel: c.ordered[0] ? c.ordered[0].model : null, errorKind: lastErr ? classify(lastErr.status, lastErr.body) : null }), cfg);
+  const lastKind = lastErr ? classify(lastErr.status, lastErr.body) : null;
+  const explainedClient = lastKind === "client" && !!lastErr;
+  const finalStatus = explainedClient ? (lastErr.status || 400) : 503;
+  const failEntry = applyCost(newHistoryEntry({ t: detailT, callId, model: modelId, backend: lastTried ? lastTried.backend : "none", stream, status: finalStatus, latencyMs, session: sessionKey, routedModel: c.ordered[0] ? c.ordered[0].model : null, errorKind: lastKind }), cfg);
   recordHistory(failEntry);
   recordAnalytics(failEntry);
-  fireAlert(cfg, "request_exhausted", { callId, model: modelId, error: lastErr ? String(lastErr.body || lastErr.status) : "all providers unavailable" });
-  recordStats({ backend: lastTried ? lastTried.backend : "none", model: modelId, status: 503, latencyMs });
+  if (!explainedClient) fireAlert(cfg, "request_exhausted", { callId, model: modelId, error: lastErr ? String(lastErr.body || lastErr.status) : "all providers unavailable" });
+  recordStats({ backend: lastTried ? lastTried.backend : "none", model: modelId, status: finalStatus, latencyMs });
   // A detail record exists whenever at least one attempt ran (recorded per
   // attempt above); finalize it unconditionally.
   finalizeDetail(detailT, {
-    status: 503,
+    status: finalStatus,
     ttftMs: 0,
     latencyMs,
     genMs: 0,
@@ -2124,8 +2173,22 @@ async function handleChat(req, res, cfg, bodyText) {
   });
   res.setHeader("x-router-backend", lastTried ? lastTried.backend : "none");
   res.setHeader("x-router-call", callId);
-  const msg = lastErr ? lastErr.body : "all backends unavailable";
-  return writeError(res, newError(503, typeof msg === "string" && msg ? msg : JSON.stringify({ error: { message: "all backends cooling", type: "router_unavailable" } })));
+  const msg = lastErr ? lastErr.body : null;
+  // Never dress an unexplained rejection up as "all backends cooling": that
+  // claimed a cooling state the router never entered, which is what made the
+  // 2026-10-07 incident unreadable. Genuine eligibility failures have their own
+  // path above and keep their own wording.
+  // Named errBody, not body: the enclosing handler already binds "body" to the
+  // parsed request payload.
+  let errBody;
+  if (explainedClient) {
+    errBody = typeof msg === "string" && msg ? msg : JSON.stringify({ error: { message: "the upstream rejected this request", type: "invalid_request_error" } });
+  } else if (lastKind === "upstream_rejection") {
+    errBody = JSON.stringify({ error: { message: `every provider rejected this request without explaining why (${pool.length} tried)`, type: "upstream_rejection" } });
+  } else {
+    errBody = typeof msg === "string" && msg ? msg : JSON.stringify({ error: { message: "all backends cooling", type: "router_unavailable" } });
+  }
+  return writeError(res, newError(finalStatus, errBody));
 }
 
 // Cache detection: the router forwards x-cache-key/cachekey/set-cache-key as

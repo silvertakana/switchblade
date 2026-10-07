@@ -2084,17 +2084,148 @@ async function main() {
         body: JSON.stringify({ model: "p20", messages: [] }),
         signal: AbortSignal.timeout(8000),
       });
-      // Client errors are not retried (hits must stay 1). The router exhausts
-      // the pool and surfaces a 503 carrying the upstream's error body - that
-      // is pre-existing behavior, not a retry concern; what matters is no retry.
+      // A genuine client error is EXPLAINED (it carries a message), so it is the
+      // caller's payload that is wrong: no retry, no failover, and the router now
+      // surfaces the actual status with the upstream's explanation instead of
+      // masking it as a 503. Only an unexplained/opaque rejection fails over.
+      const z20body = await rr.json();
       assert(
-        rr.status === 503 && hits === 1,
-        "z20) non-retryable client error does NOT retry (hits=" + hits + ", status=" + rr.status + ")"
+        rr.status === 422 && hits === 1,
+        "z20) explained client error does NOT retry and keeps its status (hits=" + hits + ", status=" + rr.status + ")"
+      );
+      assert(
+        /bad payload/.test(JSON.stringify(z20body)),
+        "z20b) the 422 carries the upstream explanation (body=" + JSON.stringify(z20body).slice(0, 120) + ")"
       );
     } finally {
       childZ20.kill();
       clientSrv.close();
       await rm(dirZ20, { recursive: true, force: true });
+    }
+  }
+
+  // zOpaque1) An EMPTY-bodied 400 is indistinguishable from a payload bug, so it
+  //   must never abort the whole request: the router fails over to the next
+  //   provider. Motivating incident (2026-10-07): OpenCode Go answered 400 with
+  //   no body and every affected session got a 503 after a single attempt.
+  {
+    let aHits = 0;
+    const aSrv = http.createServer((req, res) => {
+      aHits++;
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end();
+    });
+    const aPort = await listen(aSrv);
+    const bMock = mockBackend("opqB", {});
+    bMock.port = await listen(bMock.srv);
+    const cfgOpq = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "opqA", baseURL: `http://${HOST}:${aPort}`, apiKeyEnv: "KEY_OPQA" },
+        { id: "opqB", baseURL: `http://${HOST}:${bMock.port}`, apiKeyEnv: "KEY_OPQB" },
+      ],
+      // affinityPool 1 degenerates to declared order, so opqA* is always tried first
+      // and the failover path is actually exercised (a larger pool lets the session
+      // hash start at opqB*, which passes without ever attempting a failover).
+      models: { mOpq: { providers: [{ backend: "opqA", upstream: "uA" }, { backend: "opqB", upstream: "uB" }], affinityPool: 1 } },
+      presets: { pOpq: { strategy: "failover", models: ["mOpq"] } },
+      backoff: BO,
+    };
+    const h = await startRouterCfg(cfgOpq, "KEY_OPQA=k\nKEY_OPQB=k\n");
+    try {
+      const rr = await api(h.base, "/v1/chat/completions", { body: { model: "pOpq", messages: [] } });
+      const rb = await rr.json();
+      assert(
+        rr.status === 200 && rb.choices && rb.choices[0].message.content === "mock:opqB",
+        "zOpaque1) empty-bodied 400 fails over to a working provider (status=" + rr.status + ", body=" + JSON.stringify(rb).slice(0, 100) + ")"
+      );
+      assert(aHits === 1, "zOpaque1b) the opaque provider was tried exactly once (hits=" + aHits + ")");
+      const hh = await (await api(h.base, "/health", { method: "GET" })).json();
+      const aState = (hh.backends.find((b) => b.id === "opqA") || {}).state;
+      assert(aState === "healthy", "zOpaque1c) an opaque rejection does not cool the account (state=" + aState + ")");
+    } finally {
+      h.child.kill(); aSrv.close(); bMock.srv.close();
+      await rm(h.dir, { recursive: true, force: true });
+    }
+  }
+
+  // zOpaque2) Opacity is a property of the BODY, not the status code: whitespace,
+  //   an empty JSON object, and a message-less JSON error are all unexplained and
+  //   must fail over rather than abort the request.
+  for (const [label, opqStatus, opqBody] of [
+    ["whitespace", 422, "   \n  "],
+    ["empty-object", 400, "{}"],
+    ["message-less-json", 400, JSON.stringify({ error: { type: "invalid_request_error" } })],
+  ]) {
+    let aHits = 0;
+    const aSrv = http.createServer((req, res) => {
+      aHits++;
+      res.writeHead(opqStatus, { "content-type": "application/json" });
+      res.end(opqBody);
+    });
+    const aPort = await listen(aSrv);
+    const bMock = mockBackend("opqB2", {});
+    bMock.port = await listen(bMock.srv);
+    const cfgO2 = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "opqA2", baseURL: `http://${HOST}:${aPort}`, apiKeyEnv: "KEY_OPQA2" },
+        { id: "opqB2", baseURL: `http://${HOST}:${bMock.port}`, apiKeyEnv: "KEY_OPQB2" },
+      ],
+      // affinityPool 1 degenerates to declared order, so opqA* is always tried first
+      // and the failover path is actually exercised (a larger pool lets the session
+      // hash start at opqB*, which passes without ever attempting a failover).
+      models: { mO2: { providers: [{ backend: "opqA2", upstream: "uA" }, { backend: "opqB2", upstream: "uB" }], affinityPool: 1 } },
+      presets: { pO2: { strategy: "failover", models: ["mO2"] } },
+      backoff: BO,
+    };
+    const h2 = await startRouterCfg(cfgO2, "KEY_OPQA2=k\nKEY_OPQB2=k\n");
+    try {
+      const rr = await api(h2.base, "/v1/chat/completions", { body: { model: "pO2", messages: [] } });
+      assert(
+        rr.status === 200 && aHits === 1,
+        "zOpaque2-" + label + ") unexplained " + opqStatus + " fails over (status=" + rr.status + ", aHits=" + aHits + ")"
+      );
+    } finally {
+      h2.child.kill(); aSrv.close(); bMock.srv.close();
+      await rm(h2.dir, { recursive: true, force: true });
+    }
+  }
+
+  // zOpaque3) When EVERY provider returns an unexplained rejection the request
+  //   still cannot be answered, but the router must exhaust the pool (one attempt
+  //   each) instead of aborting on the first one, and report it as provider
+  //   exhaustion rather than a payload verdict.
+  {
+    let aHits = 0;
+    let bHits = 0;
+    const srvA = http.createServer((req, res) => { aHits++; res.writeHead(400, { "content-type": "application/json" }); res.end(); });
+    const srvB = http.createServer((req, res) => { bHits++; res.writeHead(400, { "content-type": "application/json" }); res.end(); });
+    const portA = await listen(srvA);
+    const portB = await listen(srvB);
+    const cfgO3 = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "opqA3", baseURL: `http://${HOST}:${portA}`, apiKeyEnv: "KEY_OPQA3" },
+        { id: "opqB3", baseURL: `http://${HOST}:${portB}`, apiKeyEnv: "KEY_OPQB3" },
+      ],
+      // affinityPool 1 degenerates to declared order, so opqA* is always tried first
+      // and the failover path is actually exercised (a larger pool lets the session
+      // hash start at opqB*, which passes without ever attempting a failover).
+      models: { mO3: { providers: [{ backend: "opqA3", upstream: "uA" }, { backend: "opqB3", upstream: "uB" }], affinityPool: 1 } },
+      presets: { pO3: { strategy: "failover", models: ["mO3"] } },
+      backoff: BO,
+    };
+    const h3 = await startRouterCfg(cfgO3, "KEY_OPQA3=k\nKEY_OPQB3=k\n");
+    try {
+      const rr = await api(h3.base, "/v1/chat/completions", { body: { model: "pO3", messages: [] } });
+      assert(
+        rr.status === 503 && aHits === 1 && bHits === 1,
+        "zOpaque3) all-opaque exhausts the pool once per provider and returns 503 (status=" + rr.status + ", hits=" + aHits + "/" + bHits + ")"
+      );
+    } finally {
+      h3.child.kill(); srvA.close(); srvB.close();
+      await rm(h3.dir, { recursive: true, force: true });
     }
   }
 
