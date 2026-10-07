@@ -3162,6 +3162,100 @@ async function main() {
     }
   }
 
+  // zStale) A settlement that is no longer the newest one must not write health. Review
+  //   2026-10-08 verified a held success clearing a cooldown a newer request had recorded
+  //   (route fails 1 -> 0). Upstream `sa` answers the FIRST request slowly with a usable
+  //   200 and the SECOND immediately with a 500, which is that race seen from outside.
+  {
+    let saHits = 0;
+    const sa = http.createServer(async (req, res) => {
+      for await (const _ of req) { /* drain */ }
+      saHits++;
+      if (saHits === 1) {
+        await new Promise((r) => setTimeout(r, 700));
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ id: "m", object: "chat.completion", choices: [{ index: 0, message: { role: "assistant", content: "slow but usable" }, finish_reason: "stop" }], usage: { prompt_tokens: 5, completion_tokens: 3 } }));
+        return;
+      }
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "boom", type: "server_error" } }));
+    });
+    const portSa = await listen(sa);
+    const cfgStale = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "sa", baseURL: `http://${HOST}:${portSa}`, apiKeyEnv: "KEY_SA", timeoutMs: 20000 }],
+      models: { mS: { providers: [{ backend: "sa", upstream: "u1" }], affinityPool: 1 } },
+      presets: { pS: { strategy: "failover", models: ["mS"] } },
+      backoff: { ...BO, serverBaseMs: 30000, serverMaxMs: 300000 },
+    };
+    const hStale = await startRouterCfg(cfgStale, "KEY_SA=k\n");
+    const saRow = async () => ((await (await api(hStale.base, "/health", { method: "GET" })).json()).routes || []).find((x) => x.backend === "sa" && x.upstream === "u1");
+    const call = () => api(hStale.base, "/v1/chat/completions", { body: { model: "pS", messages: [{ role: "user", content: "hi" }] } });
+    try {
+      const slow = call();
+      await new Promise((r) => setTimeout(r, 150)); // the slow attempt is now in flight
+      const fast = await call();
+      await fast.text();
+      const cooled = await saRow();
+      assert(
+        saHits === 2 && cooled && cooled.state === "cooling" && cooled.fails === 1,
+        "zStale1) a newer failure cools the route while an older attempt is still in flight (hits=" + saHits + ", row=" + JSON.stringify(cooled && { state: cooled.state, fails: cooled.fails }) + ")"
+      );
+      const slowRes = await slow;
+      await slowRes.text();
+      const after = await saRow();
+      assert(
+        after && after.state === "cooling" && after.fails === 1,
+        "zStale2) an older usable completion does NOT clear the cooldown a newer request recorded (row=" + JSON.stringify(after && { state: after.state, fails: after.fails }) + ")"
+      );
+    } finally {
+      hStale.child.kill(); sa.close();
+      await rm(hStale.dir, { recursive: true, force: true });
+    }
+  }
+
+  // zStale3) A candidate that cooled while an earlier candidate was still working must not
+  //   be dispatched: the candidate list is built once, so without a dispatch-time recheck a
+  //   manually cooled provider still receives the request (review finding 1).
+  {
+    let aHits = 0;
+    const sa = http.createServer(async (req, res) => {
+      for await (const _ of req) { /* drain */ }
+      aHits++;
+      await new Promise((r) => setTimeout(r, 600));
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "boom", type: "server_error" } }));
+    });
+    const sb = mockBackend("sb", {});
+    const portSa = await listen(sa);
+    sb.port = await listen(sb.srv);
+    const cfgDisp = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "sa", baseURL: `http://${HOST}:${portSa}`, apiKeyEnv: "KEY_SA", timeoutMs: 20000 },
+        { id: "sb", baseURL: `http://${HOST}:${sb.port}`, apiKeyEnv: "KEY_SB" },
+      ],
+      models: { mD: { providers: [{ backend: "sa", upstream: "u1" }, { backend: "sb", upstream: "u1" }], affinityPool: 1 } },
+      presets: { pD: { strategy: "failover", models: ["mD"] } },
+      backoff: { ...BO, serverBaseMs: 30000, serverMaxMs: 300000 },
+    };
+    const hDisp = await startRouterCfg(cfgDisp, "KEY_SA=k\nKEY_SB=k\n");
+    try {
+      const pending = api(hDisp.base, "/v1/chat/completions", { body: { model: "pD", messages: [{ role: "user", content: "hi" }] } });
+      await new Promise((r) => setTimeout(r, 200)); // the first candidate is in flight
+      await api(hDisp.base, "/admin/backend", { body: { id: "sb", action: "cool" } });
+      const res = await pending;
+      await res.text();
+      assert(
+        aHits === 1 && sb.hits.length === 0 && res.status >= 500,
+        "zStale3) a provider cooled while the previous candidate was in flight is never dispatched (aHits=" + aHits + ", bHits=" + sb.hits.length + ", status=" + res.status + ")"
+      );
+    } finally {
+      hDisp.child.kill(); sa.close(); sb.srv.close();
+      await rm(hDisp.dir, { recursive: true, force: true });
+    }
+  }
+
   // rUnit) Route-health helpers: the 30/60/120-second progression to the
   //   five-minute cap, computed from the failure streak. Pure functions, so the
   //   clock never has to advance to test them.

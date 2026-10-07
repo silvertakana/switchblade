@@ -751,6 +751,30 @@ function markRouteSuccess(attempt) {
   r.generation = nextGeneration();
 }
 
+// Settlement ownership. Every attempt books itself as the current writer of its route and
+// account rows at dispatch (see the chat loop); only the newest booking may write health.
+// Without this an attempt that started earlier but finished later resurrects stale state:
+// review 2026-10-08 verified a held success clearing a cooldown a newer request had just
+// recorded (route fails 1 -> 0, account cooling -> healthy). A row with no booking (a
+// config load, a manual cool, a reset) is always writable, so operator actions still win.
+function ownsRouteSettlement(attempt) {
+  if (!attempt || attempt.dispatchSeq == null) return true;
+  const r = ROUTES.get(routeKey(attempt));
+  if (!r) return true; // nothing written yet: this settlement creates the row
+  if (r.dispatchSeq === attempt.dispatchSeq) return true; // this attempt's own booking
+  // A row generation past our booking was written after we dispatched, so it is newer
+  // evidence than ours. This also covers the row being CREATED by a newer attempt, which
+  // is the common shape of the race: the cooldown row simply did not exist when we left.
+  return (r.generation || 0) <= attempt.dispatchSeq;
+}
+function ownsAccountSettlement(attempt) {
+  if (!attempt || attempt.dispatchSeq == null) return true;
+  const h = health.get(attempt.backend);
+  if (!h) return true;
+  if (h.dispatchSeq === attempt.dispatchSeq) return true;
+  return (h.generation || 0) <= attempt.dispatchSeq;
+}
+
 // An opaque rejection excludes the route for the CALLER that saw it. Keyed by
 // session + route rather than by logical model, so two models aliasing one physical
 // route share the exclusion, matching how route health is shared (zScope2).
@@ -809,21 +833,27 @@ function nearestRecoveryMs(ordered, sessionKey, now) {
 // Single dispatch point for an attempt's failure, so the three scopes cannot drift
 // apart: caller's fault changes nothing, an opaque rejection excludes the route for
 // this session, a server fault cools the route, and everything else cools the account.
-function noteAttemptFailure(cfg, attempt, sessionKey, status, bodyText) {
-  const kind = classify(status, bodyText);
+function noteAttemptFailure(cfg, attempt, sessionKey, status, bodyText, errorBodyState = "present") {
+  // The settle path must classify from the SAME body-read state the terminal surface used,
+  // or one request reports an opaque rejection and settles as a client error, writing no
+  // exclusion (review finding 14). The ownership guards keep a late settlement from
+  // resurrecting health that a newer attempt already replaced.
+  const kind = classify(status, bodyText, errorBodyState);
   if (kind === "client") return kind;
   if (kind === "upstream_rejection") {
     excludeRouteForSession(sessionKey, attempt);
-    const h = health.get(attempt.backend) || { state: "healthy", fails: 0, backoffMs: 0 };
-    h.lastError = { status, kind, body: (bodyText || "").slice(0, 300) };
-    health.set(attempt.backend, h);
+    if (ownsAccountSettlement(attempt)) {
+      const h = health.get(attempt.backend) || { state: "healthy", fails: 0, backoffMs: 0 };
+      h.lastError = { status, kind, body: (bodyText || "").slice(0, 300) };
+      health.set(attempt.backend, h);
+    }
     return kind;
   }
   if (kind === "server") {
-    markRouteFailure(cfg, attempt, status, bodyText, kind);
+    if (ownsRouteSettlement(attempt)) markRouteFailure(cfg, attempt, status, bodyText, kind);
     return kind;
   }
-  markFailure(cfg, attempt.backend, status, bodyText);
+  if (ownsAccountSettlement(attempt)) markFailure(cfg, attempt.backend, status, bodyText);
   return kind;
 }
 
@@ -2668,6 +2698,18 @@ async function handleChat(req, res, cfg, bodyText) {
     // nothing else would release it.
     const lease = claimAttempt(attempt, now);
     if (!lease) continue; // another request is already probing this recovering route
+    // Eligibility is re-read HERE, at the moment of dispatch, not only when the candidate
+    // list was built: an earlier candidate's network work, or another request, can cool this
+    // route in between, and dispatching into a live cooldown is the bypass that keeps a
+    // session on a provider that keeps failing (review 2026-10-08, finding 1). The
+    // `probe_in_flight` reported here is normally the lease taken a line above, so only a
+    // probe some OTHER request holds is a reason to skip.
+    const blockedAtDispatch = ineligibility(attempt, sessionKey, Date.now());
+    const ownProbe = blockedAtDispatch === "probe_in_flight" && (lease.routeClaim || lease.accountClaim);
+    if (blockedAtDispatch && !ownProbe) {
+      releaseAttempt(lease);
+      continue;
+    }
     const payload = buildPayload(body, cfg, c.preset, model, provider, backend);
     // Per-model retry: on retryable failures, retry the SAME provider with
     // exponential backoff before falling through to the next candidate. This
@@ -2698,6 +2740,22 @@ async function handleChat(req, res, cfg, bodyText) {
       return false;
     };
     while (true) {
+      // A cooldown that landed during the backoff stops the retry -- unless it is the
+      // cooldown our OWN failure just recorded, which is exactly what a configured
+      // transient retry exists to wait out (review finding 1: a retry was dispatched after
+      // a manual cool).
+      if (retries > 0) {
+        const why = ineligibility(attempt, sessionKey, Date.now());
+        if (why && !(why === "route_cooling" && ownsRouteSettlement(attempt))) break;
+      }
+      // Book before EVERY dispatch, first try and retry alike: our own failure moves the
+      // row's generation past this attempt's booking, and the retry must still be able to
+      // settle what its own failure recorded (see ownsRouteSettlement).
+      attempt.dispatchSeq = nextGeneration();
+      const bookRoute = ROUTES.get(routeKey(attempt));
+      if (bookRoute) bookRoute.dispatchSeq = attempt.dispatchSeq;
+      const bookAccount = health.get(attempt.backend);
+      if (bookAccount) bookAccount.dispatchSeq = attempt.dispatchSeq;
       result = await forward(req, cfg, backend, payload, req.headers, stream, sessionKey);
       if (result.err && isRetryableError(result.err.status, result.err.body) && retries < maxRetries && !hasEligibleAlternative()) {
         const retryCount = retries + 1;
@@ -2729,7 +2787,7 @@ async function handleChat(req, res, cfg, bodyText) {
       const errKind = classify(result.err.status, result.err.body, result.err.errorBodyState);
       failedAttempts++;
       if (errKind === "upstream_rejection") opaqueFailures++;
-      noteAttemptFailure(cfg, attempt, sessionKey, result.err.status, result.err.body);
+      noteAttemptFailure(cfg, attempt, sessionKey, result.err.status, result.err.body, result.err.errorBodyState);
       const scope = cooldownScopeOf(attempt, errKind);
       attemptsSummary.push(attemptOutcome({
         attempt,
@@ -2789,8 +2847,10 @@ async function handleChat(req, res, cfg, bodyText) {
       // The caller hung up: the provider did nothing wrong, so nothing is charged.
       usableDecision = "client_cancelled";
     } else if (metrics.usable) {
-      markSuccess(attempt.backend);
-      markRouteSuccess(attempt);
+      // The pin is still remembered (this route really did serve the session), but the
+      // health writes are refused when a newer attempt already owns these rows.
+      if (ownsAccountSettlement(attempt)) markSuccess(attempt.backend);
+      if (ownsRouteSettlement(attempt)) markRouteSuccess(attempt);
       rememberProvider(prefToken, attempt, metrics);
     } else {
       usableFailure = metrics.relayError || "upstream returned no usable output";
