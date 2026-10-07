@@ -210,7 +210,7 @@ function sessionPreferenceKey(authScope, sessionKey, logicalModel) {
     persisted `attemptsSummary` plus `attemptsOmitted` (`index.html` ~2810/2828).
   - Note (206): the Task 5 commit is `8348c42` ("feat(ui): separate account from provider recovery,
     and show why a call moved"), which says what changed rather than repeating the plan's wording.
-  - Note (212): all four gates run clean at 04:10 (see the morning report for the exact output).
+  - Note (212): all four gates run clean at 03:30 (see the morning report for the exact output).
 - [x] Run syntax checks and the full suite; commit `feat: explain cooldown and session failover decisions`.
 
 ## Task 6: Final verification and narrow production release
