@@ -7,6 +7,7 @@ import { writeFile, mkdtemp, rm, readFile, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
+import vm from "node:vm";
 // Unit-level imports: server.mjs only starts the server when run as a script,
 // so importing it here gives direct access to strategy selection for tests.
 import { candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost, writeConfigAtomic } from "./server.mjs";
@@ -3466,6 +3467,105 @@ async function main() {
       hUn.child.kill(); uz.close(); okb.srv.close();
       await rm(hUn.dir, { recursive: true, force: true });
     }
+  }
+
+  // zUi) The dashboard renders recovery state from payloads captured off a real router, and
+  //   survives both hostile upstream text and legacy records that predate these fields
+  //   (plan checkbox 201). The renderers run in a stub DOM: no browser, no external assets.
+  {
+    const FIX = join(import.meta.dirname, "test-fixtures", "ui");
+    const load = async (f) => JSON.parse(await readFile(join(FIX, f), "utf8"));
+    const baseHealth = await load("health.json");
+    const baseHist = await load("api_history_limit_10.json");
+    const baseDetail = await load("detail_c06gQZM-rM.json");
+    const baseDash = await load("api_dashboard.json");
+    const CALL = baseDetail.detail.callId;
+    const HTML = await readFile(join(import.meta.dirname, "index.html"), "utf8");
+    const SCRIPTS = [...HTML.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g)].map((m) => m[1]).sort((a, b) => b.length - a.length);
+    const IDS = [...HTML.matchAll(/id="([^"]+)"/g)].map((m) => m[1]);
+    function makeEl(id) {
+      const el = {
+        id, dataset: {}, children: [], attrs: {}, title: "", value: "", checked: false, disabled: false, hidden: false,
+        style: {}, _html: "", _text: "",
+        classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } },
+        appendChild(c) { this.children.push(c); return c; }, removeChild() {}, insertBefore(c) { this.children.push(c); return c; },
+        querySelector() { return null; }, querySelectorAll() { return []; },
+        addEventListener() {}, removeEventListener() {}, dispatchEvent() {},
+        setAttribute(k, v) { this.attrs[k] = String(v); }, getAttribute(k) { return this.attrs[k] ?? null; }, removeAttribute(k) { delete this.attrs[k]; },
+        focus() {}, blur() {}, click() {}, remove() {}, closest() { return null; }, contains() { return false; },
+        getBoundingClientRect() { return { top: 0, left: 0, width: 0, height: 0, bottom: 0, right: 0 }; }, getContext() { return null; },
+      };
+      Object.defineProperty(el, "innerHTML", { get() { return this._html; }, set(v) { this._html = String(v); } });
+      Object.defineProperty(el, "textContent", { get() { return this._text; }, set(v) { this._text = String(v); } });
+      return el;
+    }
+    async function drive(fx, openCall) {
+      const els = new Map();
+      for (const id of IDS) if (!els.has(id)) els.set(id, makeEl(id));
+      const doc = {
+        getElementById(id) { if (!els.has(id)) els.set(id, makeEl(id)); return els.get(id); },
+        querySelector() { return null; }, querySelectorAll() { return []; },
+        createElement(tag) { return makeEl("#" + tag); }, createTextNode(t) { return { nodeValue: String(t), textContent: String(t) }; },
+        addEventListener() {}, removeEventListener() {}, readyState: "complete", title: "", cookie: "",
+        documentElement: makeEl("html"), body: makeEl("body"), head: makeEl("head"), visibilityState: "visible", hidden: false,
+      };
+      const pick = (url) => {
+        const p = String(url).replace(/^https?:\/\/[^/]+/, "").split("?")[0];
+        if (p === "/health") return fx.health;
+        if (p === "/api/dashboard") return fx.dash;
+        if (p === "/api/history") return { entries: fx.hist.entries, limit: fx.hist.limit };
+        if (p === "/api/history/detail") return fx.detail;
+        return {};
+      };
+      const sandbox = {
+        console: { log() {}, warn() {}, error() {}, info() {}, debug() {} }, document: doc,
+        localStorage: { getItem() { return null; }, setItem() {}, removeItem() {} },
+        matchMedia: () => ({ matches: false, addEventListener() {}, removeEventListener() {} }),
+        getComputedStyle: () => ({ getPropertyValue: () => "" }),
+        requestAnimationFrame: () => 0, cancelAnimationFrame() {}, setInterval: () => 0, clearInterval() {}, setTimeout: () => 0, clearTimeout() {},
+        fetch: async (url) => { const body = pick(url); return { ok: true, status: 200, headers: { get: () => null }, json: async () => body, text: async () => JSON.stringify(body) }; },
+        alert() {}, location: { href: "http://127.0.0.1:1/", hash: "", search: "", pathname: "/", protocol: "http:", host: "127.0.0.1:1" },
+        navigator: { userAgent: "node", clipboard: { writeText: async () => {} } },
+        URL: { createObjectURL: () => "", revokeObjectURL() {} }, addEventListener() {}, removeEventListener() {},
+        Event: class { constructor(t) { this.type = t; } }, Blob: class {}, FileReader: class {},
+      };
+      sandbox.window = sandbox; sandbox.globalThis = sandbox; sandbox.self = sandbox;
+      const ctx = vm.createContext(sandbox);
+      vm.runInContext(SCRIPTS[0], ctx, { filename: "index-inline.js" });
+      const run = async (expr) => { const p = vm.runInContext(expr, ctx); if (p && typeof p.then === "function") await p; };
+      const wait = () => new Promise((r) => setTimeout(r, 25));
+      await run("poll()");
+      await wait();
+      if (openCall) { await run("openDetail(" + JSON.stringify(openCall) + ")"); await wait(); }
+      return [...els.values()].map((e) => e._html + " " + e._text).join("\n");
+    }
+    const fx = () => ({ health: structuredClone(baseHealth), hist: structuredClone(baseHist), detail: structuredClone(baseDetail), dash: structuredClone(baseDash) });
+    const plain = await drive(fx());
+    assert(/recovery scope/i.test(plain) && /model route/i.test(plain) && /cool/i.test(plain), "zUi1) the dashboard separates account recovery from provider routes");
+    assert(/first pick/i.test(plain) && /cache may be cold/i.test(plain), "zUi2) the history row names the first pick and marks a fallback as possibly cold");
+    const detail = await drive(fx(), CALL);
+    assert(
+      /attempt outcome/i.test(detail) && /cooldown scope/i.test(detail) && /next recovery/i.test(detail) && /session exclusion/i.test(detail) && /body present/i.test(detail),
+      "zUi3) the detail panel shows attempt outcomes, cooldown scope, next recovery, body state and this call's session exclusions"
+    );
+    const H = "<img src=x onerror=alert(1)>";
+    const host = fx();
+    host.hist.entries[0].relayError = H;
+    host.hist.entries[0].attemptsSummary = [{ backend: H, upstream: "mock-upstream", model: "m", status: 429, kind: "rate", decision: H, latencyMs: 4, retries: 0, errorBodyState: "present", errorBodyBytes: 9, cooldownScope: "account", nextAvailableAt: 0, requestIds: { "x-request-id": H } }];
+    if (host.detail.detail.attempts && host.detail.detail.attempts[0]) host.detail.detail.attempts[0].errorBody = H;
+    if (host.detail.detail.response) { host.detail.detail.response.preview = H; host.detail.detail.response.relayError = H; }
+    const hostile = await drive(host, CALL);
+    assert(!/<img src=x/.test(hostile) && /&lt;img src=x/.test(hostile), "zUi4) upstream text renders as escaped text, never as markup");
+    const old = fx();
+    for (const e of old.hist.entries) { delete e.selectionReason; delete e.attemptsSummary; delete e.cacheMayBeCold; delete e.attemptsOmitted; }
+    for (const a of (old.detail.detail.attempts || [])) { delete a.errorBody; delete a.retry; }
+    for (const k of ["attemptsSummary", "selectionReason", "fallbackCount", "errorKind", "relayError", "cacheMayBeCold", "attemptsOmitted"]) delete old.detail.detail.response[k];
+    const legacy = await drive(old, CALL);
+    const bad = (legacy.replace(/\s+/g, " ").match(/.{0,70}(undefined|NaN).{0,70}/) || [])[0] || "";
+    assert(
+      !/undefined/.test(legacy) && !/NaN/.test(legacy) && legacy.includes(old.hist.entries[0].backend) && legacy.includes(old.hist.entries[0].model),
+      "zUi5) a record predating these fields still renders its backend and model, with no undefined or NaN (" + JSON.stringify(bad) + ")"
+    );
   }
 
   // rUnit) Route-health helpers: the 30/60/120-second progression to the
