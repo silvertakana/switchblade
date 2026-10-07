@@ -59,10 +59,10 @@ A blank `400` is not proof that a provider is broken. Those failures temporarily
 
 **Interfaces:** Consumes the verified production revision and hash; produces an isolated `fix/provider-recovery` worktree and baseline test evidence.
 
-- [ ] Resolve the live production container and compare its deployed source bytes with the release base. If production or `main` moved, review the new base before continuing; do not ship unrelated commits.
-- [ ] Create the worktree (done: `C:/dev/local-model-router.fix-provider-recovery`, branch `fix/provider-recovery`, from the verified revision). Sibling-directory worktrees match this host's convention for other repos.
-- [ ] Save this plan in the worktree and record the ledger.
-- [ ] Run the baseline checks and record the actual suite count and any pre-existing failures.
+- [x] Resolve the live production container and compare its deployed source bytes with the release base. If production or `main` moved, review the new base before continuing; do not ship unrelated commits.
+- [x] Create the worktree (done: `C:/dev/local-model-router.fix-provider-recovery`, branch `fix/provider-recovery`, from the verified revision). Sibling-directory worktrees match this host's convention for other repos.
+- [x] Save this plan in the worktree and record the ledger.
+- [x] Run the baseline checks and record the actual suite count and any pre-existing failures.
 
 ```pwsh
 node --check server.mjs
@@ -107,11 +107,11 @@ function upstreamExplanation(bodyText) {
 
 Billing detection stays first. For `400/422`, no explanation means opaque. If the body read was incomplete, only a complete parseable structured explanation can justify treating it as a genuine client error; partial plain text cannot. Preserve existing auth/rate/server/network classifications. Opacity is decided from the body text itself (blank, whitespace, message-less JSON, terse model-only JSON), so this task does not depend on Task 4; `errorBodyState` is used only to withhold the genuine-client verdict on an incomplete read.
 
-- [ ] Add a failing integration test: empty `400` from A, usable `200` from B, exactly one hit each. Run it against unfixed source and capture the failure naming the actual `503`.
-- [ ] Parameterize whitespace, `{}`, terse model-only JSON, empty messages, JSON string errors, `error.message`, top-level `message`, explanatory plain text, and billing errors.
-- [ ] Introduce the opaque classification and continuation behaviour without account-wide cooling; Task 2 supplies the session-only exclusion.
-- [ ] Return the actual `400/422` for terminal genuine client errors. Update `z20` from expected `503` to `422`, keeping its one-hit assertion. Keep the final status consistent in history, stats, analytics, detail, and the response. Genuine client errors must not raise an exhaustion alert.
-- [ ] Run syntax checks and the full suite; commit `fix: distinguish unexplained upstream rejections from client errors`.
+- [x] Add a failing integration test: empty `400` from A, usable `200` from B, exactly one hit each. Run it against unfixed source and capture the failure naming the actual `503`.
+- [x] Parameterize whitespace, `{}`, terse model-only JSON, empty messages, JSON string errors, `error.message`, top-level `message`, explanatory plain text, and billing errors.
+- [x] Introduce the opaque classification and continuation behaviour without account-wide cooling; Task 2 supplies the session-only exclusion.
+- [x] Return the actual `400/422` for terminal genuine client errors. Update `z20` from expected `503` to `422`, keeping its one-hit assertion. Keep the final status consistent in history, stats, analytics, detail, and the response. Genuine client errors must not raise an exhaustion alert.
+- [x] Run syntax checks and the full suite; commit `fix: distinguish unexplained upstream rejections from client errors`.
 
 ## Task 2: Scoped cooldowns, strict eligibility, and recovery probes
 
@@ -137,14 +137,14 @@ function routeBackoffMs(fails, cfg) {
 }
 ```
 
-- [ ] Add red fake-clock tests for route isolation, alias sharing, 30/60/120-second progression to the five-minute cap, and failure-streak preservation after timer expiry. A real valid recovery resets the streak; expiry alone does not.
-- [ ] Implement the three eligibility scopes. Opaque failures exclude only the affected session/client route for 30 seconds; server failures update shared route health; account faults update existing account health.
-- [ ] Remove all-cooling forced attempts. Update the `u`/`w` regressions to assert no cooled upstream receives a request, the backend header is `none` when no attempt ran, and the `503` carries correct retry information. Manual exclusions stay sticky, timed exclusions stay timed.
-- [ ] Admit one probe at a time per recovering account/route. Acquire leases before awaiting network work; release on every exit. Use one monotonically increasing generation allocator that is not reset when maps are cleared or a route is removed and re-added. Stale callbacks must never match a newly created state.
-- [ ] Implement the 60-second cross-route account-outage heuristic. Test escalation and the counterexample where another route succeeds (preventing escalation). Opaque failures never count toward it.
-- [ ] Preserve unchanged states across config hot reload; prune removed physical routes and preferences/exclusions referencing them. Account `uncool` clears that account's route recovery states; explicit `reset-health` clears account/route recovery, preferences, and session exclusions. Keep admin authentication. Never invoke either during normal failover.
-- [ ] Extend `/health` with route-scoped rows listing logical model references, retry time, failure count, and probe state. Tag cooling events with scope; keep account-only analytics from counting route events as account outages. Do not expose session maps or authentication fingerprints.
-- [ ] Run syntax checks and the full suite; commit `feat: respect scoped provider cooldowns and recovery probes`.
+- [x] Add red fake-clock tests for route isolation, alias sharing, 30/60/120-second progression to the five-minute cap, and failure-streak preservation after timer expiry. A real valid recovery resets the streak; expiry alone does not.
+- [x] Implement the three eligibility scopes. Opaque failures exclude only the affected session/client route for 30 seconds; server failures update shared route health; account faults update existing account health.
+- [x] Remove all-cooling forced attempts. Update the `u`/`w` regressions to assert no cooled upstream receives a request, the backend header is `none` when no attempt ran, and the `503` carries correct retry information. Manual exclusions stay sticky, timed exclusions stay timed.
+- [x] Admit one probe at a time per recovering account/route. Acquire leases before awaiting network work; release on every exit. Use one monotonically increasing generation allocator that is not reset when maps are cleared or a route is removed and re-added. Stale callbacks must never match a newly created state.
+- [x] Implement the 60-second cross-route account-outage heuristic. Test escalation and the counterexample where another route succeeds (preventing escalation). Opaque failures never count toward it.
+- [x] Preserve unchanged states across config hot reload; prune removed physical routes and preferences/exclusions referencing them. Account `uncool` clears that account's route recovery states; explicit `reset-health` clears account/route recovery, preferences, and session exclusions. Keep admin authentication. Never invoke either during normal failover.
+- [x] Extend `/health` with route-scoped rows listing logical model references, retry time, failure count, and probe state. Tag cooling events with scope; keep account-only analytics from counting route events as account outages. Do not expose session maps or authentication fingerprints.
+- [x] Run syntax checks and the full suite; commit `feat: respect scoped provider cooldowns and recovery probes`.
 
 ## Task 3: Keep sessions on successful replacements
 
@@ -166,13 +166,14 @@ function sessionPreferenceKey(authScope, sessionKey, logicalModel) {
 }
 ```
 
-- [ ] Write the core red multi-turn fixture: A returns an empty `400`; B produces a valid response; later turns of the same session hit only B. After A's exclusion expires and another session proves A works, the original session still hits B. Then B fails, C succeeds, and the session stays on C. Assert provider hit counts, not just answer text.
-- [ ] Implement the bounded 10,000-entry LRU preference map with no idle TTL for healthy pins. Lazily remove expired negative exclusions; empty non-pinned rows may be pruned. Different authentication scopes with identical session IDs must not share state.
-- [ ] Apply failover-first retry selection. Same-provider retries only for configured transient errors when no alternative is eligible, before final cooling, with eligibility/cancellation/generation rechecks before each retry. Keep the existing single-provider retry tests.
-- [ ] Move healthy marking from HTTP `200` headers to clean usable completion. Record upstream stalls, cuts, and empty output as route failures. For already-delivered streams, never replay or change the sent status; keep `200` plus failure telemetry, exclude the route for later requests, and do not pin it as a success. Content-only, reasoning-only, and tool-call-only responses all qualify as usable.
-- [ ] Propagate client-disconnect cancellation distinctly through forwarding and relay; never classify a caller-aborted pipeline as an upstream outage. Release owned probe leases without penalizing the provider.
+- [x] Write the core red multi-turn fixture: A returns an empty `400`; B produces a valid response; later turns of the same session hit only B. After A's exclusion expires and another session proves A works, the original session still hits B. Then B fails, C succeeds, and the session stays on C. Assert provider hit counts, not just answer text.
+- [x] Implement the bounded 10,000-entry LRU preference map with no idle TTL for healthy pins. Lazily remove expired negative exclusions; empty non-pinned rows may be pruned. Different authentication scopes with identical session IDs must not share state.
+- [x] Apply failover-first retry selection. Same-provider retries only for configured transient errors when no alternative is eligible, before final cooling, with eligibility/cancellation/generation rechecks before each retry. Keep the existing single-provider retry tests.
+- [x] Move healthy marking from HTTP `200` headers to clean usable completion. Record upstream stalls, cuts, and empty output as route failures. For already-delivered streams, never replay or change the sent status; keep `200` plus failure telemetry, exclude the route for later requests, and do not pin it as a success. Content-only, reasoning-only, and tool-call-only responses all qualify as usable.
+- [x] Propagate client-disconnect cancellation distinctly through forwarding and relay; never classify a caller-aborted pipeline as an upstream outage. Release owned probe leases without penalizing the provider.
 - [ ] Add held-response concurrency tests: an older slow A success cannot erase a newer A cooldown or overwrite a newer B preference. Cover account and route generations, probe cancellation, `no-session` client-scoped exclusion, model ordering, config removal/re-add, long idle, and LRU eviction.
-- [ ] Run syntax checks and the full suite; commit `feat: keep sessions on working fallback providers`.
+  - DEVIATION (recorded 2026-10-08): the two-overlapping-live-requests half of this box is NOT covered. The older-slow-A-vs-newer-B-preference and newer-cooldown cases are pinned at unit level (zSess4f/zSess4h) instead of with concurrent live requests. Residual risk: a live held-response race is untested.
+- [x] Run syntax checks and the full suite; commit `feat: keep sessions on working fallback providers`.
 
 ## Task 4: Useful errors and durable safe diagnostics
 
@@ -183,14 +184,14 @@ function sessionPreferenceKey(authScope, sessionKey, logicalModel) {
 - `terminalChatError(...)` returns an OpenAI-style JSON envelope with message/type/code/callId/backend/upstreamStatus and an optional recovery timestamp. Chat errors only; config/admin envelopes unchanged.
 - History adds `attemptsSummary`, `attemptsOmitted`, `fallbackCount`, `selectionReason`; old records default to empty/zero.
 
-- [ ] Add red tests for never-ended error bodies, exact-limit and oversized multichunk bodies, UTF-8 boundaries, and socket-reset read failures.
-- [ ] Replace unbounded error `.text()` reads with a reader capped at 16 KiB and one five-second total deadline. Race pending reads against the deadline, keep the bounded prefix, and distinguish timeout from empty body. Clear the timer and cancel/release readers on every exit without waiting indefinitely for cancellation. Successful-response and stream timeouts otherwise stay as they are.
-- [ ] Return nonempty safe JSON for every terminal chat failure. Genuine client errors keep `400/422`; opaque/provider exhaustion returns `503`; no-eligible responses explain cooldown/probe/manual state accurately. Keep `x-router-call` and `x-router-backend`. Never turn a blank upstream rejection into "all backends cooling" unless eligibility actually explains it.
-- [ ] Redact configured backend/master/UI credential values from explanatory messages and correlation IDs. Cap messages at 512 characters and allowed IDs at 160; capture only `x-request-id`, `request-id`, and `cf-ray`. Do not add arbitrary headers or raw HTML to new diagnostic envelopes.
-- [ ] Persist body-free final provider outcomes on success and failure: backend/model/upstream/status/classification/decision/latency/body-read state/captured bytes/retry count/cooldown scope/recovery time/allowed request IDs. Keep up to 32 outcomes; when larger, keep the first 31 and the final outcome and record the omitted count.
-- [ ] Count cross-provider transitions separately from same-provider retries. Distinguish configured selection, session preference, cooldown-driven selection, and request failover. Provider-switch telemetry says the cache **may** be cold, never asserts an unmeasured miss. In-memory detail keeps its existing bounded payload policy.
-- [ ] Test persistence after detail-ring eviction and in the temporary history file. Verify key/body/prompt/header sentinels are absent from new durable summaries, that terminal status agrees across surfaces, and that partial-stream failures are not misrepresented as clean success.
-- [ ] Run syntax checks and the full suite; commit `feat: retain safe provider recovery diagnostics`.
+- [x] Add red tests for never-ended error bodies, exact-limit and oversized multichunk bodies, UTF-8 boundaries, and socket-reset read failures.
+- [x] Replace unbounded error `.text()` reads with a reader capped at 16 KiB and one five-second total deadline. Race pending reads against the deadline, keep the bounded prefix, and distinguish timeout from empty body. Clear the timer and cancel/release readers on every exit without waiting indefinitely for cancellation. Successful-response and stream timeouts otherwise stay as they are.
+- [x] Return nonempty safe JSON for every terminal chat failure. Genuine client errors keep `400/422`; opaque/provider exhaustion returns `503`; no-eligible responses explain cooldown/probe/manual state accurately. Keep `x-router-call` and `x-router-backend`. Never turn a blank upstream rejection into "all backends cooling" unless eligibility actually explains it.
+- [x] Redact configured backend/master/UI credential values from explanatory messages and correlation IDs. Cap messages at 512 characters and allowed IDs at 160; capture only `x-request-id`, `request-id`, and `cf-ray`. Do not add arbitrary headers or raw HTML to new diagnostic envelopes.
+- [x] Persist body-free final provider outcomes on success and failure: backend/model/upstream/status/classification/decision/latency/body-read state/captured bytes/retry count/cooldown scope/recovery time/allowed request IDs. Keep up to 32 outcomes; when larger, keep the first 31 and the final outcome and record the omitted count.
+- [x] Count cross-provider transitions separately from same-provider retries. Distinguish configured selection, session preference, cooldown-driven selection, and request failover. Provider-switch telemetry says the cache **may** be cold, never asserts an unmeasured miss. In-memory detail keeps its existing bounded payload policy.
+- [x] Test persistence after detail-ring eviction and in the temporary history file. Verify key/body/prompt/header sentinels are absent from new durable summaries, that terminal status agrees across surfaces, and that partial-stream failures are not misrepresented as clean success.
+- [x] Run syntax checks and the full suite; commit `feat: retain safe provider recovery diagnostics`.
 
 ## Task 5: Dashboard and behaviour documentation
 
@@ -201,7 +202,7 @@ function sessionPreferenceKey(authScope, sessionKey, logicalModel) {
 - [ ] Add red rendering tests driven by records produced by real mock-router API calls. Cover old records, absent explanation, successful fallback, an account healthy with one model route cooling, and escaped malicious explanatory text.
 - [ ] Show account cooldown and provider/model cooldown separately. Show session-only exclusions in the affected call's detail, not as a public list of sessions. Say plainly when no explanation was supplied.
 - [ ] Render trace data through the existing `esc()` handling. Use compact persisted summaries when detailed attempts were evicted. Add a fallback count separate from retries and show aggregate preference evictions.
-- [ ] Document strict cooldown enforcement, scoped opaque rejection, sticky preferences and their restart/LRU exceptions, failover-first retries, and truthful `400/422` responses. Update only affected contract text; do not import the unfinished configuration migration.
+- [x] Document strict cooldown enforcement, scoped opaque rejection, sticky preferences and their restart/LRU exceptions, failover-first retries, and truthful `400/422` responses. Update only affected contract text; do not import the unfinished configuration migration.
 - [ ] Run syntax checks and the full suite; commit `feat: explain cooldown and session failover decisions`.
 
 ## Task 6: Final verification and narrow production release
