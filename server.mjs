@@ -2289,12 +2289,16 @@ function parseJsonMaybe(text) {
 }
 
 // Configured credential VALUES must never reach a caller, a log line, or a durable
-// record. Values shorter than 8 characters are skipped: a fixture or stub key like
-// "k" would otherwise redact the alphabet.
+// record. Values shorter than MIN_SECRET_REDACT are skipped: a fixture or stub key like
+// "k" would otherwise redact the alphabet. The floor used to be 8, which let a genuinely
+// short credential through unredacted (review 2026-10-08, finding 3); it is now 4, and a
+// value under 8 characters is replaced only as a whole word so that removing it cannot
+// corrupt unrelated text around it.
+const MIN_SECRET_REDACT = 4;
 function secretValues(cfg, req) {
   const out = [];
   const add = (v) => {
-    if (typeof v === "string" && v.trim().length >= 8 && !out.includes(v)) out.push(v);
+    if (typeof v === "string" && v.trim().length >= MIN_SECRET_REDACT && !out.includes(v)) out.push(v);
   };
   if (cfg) {
     if (cfg.masterKeyEnv) add(process.env[cfg.masterKeyEnv]);
@@ -2309,7 +2313,23 @@ function secretValues(cfg, req) {
 function redactSecrets(text, cfg, req) {
   if (typeof text !== "string" || !text) return typeof text === "string" ? text : "";
   let out = text;
-  for (const v of secretValues(cfg, req)) out = out.split(v).join("[redacted]");
+  for (const v of secretValues(cfg, req)) {
+    if (v.length >= 8) {
+      out = out.split(v).join("[redacted]");
+      continue;
+    }
+    const esc = v.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    out = out.replace(new RegExp(`(?<![\\w-])${esc}(?![\\w-])`, "g"), "[redacted]");
+  }
+  return out;
+}
+
+// Correlation headers are upstream-controlled and durable (attemptsSummary) as well as
+// served by the open detail endpoint, so an upstream is free to echo a credential into
+// one: they get the same redaction and the same cap as every other upstream text.
+function redactIds(ids, cfg, req) {
+  const out = {};
+  for (const [k, v] of Object.entries(ids || {})) out[k] = redactSecrets(String(v), cfg, req).slice(0, CORRELATION_ID_CAP);
   return out;
 }
 
@@ -2344,10 +2364,19 @@ function terminalChatError(o) {
   }
   if (!e.type) e.type = opts.type || "router_error";
   if (e.code == null) e.code = opts.code == null ? null : opts.code;
-  if (e.callId == null) e.callId = opts.callId ? String(opts.callId).slice(0, CORRELATION_ID_CAP) : null;
-  if (e.backend == null) e.backend = opts.backend || null;
-  if (e.upstreamStatus == null) e.upstreamStatus = opts.upstreamStatus == null ? null : opts.upstreamStatus;
+  // callId, backend and upstreamStatus describe THIS call, so the router's own values win:
+  // an upstream whose error object carries those keys must not be able to forge or
+  // overwrite them, and whatever it did supply is bounded (review finding 11).
+  e.callId = opts.callId
+    ? String(opts.callId).slice(0, CORRELATION_ID_CAP)
+    : (typeof e.callId === "string" ? e.callId.slice(0, CORRELATION_ID_CAP) : null);
+  e.backend = opts.backend || (typeof e.backend === "string" ? e.backend.slice(0, ERROR_MSG_CAP) : null);
+  e.upstreamStatus = opts.upstreamStatus == null
+    ? (e.upstreamStatus == null ? null : e.upstreamStatus)
+    : opts.upstreamStatus;
   if (e.nextAvailableAt == null && opts.nextAvailableAt != null) e.nextAvailableAt = opts.nextAvailableAt;
+  if (typeof e.type === "string") e.type = e.type.slice(0, 64);
+  if (typeof e.code === "string") e.code = e.code.slice(0, 64);
   return JSON.stringify({ error: e });
 }
 
@@ -2525,7 +2554,7 @@ async function forward(req, cfg, backend, payload, incomingHeaders, stream, sess
     const err = newError(upstreamRes.status, eb.body);
     err.errorBodyState = eb.errorBodyState;
     err.errorBodyBytes = eb.errorBodyBytes;
-    err.requestIds = correlationIdsOf(upstreamRes.headers);
+    err.requestIds = redactIds(correlationIdsOf(upstreamRes.headers), cfg, req);
     return { err, statusFromUpstream: upstreamRes.status };
   }
   return { res: upstreamRes };
@@ -2776,7 +2805,9 @@ async function handleChat(req, res, cfg, bodyText) {
       startedAt: attemptStarted,
       status: result.err ? (result.err.status || 0) : 200,
       latencyMs: Date.now() - attemptStarted,
-      errorBody: result.err ? (result.err.body || null) : null,
+      // Redacted when RECORDED: this body is durable and is served by the open detail
+      // endpoint, so an upstream echoing a credential is never written at all.
+      errorBody: result.err ? (result.err.body ? redactSecrets(result.err.body, cfg, req) : (result.err.body || null)) : null,
       retry: typeof attempt.retry === "number" ? attempt.retry : (attempt.attemptIndex != null ? attempt.attemptIndex : null),
     };
     // Always record the attempt in the deep-dive store; oversized bodies are

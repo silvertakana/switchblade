@@ -3256,6 +3256,78 @@ async function main() {
     }
   }
 
+  // zSec) A credential echoed back by an upstream must not survive anywhere durable or
+  //   served, and an upstream must not be able to forge the router's own facts about the
+  //   call (review findings 3 and 11, 2026-10-08).
+  {
+    const SHORT = "ab12c"; // 5 characters: under the old floor of 8, so it used to leak
+    process.env.T4F_SHORT = SHORT;
+    const cfgR = { backends: [{ id: "x", apiKeyEnv: "T4F_SHORT" }] };
+    const red = SRV.redactSecrets("key=" + SHORT + " done", cfgR, null);
+    assert(
+      !red.includes(SHORT) && red.includes("[redacted]"),
+      "zSec1) a real but short credential value is redacted too (out=" + JSON.stringify(red) + ")"
+    );
+    assert(
+      SRV.redactSecrets("k", cfgR, null) === "k" && SRV.redactSecrets("x" + "k" + "y", cfgR, null) === "x" + "k" + "y",
+      "zSec2) a value below the floor is still left alone"
+    );
+    const forged = JSON.parse(SRV.terminalChatError({
+      upstream: JSON.stringify({ error: { message: "no", backend: "caller-said-so", upstreamStatus: 418, callId: "C".repeat(300), type: "T".repeat(200) } }),
+      message: "fallback", type: "router_error", callId: "real-call", backend: "real-backend", upstreamStatus: 503, cfg: cfgR, req: null,
+    }));
+    assert(
+      forged.error.backend === "real-backend" && forged.error.upstreamStatus === 503 && forged.error.callId === "real-call" && forged.error.type.length <= 64,
+      "zSec3) an upstream cannot forge backend/upstreamStatus/callId, and its strings stay bounded (env=" + JSON.stringify(forged.error) + ")"
+    );
+    const upCall = JSON.parse(SRV.terminalChatError({
+      upstream: JSON.stringify({ error: { message: "no", callId: "C".repeat(300) } }), message: "fallback", cfg: cfgR, req: null,
+    }));
+    assert(upCall.error.callId === null || upCall.error.callId.length <= 160, "zSec4) an upstream-supplied callId is capped at 160 (len=" + (upCall.error.callId || "").length + ")");
+
+    // Live path: the upstream echoes the Authorization value in BOTH its message and a
+    // correlation header, which is what makes this reach the durable summary and detail.
+    const sc = http.createServer(async (req, res) => {
+      for await (const _ of req) { /* drain */ }
+      res.writeHead(500, { "content-type": "application/json", "x-request-id": SHORT });
+      res.end(JSON.stringify({ error: { message: "bad credential " + SHORT + " for this account" } }));
+    });
+    const portSc = await listen(sc);
+    const cfgLeak = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "sc", baseURL: `http://${HOST}:${portSc}`, apiKeyEnv: "KEY_SC" }],
+      models: { mL: { providers: [{ backend: "sc", upstream: "u1" }], affinityPool: 1 } },
+      presets: { pL: { strategy: "failover", models: ["mL"] } },
+      backoff: { ...BO, serverBaseMs: 30000, serverMaxMs: 300000 },
+    };
+    const hLeak = await startRouterCfg(cfgLeak, "KEY_SC=" + SHORT + "\n");
+    try {
+      const res = await api(hLeak.base, "/v1/chat/completions", { body: { model: "pL", messages: [{ role: "user", content: "hi" }] } });
+      const body = await res.text();
+      const callId = res.headers.get("x-router-call");
+      const hist = await (await api(hLeak.base, "/api/history?limit=5", { method: "GET" })).json();
+      const entry = (hist.entries || []).find((e) => e.callId === callId);
+      const det = await (await api(hLeak.base, "/api/history/detail?call=" + callId, { method: "GET" })).json();
+      const sums = JSON.stringify((entry && entry.attemptsSummary) || []);
+      const deta = JSON.stringify((det.detail && det.detail.attempts) || []);
+      assert(
+        !body.includes(SHORT) && body.includes("[redacted]"),
+        "zSec5) the terminal error never echoes the credential (body=" + body.slice(0, 160) + ")"
+      );
+      assert(
+        !sums.includes(SHORT) && deta.includes("[redacted]") && !deta.includes(SHORT),
+        "zSec6) the durable outcome and the detail attempt are redacted at record time (sums=" + sums.slice(0, 140) + ")"
+      );
+      assert(
+        !JSON.stringify(det).includes(SHORT),
+        "zSec7) nothing in the detail response carries the credential"
+      );
+    } finally {
+      hLeak.child.kill(); sc.close();
+      await rm(hLeak.dir, { recursive: true, force: true });
+    }
+  }
+
   // rUnit) Route-health helpers: the 30/60/120-second progression to the
   //   five-minute cap, computed from the failure streak. Pure functions, so the
   //   clock never has to advance to test them.
