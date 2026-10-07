@@ -632,6 +632,7 @@ function markSuccess(id) {
 }
 
 function resetAllHealth() {
+  clearSessionPreferences();
   for (const id of health.keys()) markHealthy(id, "reset");
 }
 
@@ -880,6 +881,7 @@ function pruneRoutes(cfg) {
   }
   for (const key of [...ROUTES.keys()]) if (!live.has(key)) ROUTES.delete(key);
   for (const [key, e] of [...SESSION_EXCLUSIONS]) if (!live.has(e.routeKey)) SESSION_EXCLUSIONS.delete(key);
+  for (const [key, row] of [...SESSION_PREFS]) if (!live.has(row.routeKey)) SESSION_PREFS.delete(key);
   for (const id of [...ACCOUNT_OUTAGE_ROUTES.keys()]) {
     if (!cfg.backends.some((b) => b.id === id)) ACCOUNT_OUTAGE_ROUTES.delete(id);
   }
@@ -917,6 +919,112 @@ function routeHealthSnapshot(cfg, now) {
     });
   }
   return rows;
+}
+
+// ---- session provider preference -------------------------------------------
+
+// A session served by a fallback should stay there: the prompt cache lost by moving
+// once is far cheaper than re-discovering a dead provider on every turn. A pin is
+// keyed by (credential, session, logical model), so two callers sharing a session id
+// never share state, and a pin can only ever reorder providers INSIDE the model group
+// it was learned in.
+const SESSION_PREF_CAP = 10000;
+const SESSION_PREFS = new Map(); // prefKey -> {routeKey, latestRequestSequence, lastUsedAt}
+const SESSION_PREF_STATS = { published: 0, rejectedStale: 0, rejectedIneligible: 0, evictions: 0, cleared: 0 };
+let requestSequence = 0; // process-wide monotonic allocator
+
+function nextRequestSequence() {
+  return ++requestSequence;
+}
+
+// Authentication scope: a short, non-reversible fingerprint of the credential the
+// request carried, so distinct keys never share a pin. The raw credential is never
+// retained, printed, or persisted.
+function authScopeOf(req) {
+  const m = /^Bearer\s+(.+)$/i.exec((req && req.headers && req.headers["authorization"]) || "");
+  if (!m || !m[1].trim()) return "anonymous";
+  return crypto.createHash("sha256").update(m[1].trim()).digest("hex").slice(0, 16);
+}
+
+// 'no-session' is a shared bucket, so pinning it would make every anonymous caller
+// follow whichever one succeeded last. Those callers get no pin at all.
+function sessionPreferenceKey(authScope, sessionKey, logicalModel) {
+  if (!sessionKey || sessionKey === "no-session") return null;
+  return crypto.createHash("sha256").update(JSON.stringify([authScope, sessionKey, logicalModel])).digest("hex");
+}
+
+// The token carries this request's sequence number, so a slow response that STARTED
+// before a newer request cannot overwrite that newer decision when it finally lands.
+function beginSessionRequest(authScope, sessionKey, logicalModel) {
+  const key = sessionPreferenceKey(authScope, sessionKey, logicalModel);
+  if (!key) return null;
+  return { key, sequence: nextRequestSequence(), sessionKey, logicalModel };
+}
+
+// Promote a pinned route to the FRONT OF ITS OWN MODEL GROUP only. Models are never
+// reordered and backend dedup already happened, so a promotion cannot resurrect a
+// provider this request is deliberately not allowed to repeat.
+function orderSessionProviders(ordered, token, now = Date.now()) {
+  if (!token || !ordered.length) return ordered;
+  const row = SESSION_PREFS.get(token.key);
+  if (!row) return ordered;
+  const out = [];
+  for (let i = 0; i < ordered.length; ) {
+    let j = i;
+    while (j < ordered.length && ordered[j].model === ordered[i].model) j++;
+    const group = ordered.slice(i, j);
+    const idx = group.findIndex((a) => routeKey(a) === row.routeKey);
+    // A pinned route that cannot be used right now must not be promoted into a
+    // doomed attempt; leave the group in its configured order.
+    if (idx > 0 && ineligibility(group[idx], token.sessionKey, now) === null) {
+      out.push(group[idx], ...group.slice(0, idx), ...group.slice(idx + 1));
+    } else {
+      out.push(...group);
+    }
+    i = j;
+  }
+  row.lastUsedAt = now;
+  return out;
+}
+
+// Published only by a request that actually produced usable output, and only while
+// the route is still usable; a route this request just cooled is not a preference.
+function rememberProvider(token, attempt, completion) {
+  if (!token || !attempt || !completion || !completion.usable) return false;
+  const now = Date.now();
+  if (ineligibility(attempt, token.sessionKey, now) !== null) {
+    SESSION_PREF_STATS.rejectedIneligible++;
+    return false;
+  }
+  const prev = SESSION_PREFS.get(token.key);
+  if (prev && prev.latestRequestSequence > token.sequence) {
+    SESSION_PREF_STATS.rejectedStale++;
+    return false;
+  }
+  if (prev) SESSION_PREFS.delete(token.key); // re-insert: Map order is the LRU order
+  SESSION_PREFS.set(token.key, { routeKey: routeKey(attempt), latestRequestSequence: token.sequence, lastUsedAt: now });
+  SESSION_PREF_STATS.published++;
+  // A healthy pin has NO idle TTL: coming back tomorrow should still land on the
+  // provider that worked. The bound is size, not age.
+  while (SESSION_PREFS.size > SESSION_PREF_CAP) {
+    const oldest = SESSION_PREFS.keys().next().value;
+    SESSION_PREFS.delete(oldest);
+    SESSION_PREF_STATS.evictions++;
+  }
+  return true;
+}
+
+// Counts and sizes only: never a session key, never a pin's identity.
+// An operator health action (manual cool/uncool, reset) is an explicit routing
+// decision and must not be silently overruled by a session's learned preference, so
+// the preference table is dropped and re-learned from the next successful call.
+function clearSessionPreferences() {
+  if (SESSION_PREFS.size) SESSION_PREF_STATS.cleared += SESSION_PREFS.size;
+  SESSION_PREFS.clear();
+}
+
+function sessionPreferenceStats() {
+  return { size: SESSION_PREFS.size, cap: SESSION_PREF_CAP, ...SESSION_PREF_STATS };
 }
 
 // ---- history + stats ----------------------------------------------------------
@@ -2180,6 +2288,10 @@ async function handleChat(req, res, cfg, bodyText) {
   // referenced by a single short id.
   const callId = newCallId();
   const c = candidates(cfg, modelId, sessionKey);
+  // Session provider preference: the route THIS caller's session last succeeded on
+  // for this logical model is promoted inside its model group, so a session stays on
+  // the fallback that worked instead of re-walking to a provider that keeps failing.
+  const prefToken = beginSessionRequest(authScopeOf(req), sessionKey, modelId);
   if (!c) {
     const e = newError(404, JSON.stringify({ error: { message: `model '${modelId}' not found`, type: "model_not_found" } }));
     return writeError(res, e);
@@ -2191,6 +2303,11 @@ async function handleChat(req, res, cfg, bodyText) {
   if (c.kind === "model" && c.ordered.length === 0) {
     const e = newError(404, JSON.stringify({ error: { message: `model '${modelId}' has no valid providers`, type: "model_not_found" } }));
     return writeError(res, e);
+  }
+
+  if (prefToken) {
+    c.ordered = orderSessionProviders(c.ordered, prefToken, Date.now());
+    c.primary = c.ordered.length ? c.ordered[0] : null;
   }
 
   // Strict eligibility. Every candidate must be serviceable right now: its account
@@ -2279,7 +2396,8 @@ async function handleChat(req, res, cfg, bodyText) {
   let opaqueFailures = 0;
   const captureDetail = bodyText.length <= DETAIL_MAX_BODY_BYTES; // size guard: skip huge payloads
   const detailT = Date.now();
-  for (const attempt of pool) {
+  for (let poolIndex = 0; poolIndex < pool.length; poolIndex++) {
+    const attempt = pool[poolIndex];
     lastTried = attempt;
     const backend = cfg.backends.find((b) => b.id === attempt.backend);
     const model = (cfg.models || {})[attempt.model];
@@ -2307,9 +2425,21 @@ async function handleChat(req, res, cfg, bodyText) {
     let retryWaitedMs = 0;
     let result = null;
     const attemptStarted = Date.now();
+    // Failover first: a same-provider retry only makes sense once nothing else in the
+    // pool can serve the request. Retrying a struggling provider on the way to the
+    // same wall is what kept sessions pinned to a provider that kept failing; moving
+    // on costs the prompt cache but gets the answer. The remaining candidates are
+    // re-checked before every retry, so one that cooled meanwhile is not a reason to
+    // keep waiting.
+    const hasEligibleAlternative = () => {
+      for (let k = poolIndex + 1; k < pool.length; k++) {
+        if (ineligibility(pool[k], sessionKey, Date.now()) === null) return true;
+      }
+      return false;
+    };
     while (true) {
       result = await forward(req, cfg, backend, payload, req.headers, stream, sessionKey);
-      if (result.err && isRetryableError(result.err.status, result.err.body) && retries < maxRetries) {
+      if (result.err && isRetryableError(result.err.status, result.err.body) && retries < maxRetries && !hasEligibleAlternative()) {
         const retryCount = retries + 1;
         const waitMs = Math.min(retryBaseMs * retryMult ** (retryCount - 1), retryMaxMs);
         const budgetExceeded = retryWaitedMs + waitMs > retryTotalMs;
@@ -2348,10 +2478,8 @@ async function handleChat(req, res, cfg, bodyText) {
       if (errKind === "client") break;
       continue;
     }
-    // Success: mark healthy, relay (ttft = time to first upstream response),
-    // then record full metrics once the body has been forwarded to the client.
-    markSuccess(attempt.backend);
-    markRouteSuccess(attempt);
+    // The upstream answered, but a status line is not a success yet: mark healthy
+    // only after the body actually carried usable output (below).
     const latencyMs = Date.now() - started;
     let metrics;
     try {
@@ -2377,6 +2505,22 @@ async function handleChat(req, res, cfg, bodyText) {
       });
       metrics = { ttftMs: latencyMs, cacheHit: false, promptTokens: 0, completionTokens: 0, reasoningTokens: 0, genMs: 0, relayError: String((e && e.message) || e) };
     }
+    // A 200 that stalled, got cut, carried nothing, or was abandoned by the caller is
+    // an upstream failure wearing a success status. The response is already on the
+    // wire so it is never replayed or re-statused: the route is charged for later
+    // requests, it is not pinned as a success, and the row keeps 200 + telemetry.
+    let usableFailure = null;
+    if (metrics.clientCancelled) {
+      // The caller hung up: the provider did nothing wrong, so nothing is charged.
+    } else if (metrics.usable) {
+      markSuccess(attempt.backend);
+      markRouteSuccess(attempt);
+      rememberProvider(prefToken, attempt, metrics);
+    } else {
+      usableFailure = metrics.relayError || "upstream returned no usable output";
+      metrics.relayError = usableFailure;
+      noteAttemptFailure(cfg, attempt, sessionKey, 0, usableFailure);
+    }
     const genSec = (metrics.genMs || 0) / 1000;
     const entry = applyCost(newHistoryEntry({
       t: detailT, callId, model: modelId, backend: attempt.backend, stream, status: 200, latencyMs,
@@ -2396,7 +2540,7 @@ async function handleChat(req, res, cfg, bodyText) {
       retries,
       retryWaitedMs,
       relayError: metrics.relayError || null, // relay cut (idle timeout / upstream drop) for a 200 row
-      errorKind: null, // upstream returned a 2xx: no failure to classify
+      errorKind: usableFailure ? classify(0, usableFailure) : null, // a 2xx that carried nothing usable is still a failure
     }), cfg);
     recordHistory(entry);
     recordStats(entry);
@@ -2625,6 +2769,12 @@ function makeUsageCollector() {
   let promptCacheMiss = 0;
   let promptCacheMissSeen = false; // miss field actually reported (0 default != "reported zero")
   let cacheFieldSeen = false;
+  // Usability signals, observed from the PARSED payload rather than inferred from
+  // token counts: a 200 that carried no content, no reasoning and no tool call is
+  // an upstream failure wearing a success status.
+  let hasContent = false;
+  let hasReasoning = false;
+  let hasToolCalls = false;
   function consume(line) {
     const t = line.trim();
     if (!t.startsWith("data:")) return;
@@ -2632,6 +2782,13 @@ function makeUsageCollector() {
     if (!payload || payload === "[DONE]") return;
     try {
       const obj = JSON.parse(payload);
+      const ch0 = Array.isArray(obj && obj.choices) ? obj.choices[0] : null;
+      const slot = ch0 ? ch0.delta || ch0.message || null : null;
+      if (slot) {
+        if (slot.content != null && String(slot.content).length > 0) hasContent = true;
+        if (slot.reasoning_content != null || slot.reasoning != null) hasReasoning = true;
+        if (Array.isArray(slot.tool_calls) && slot.tool_calls.length > 0) hasToolCalls = true;
+      }
       if (obj && obj.usage) {
         promptTokens = Number(obj.usage.prompt_tokens) || 0;
         completionTokens = Number(obj.usage.completion_tokens) || 0;
@@ -2670,7 +2827,7 @@ function makeUsageCollector() {
     finalize() {
       if (leftover) consume(leftover);
       leftover = "";
-      return { promptTokens, completionTokens, reasoningTokens, promptCacheHit, promptCacheMiss, promptCacheMissSeen, cacheFieldSeen };
+      return { promptTokens, completionTokens, reasoningTokens, promptCacheHit, promptCacheMiss, promptCacheMissSeen, cacheFieldSeen, hasContent, hasReasoning, hasToolCalls };
     },
   };
 }
@@ -2923,6 +3080,17 @@ async function relay(res, upstreamRes, stream, backendId, started, callId, idleT
   let promptCacheMissTokens = null; // raw miss tokens; null = not reported -> history derives from prompt - hit
   let preview = null;    // first content fragment, truncated to 200 chars
   let relayError = null; // set when the upstream body was cut mid-relay
+  let hasContent = false;
+  let hasReasoning = false;
+  let hasToolCalls = false;
+  // A caller that hung up mid-relay is not an upstream outage, so cancellation is
+  // tracked distinctly. 'close' also fires after a normal end, where writableEnded
+  // is already true, so only an unfinished response counts as a cancellation.
+  let clientCancelled = false;
+  const onClientClose = () => {
+    if (!res.writableEnded) clientCancelled = true;
+  };
+  res.on("close", onClientClose);
   const cap = (s) => (typeof s === "string" ? (s.length > 200 ? s.slice(0, 200) + "…" : s) : s);
   try {
     if (upstreamRes.headers.get("x-request-id")) headers["x-request-id"] = upstreamRes.headers.get("x-request-id");
@@ -2951,13 +3119,19 @@ async function relay(res, upstreamRes, stream, backendId, started, callId, idleT
       } catch (e) {
         // Distinguish a stall-watchdog cut from an upstream/network drop so
         // the history row + timestamped log attribute the right cause.
-        relayError = idle.controller.signal.aborted
-          ? `upstream idle timeout (no data for ${idleTimeoutMs}ms)`
-          : String(e && e.message);
+        if (idle.controller.signal.aborted) clientCancelled = false;
+        relayError = clientCancelled
+          ? "client cancelled the request"
+          : idle.controller.signal.aborted
+            ? `upstream idle timeout (no data for ${idleTimeoutMs}ms)`
+            : String(e && e.message);
         throw e; // let the outer catch close the response + log once
       }
       genMs = Date.now() - genStart;
       const usage = collector.finalize();
+      hasContent = usage.hasContent;
+      hasReasoning = usage.hasReasoning;
+      hasToolCalls = usage.hasToolCalls;
       promptTokens = usage.promptTokens;
       completionTokens = usage.completionTokens;
       reasoningTokens = usage.reasoningTokens;
@@ -3004,6 +3178,9 @@ async function relay(res, upstreamRes, stream, backendId, started, callId, idleT
             buf = Buffer.from(JSON.stringify(parsed));
             const firstMsg = parsed.choices[0].message || parsed.choices[0].delta || {};
             preview = cap(firstMsg.content != null ? firstMsg.content : (firstMsg.text != null ? firstMsg.text : null));
+            hasContent = firstMsg.content != null && String(firstMsg.content).length > 0;
+            hasReasoning = firstMsg.reasoning_content != null || firstMsg.reasoning != null;
+            hasToolCalls = Array.isArray(firstMsg.tool_calls) && firstMsg.tool_calls.length > 0;
           }
         } catch {
           // Body not JSON (e.g. upstream proxy error) — keep token counts at 0.
@@ -3013,9 +3190,11 @@ async function relay(res, upstreamRes, stream, backendId, started, callId, idleT
       } catch (e) {
         // Non-stream body stall/cut (readBodyWithIdle cancels on idle) or
         // body read error: attribute the cause and let the outer catch log.
-        relayError = /idle timeout/.test(String(e && e.message))
-          ? `upstream idle timeout (no data for ${idleTimeoutMs}ms)`
-          : String(e && e.message);
+        relayError = clientCancelled
+          ? "client cancelled the request"
+          : /idle timeout/.test(String(e && e.message))
+            ? `upstream idle timeout (no data for ${idleTimeoutMs}ms)`
+            : String(e && e.message);
         throw e;
       }
     }
@@ -3026,7 +3205,8 @@ async function relay(res, upstreamRes, stream, backendId, started, callId, idleT
     // close cleanly. elapsedMs = wall time from request start; idleAborted =
     // the stall watchdog fired vs an upstream/network drop.
     const idleAborted = relayError && /idle timeout/.test(relayError);
-    writeRelayLog({
+    if (idleAborted) clientCancelled = false; // the upstream stalled; the caller did not leave
+    if (!clientCancelled) writeRelayLog({
       level: "relay-error",
       time: new Date().toISOString(),
       callId: callId || null,
@@ -3044,7 +3224,11 @@ async function relay(res, upstreamRes, stream, backendId, started, callId, idleT
       /* ignore */
     }
   }
-  return { ttftMs, cacheHit, cacheHitPct, promptCacheHitTokens, promptCacheMissTokens, promptTokens, completionTokens, reasoningTokens, genMs, preview, relayError };
+  res.off("close", onClientClose);
+  // A clean, usable completion is content, reasoning or a tool call actually
+  // parsed out of the upstream body - not merely a 200 status line.
+  const usable = !relayError && !clientCancelled && (hasContent || hasReasoning || hasToolCalls);
+  return { ttftMs, cacheHit, cacheHitPct, promptCacheHitTokens, promptCacheMissTokens, promptTokens, completionTokens, reasoningTokens, genMs, preview, relayError, hasContent, hasReasoning, hasToolCalls, clientCancelled, usable };
 }
 
 // Read and JSON-parse a request body. Returns { value } or { error } (a
@@ -3675,6 +3859,7 @@ function server() {
       } else {
         markHealthy(id, "uncool");
       }
+      clearSessionPreferences(); // re-learn rather than overrule the operator
       const h = health.get(id);
       const state = h.state === "cooling" && h.nextAvailableAt > Date.now() ? "cooling" : "healthy";
       res.writeHead(200, { "content-type": "application/json" });
@@ -3859,4 +4044,4 @@ if (isMain) {
   });
 }
 
-export { candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost, writeConfigAtomic, routeKey, routeBackoffMs };
+export { candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost, writeConfigAtomic, routeKey, routeBackoffMs, authScopeOf, sessionPreferenceKey, beginSessionRequest, orderSessionProviders, rememberProvider, sessionPreferenceStats, clearSessionPreferences };

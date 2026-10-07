@@ -2518,6 +2518,249 @@ async function main() {
     }
   }
 
+  // zSess1) A session served by a fallback STAYS on it, even after the original
+  //   provider becomes eligible again, and the pin is per session: another session
+  //   still starts at the declared primary. Hit counts, not just answer text.
+  {
+    const mkSrv = (tag, st) => http.createServer(async (req, res) => {
+      for await (const c of req) { /* drain */ }
+      st.hits++;
+      if (st.fail > 0) {
+        st.fail--;
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "boom" } }));
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: tag, choices: [{ message: { role: "assistant", content: "from-" + tag } }] }));
+    });
+    const A = { hits: 0, fail: 1 }, B = { hits: 0, fail: 0 }, C = { hits: 0, fail: 0 };
+    const srvA = mkSrv("a", A), srvB = mkSrv("b", B), srvC = mkSrv("c", C);
+    const pp = await Promise.all([listen(srvA), listen(srvB), listen(srvC)]);
+    const cfgS = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "sa", baseURL: `http://${HOST}:${pp[0]}`, apiKeyEnv: "KEY_SA" },
+        { id: "sb", baseURL: `http://${HOST}:${pp[1]}`, apiKeyEnv: "KEY_SB" },
+        { id: "sc", baseURL: `http://${HOST}:${pp[2]}`, apiKeyEnv: "KEY_SC" },
+      ],
+      models: { mS: { providers: [{ backend: "sa", upstream: "uS" }, { backend: "sb", upstream: "uS" }, { backend: "sc", upstream: "uS" }], affinityPool: 1 } },
+      presets: { pS: { strategy: "affinity", models: ["mS"] } },
+      backoff: { ...BO, serverBaseMs: 150, serverMaxMs: 400 },
+    };
+    const hS = await startRouterCfg(cfgS, "KEY_SA=k\nKEY_SB=k\nKEY_SC=k\n");
+    const turn = async (sess) => {
+      const r = await api(hS.base, "/v1/chat/completions", { body: { model: "pS", messages: [] }, headers: { "x-session-affinity": sess } });
+      const j = await r.json();
+      return { backend: r.headers.get("x-router-backend"), content: j.choices[0].message.content };
+    };
+    try {
+      const t1 = await turn("sess-1");
+      assert(
+        A.hits === 1 && B.hits === 1 && t1.backend === "sb" && t1.content === "from-b",
+        "zSess1a) a failing primary fails over and the fallback answers (A=" + A.hits + ", B=" + B.hits + ", backend=" + t1.backend + ")"
+      );
+      await new Promise((r) => setTimeout(r, 240)); // let sa's route cooldown lapse: it is eligible again
+      const t2 = await turn("sess-1");
+      assert(
+        t2.backend === "sb" && A.hits === 1 && B.hits === 2,
+        "zSess1b) the session stays on its fallback instead of re-probing the recovered primary (backend=" + t2.backend + ", A=" + A.hits + ", B=" + B.hits + ")"
+      );
+      const t3 = await turn("sess-2");
+      assert(
+        t3.backend === "sa" && A.hits === 2,
+        "zSess1c) another session still starts at the declared primary (backend=" + t3.backend + ", A=" + A.hits + ")"
+      );
+    } finally {
+      hS.child.kill(); srvA.close(); srvB.close(); srvC.close();
+      await rm(hS.dir, { recursive: true, force: true });
+    }
+  }
+
+  // zSess2) When the fallback itself starts failing the session moves further down
+  //   and STAYS there: it is not dragged back to a provider that is merely eligible.
+  {
+    const mkSrv2 = (tag, st) => http.createServer(async (req, res) => {
+      for await (const c of req) { /* drain */ }
+      st.hits++;
+      if (st.fail) {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "boom" } }));
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: tag, choices: [{ message: { role: "assistant", content: "from-" + tag } }] }));
+    });
+    const A = { hits: 0, fail: true }, B = { hits: 0, fail: false }, C = { hits: 0, fail: false };
+    const srvA = mkSrv2("a", A), srvB = mkSrv2("b", B), srvC = mkSrv2("c", C);
+    const pp = await Promise.all([listen(srvA), listen(srvB), listen(srvC)]);
+    const cfgS2 = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "s2a", baseURL: `http://${HOST}:${pp[0]}`, apiKeyEnv: "KEY_S2A" },
+        { id: "s2b", baseURL: `http://${HOST}:${pp[1]}`, apiKeyEnv: "KEY_S2B" },
+        { id: "s2c", baseURL: `http://${HOST}:${pp[2]}`, apiKeyEnv: "KEY_S2C" },
+      ],
+      models: { mS2: { providers: [{ backend: "s2a", upstream: "u2" }, { backend: "s2b", upstream: "u2" }, { backend: "s2c", upstream: "u2" }], affinityPool: 1 } },
+      presets: { pS2: { strategy: "affinity", models: ["mS2"] } },
+      backoff: { ...BO, serverBaseMs: 150, serverMaxMs: 400 },
+    };
+    const hS2 = await startRouterCfg(cfgS2, "KEY_S2A=k\nKEY_S2B=k\nKEY_S2C=k\n");
+    const turn2 = async () => {
+      const r = await api(hS2.base, "/v1/chat/completions", { body: { model: "pS2", messages: [] }, headers: { "x-session-affinity": "sess-chain" } });
+      await r.json();
+      return r.headers.get("x-router-backend");
+    };
+    try {
+      const b1 = await turn2(); // a fails -> b answers, and b becomes the session's provider
+      assert(b1 === "s2b" && B.hits === 1, "zSess2a) the first fallback answers (backend=" + b1 + ", B=" + B.hits + ")");
+      B.fail = true; // the fallback starts failing too
+      const b2 = await turn2();
+      assert(b2 === "s2c" && C.hits === 1, "zSess2b) a failing fallback hands the session to the next provider (backend=" + b2 + ", C=" + C.hits + ")");
+      const b3 = await turn2();
+      assert(b3 === "s2c" && C.hits === 2 && A.hits === 1, "zSess2c) the session stays on the provider that works (backend=" + b3 + ", C=" + C.hits + ", A=" + A.hits + ")");
+    } finally {
+      hS2.child.kill(); srvA.close(); srvB.close(); srvC.close();
+      await rm(hS2.dir, { recursive: true, force: true });
+    }
+  }
+
+  // zSess3) A 200 that carried nothing usable is an upstream failure wearing a
+  //   success status: the response is delivered as-is (never replayed), the ROUTE is
+  //   charged for later requests, and the account is not blamed.
+  {
+    let hits = 0;
+    const srvE = http.createServer(async (req, res) => {
+      for await (const c of req) { /* drain */ }
+      hits++;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: "empty", choices: [{ message: { role: "assistant", content: "" } }] }));
+    });
+    const goodE = mockBackend("goode", {});
+    const pp = await Promise.all([listen(srvE), listen(goodE.srv)]);
+    goodE.port = pp[1];
+    const cfgE = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "se", baseURL: `http://${HOST}:${pp[0]}`, apiKeyEnv: "KEY_SE" },
+        { id: "goode", baseURL: `http://${HOST}:${goodE.port}`, apiKeyEnv: "KEY_GOODE" },
+      ],
+      models: { mE: { providers: [{ backend: "se", upstream: "uE" }, { backend: "goode", upstream: "uE" }], affinityPool: 1 } },
+      presets: { pE: { strategy: "affinity", models: ["mE"] } },
+      backoff: { ...BO, serverBaseMs: 60000, serverMaxMs: 300000 },
+    };
+    const hE = await startRouterCfg(cfgE, "KEY_SE=k\nKEY_GOODE=k\n");
+    try {
+      const rr = await api(hE.base, "/v1/chat/completions", { body: { model: "pE", messages: [] }, headers: { "x-session-affinity": "sess-empty" } });
+      const body = await rr.json();
+      const hh = await (await api(hE.base, "/health", { method: "GET" })).json();
+      const row = (hh.routes || []).find((x) => x.backend === "se" && x.upstream === "uE");
+      const acct = hh.backends.find((b) => b.id === "se");
+      assert(
+        rr.status === 200 && body.choices[0].message.content === "" && rr.headers.get("x-router-backend") === "se",
+        "zSess3a) the empty 200 is delivered unchanged rather than replayed (status=" + rr.status + ", backend=" + rr.headers.get("x-router-backend") + ")"
+      );
+      assert(
+        !!row && row.fails >= 1 && row.state === "cooling" && acct.state === "healthy",
+        "zSess3b) an unusable 200 is charged to the route, not the account (row=" + JSON.stringify(row && { fails: row.fails, state: row.state }) + ", account=" + acct.state + ")"
+      );
+    } finally {
+      hE.child.kill(); srvE.close(); goodE.srv.close();
+      await rm(hE.dir, { recursive: true, force: true });
+    }
+  }
+
+  // zSess4) Preference keys and bounds, unit level: credential scope, model scope,
+  //   no-session, the stale-sequence guard, no idle TTL, and the LRU cap.
+  {
+    SRV.clearSessionPreferences();
+    assert(
+      SRV.sessionPreferenceKey("scopeA", "s1", "m") !== SRV.sessionPreferenceKey("scopeB", "s1", "m"),
+      "zSess4a) two credentials with the same session id do not share a preference"
+    );
+    assert(
+      SRV.sessionPreferenceKey("scopeA", "s1", "m") !== SRV.sessionPreferenceKey("scopeA", "s1", "m2"),
+      "zSess4b) the logical model is part of the key"
+    );
+    assert(SRV.sessionPreferenceKey("scopeA", "no-session", "m") === null, "zSess4c) no-session callers get no pin");
+    assert(
+      SRV.authScopeOf({ headers: { authorization: "Bearer abc" } }) !== SRV.authScopeOf({ headers: { authorization: "Bearer def" } }),
+      "zSess4d) different credentials get different scopes"
+    );
+    assert(SRV.authScopeOf({ headers: {} }) === "anonymous", "zSess4e) no credential is its own scope");
+    const tok1 = SRV.beginSessionRequest("scopeA", "s1", "m");
+    const tok2 = SRV.beginSessionRequest("scopeA", "s1", "m");
+    assert(tok2.sequence > tok1.sequence, "zSess4f) request sequences are monotonic");
+    assert(SRV.rememberProvider(tok2, { backend: "zz-b", upstream: "u" }, { usable: true }) === true, "zSess4g) a usable completion publishes a pin");
+    assert(
+      SRV.rememberProvider(tok1, { backend: "zz-a", upstream: "u" }, { usable: true }) === false &&
+        SRV.sessionPreferenceStats().rejectedStale >= 1,
+      "zSess4h) an older response cannot overwrite a newer pin (rejectedStale=" + SRV.sessionPreferenceStats().rejectedStale + ")"
+    );
+    const ordered = [{ model: "m", backend: "zz-a", upstream: "u" }, { model: "m", backend: "zz-b", upstream: "u" }];
+    assert(
+      SRV.orderSessionProviders(ordered, tok2, Date.now() + 30 * 24 * 3600 * 1000)[0].backend === "zz-b",
+      "zSess4i) a healthy pin has no idle TTL (promoted a month later)"
+    );
+    assert(
+      SRV.orderSessionProviders([{ model: "other", backend: "zz-b", upstream: "u" }, ...ordered], tok2, Date.now())[0].model === "other",
+      "zSess4j) a pin never reorders logical models"
+    );
+    assert(SRV.rememberProvider(tok2, { backend: "zz-a", upstream: "u" }, { usable: false }) === false, "zSess4k) an unusable completion never publishes a pin");
+    for (let i = 0; i < 10001; i++) {
+      SRV.rememberProvider({ key: "cap-" + i, sequence: 1000000 + i, sessionKey: "sb" }, { backend: "zz-b", upstream: "u" }, { usable: true });
+    }
+    const st = SRV.sessionPreferenceStats();
+    assert(st.size <= st.cap && st.evictions >= 1, "zSess4l) the preference map is bounded (size=" + st.size + "/" + st.cap + ", evictions=" + st.evictions + ")");
+    SRV.clearSessionPreferences();
+    assert(SRV.sessionPreferenceStats().size === 0, "zSess4m) an operator action clears learned preferences");
+  }
+
+  // zSess5) A caller that hangs up mid-stream is NOT an upstream outage: the route is
+  //   not cooled and no preference is published, so the provider keeps serving others.
+  {
+    let hits = 0;
+    const srvC = http.createServer(async (req, res) => {
+      for await (const c of req) { /* drain */ }
+      hits++;
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+      res.write("data: " + JSON.stringify({ id: "cancel", choices: [{ delta: { content: "hello" } }] }) + "\n\n");
+      // then hold forever: the caller walks away
+    });
+    const portC = await listen(srvC);
+    const cfgC = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "sc5", baseURL: `http://${HOST}:${portC}`, apiKeyEnv: "KEY_SC5", idleTimeoutMs: 60000 }],
+      models: { mC5: { providers: [{ backend: "sc5", upstream: "u5" }], affinityPool: 1 } },
+      presets: { pC5: { strategy: "affinity", models: ["mC5"] } },
+      backoff: { ...BO, serverBaseMs: 60000, serverMaxMs: 300000 },
+    };
+    const hC = await startRouterCfg(cfgC, "KEY_SC5=k\n");
+    try {
+      const ac = new AbortController();
+      const rr = await fetch(hC.base + "/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer local-master" },
+        body: JSON.stringify({ model: "pC5", messages: [], stream: true }),
+        signal: ac.signal,
+      });
+      const reader = rr.body.getReader();
+      await reader.read(); // the first chunk arrives
+      ac.abort(); // the caller hangs up
+      await new Promise((r) => setTimeout(r, 500));
+      const hh = await (await api(hC.base, "/health", { method: "GET" })).json();
+      const b = hh.backends.find((x) => x.id === "sc5");
+      const rows = (hh.routes || []).filter((x) => x.backend === "sc5");
+      assert(
+        hits === 1 && b.state === "healthy" && rows.length === 0,
+        "zSess5) a caller abort is not charged to the provider (hits=" + hits + ", state=" + b.state + ", routes=" + JSON.stringify(rows) + ")"
+      );
+    } finally {
+      hC.child.kill(); srvC.close();
+      await rm(hC.dir, { recursive: true, force: true });
+    }
+  }
+
   // zProbe1) Exactly one request may probe a recovering route. Once the cooldown
   //   lapses, the first request takes the probe and hangs on the upstream; a second
   //   request arriving while that probe is still open must NOT pile onto the same
@@ -2831,7 +3074,9 @@ async function main() {
     }
   }
 
-  // z21) maxRetries exhausted -> falls through to next candidate provider.
+  // z21) failover FIRST: a retryable upstream failure with another provider still
+  //      eligible leaves for that provider immediately instead of burning the whole
+  //      retry budget against the same failing one. badSrv is hit exactly once.
   {
     let badHits = 0;
     const badSrv = http.createServer((req, res) => {
@@ -2868,8 +3113,8 @@ async function main() {
       const backend = rr.headers.get("x-router-backend");
       const body = await rr.json();
       assert(
-        rr.status === 200 && backend === "z21good" && badHits === 3,
-        "z21) retries exhausted then fallback: badSrv hit 3x (1 + 2 retries), served by good backend (backend=" + backend + ", badHits=" + badHits + ")"
+        rr.status === 200 && backend === "z21good" && badHits === 1,
+        "z21) failover-first: a retryable failure with an eligible alternative is not retried (backend=" + backend + ", badHits=" + badHits + ")"
       );
     } finally {
       childZ21.kill();
@@ -2878,9 +3123,53 @@ async function main() {
     }
   }
 
-  // z22) totalMs budget stops retries mid-way: with baseMs large enough that
-  //      the second retry would exceed the budget, only 2 attempts happen
-  //      (1 initial + 1 retry) then failover to the good backend.
+  // z21b) the same-provider retry still exists, but only when NOTHING else is
+  //      eligible: with a single configured provider there is no alternative to
+  //      fail over to, so a retryable 503 is retried up to maxRetries before the
+  //      failure is finally charged.
+  {
+    let badHits = 0;
+    const badSrv = http.createServer((req, res) => {
+      badHits++;
+      res.writeHead(503, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "overloaded", type: "overloaded_error" } }));
+    });
+    const z21bPort = await listen(badSrv);
+    const cfgZ21b = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "z21bbad", baseURL: `http://${HOST}:${z21bPort}`, apiKeyEnv: "KEY_Z21BBAD" }],
+      models: {
+        "m21b": {
+          providers: [{ backend: "z21bbad", upstream: "u21b" }], affinityPool: 1,
+          retry: { maxRetries: 2, baseMs: 10, maxMs: 30, multiplier: 2 },
+        },
+      },
+      presets: { "p21b": { strategy: "affinity", models: ["m21b"] } },
+      backoff: BO,
+    };
+    const { child: childZ21b, base: baseZ21b, dir: dirZ21b } = await startRouterCfg(cfgZ21b, "KEY_Z21BBAD=k\n");
+    try {
+      const rr = await fetch(baseZ21b + "/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer local-master" },
+        body: JSON.stringify({ model: "p21b", messages: [] }),
+        signal: AbortSignal.timeout(8000),
+      });
+      await rr.text();
+      assert(
+        rr.status === 503 && badHits === 3,
+        "z21b) the last eligible provider is still retried (1 + 2 retries) before cooling (status=" + rr.status + ", badHits=" + badHits + ")"
+      );
+    } finally {
+      childZ21b.kill();
+      badSrv.close();
+      await rm(dirZ21b, { recursive: true, force: true });
+    }
+  }
+
+  // z22) totalMs budget stops same-provider retries mid-way: with baseMs large
+  //      enough that the second retry would exceed the budget, only 2 attempts
+  //      happen (1 initial + 1 retry) and the failure is charged.
   {
     let badHits = 0;
     const badSrv = http.createServer((req, res) => {
@@ -2899,7 +3188,7 @@ async function main() {
       ],
       models: {
         "m22": {
-          providers: [{ backend: "z22bad", upstream: "u22" }, { backend: "z22good", upstream: "u22" }], affinityPool: 1,
+          providers: [{ backend: "z22bad", upstream: "u22" }], affinityPool: 1,
           // maxRetries high, but totalMs budget tiny: after first retry (wait 40ms)
           // the second retry's wait would blow the 60ms budget -> stop retrying.
           retry: { maxRetries: 5, baseMs: 40, maxMs: 200, multiplier: 2, totalMs: 60 },
@@ -2918,8 +3207,8 @@ async function main() {
       });
       const backend = rr.headers.get("x-router-backend");
       assert(
-        rr.status === 200 && backend === "z22good" && badHits === 2,
-        "z22) totalMs budget stops retries: badSrv hit 2x (1 + 1 retry), fallback served (backend=" + backend + ", badHits=" + badHits + ")"
+        rr.status === 503 && badHits === 2,
+        "z22) totalMs budget stops retries: badSrv hit 2x (1 + 1 retry) then the failure is charged (status=" + rr.status + ", badHits=" + badHits + ")"
       );
     } finally {
       childZ22.kill();
