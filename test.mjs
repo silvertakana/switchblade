@@ -914,23 +914,21 @@ async function main() {
         "v34a2) the rejection is logged with the validator's own reason (" + JSON.stringify(v34Err.split("\n").filter((l) => /rejected/.test(l)).join(" | ").slice(0, 300)) + ")"
       );
 
-      // v34a3) THE NEW OBSERVABLE Task 11 introduces, pinned rather than merely
-      // noted: a LEGACY payload whose only defect is a repaired value (`retry:
-      // ""`) now reloads ADOPTED, because the bridge repairs it before the
-      // validator runs. The reload-rejection boundary therefore does NOT move
-      // for this class, and the repair is reported.
+      // v34a3) The reload-rejection boundary DOES move for a NEWLY introduced legacy empty
+      // string: it is no longer repaired behind the operator back, so the write is refused,
+      // the config that is running keeps running, and the refusal names the value.
       const legacyReload = JSON.parse(JSON.stringify(good));
       legacyReload.models.v34m = { providers: [{ backend: "v34", upstream: "u" }], retry: "", meta: { label: "legacy-repaired" } };
       await writeFile(cfgPath, JSON.stringify(legacyReload, null, 2));
       await new Promise((r) => setTimeout(r, 900));
       const live2 = await (await fetch(base + "/api/config")).json();
       assert(
-        !!live2.models.v34m && live2.models.v34m.meta && live2.models.v34m.meta.label === "legacy-repaired",
-        "v34a3) a legacy reload whose only defect is a repaired value is repaired and ADOPTED (label=" + (live2.models.v34m && live2.models.v34m.meta && live2.models.v34m.meta.label) + ")"
+        !!live2.models.v34m && live2.models.v34m.meta && live2.models.v34m.meta.label === "good",
+        "v34a3) a reload that INTRODUCES a legacy empty string is refused and the previous config keeps running (label=" + JSON.stringify(live2.models.v34m && live2.models.v34m.meta) + ")"
       );
       assert(
-        /models\.v34m\.retry was an empty string/.test(v34Err) && /bridge:/.test(v34Err),
-        "v34a4) and the repair is reported by the bridge's own warning (" + JSON.stringify(v34Err.split("\n").filter((l) => /bridge:/.test(l)).join(" | ").slice(0, 300)) + ")"
+        /config reload rejected: models\.v34m\.retry: retry must be an object/.test(v34Err) && !/bridge:/.test(v34Err),
+        "v34a4) the refusal names the value, with no repair anywhere in the picture (" + JSON.stringify(v34Err.split("\n").filter((l) => /v34m|bridge:/.test(l))) + ")"
       );
     } finally {
       child.kill();
@@ -1540,12 +1538,26 @@ async function main() {
       // the converter's own warning, which is asserted below rather than noted.
       assert(
         bodyWin.temperature === 0.9 && bodyWin.model === "deepseek-v4-flash" &&
-        presetWin.temperature === 0.5 && presetWin.model === "deepseek-v4-flash",
-        "z10) precedence body>model after the bridge (a preset-level params layer no longer exists in v3); params-layer model ignored (" + JSON.stringify({ bodyWin, presetWin }) + ")"
+        presetWin.temperature === 0.2 && presetWin.model === "deepseek-v4-flash",
+        "z10) a pre-v3 config keeps the documented merge order: request > preset > model (got " + JSON.stringify({ bodyWin: bodyWin.temperature, presetWin: presetWin.temperature }) + ")"
       );
       assert(
-        z10Warnings.some((w) => w.includes("p10") && /params dropped/.test(w)),
-        "z10b) the dropped preset params are REPORTED, naming the preset, not silently lost (" + JSON.stringify(z10Warnings.join("").split("\n").filter((l) => /warning/.test(l))) + ")"
+        !z10Warnings.some((w) => /params dropped/.test(w)),
+        "z10b) the preset layer is APPLIED, not dropped, so nothing reports a loss (" + JSON.stringify(z10Warnings.join("").slice(0, 200)) + ")"
+      );
+      // The layer belongs to the pre-v3 contract only: a v3 model has no preset-level
+      // params, so the same preset must leave the model layer winning there.
+      const z10v3 = buildPayload(
+        {},
+        { params: {} },
+        { params: { temperature: 0.2 } },
+        { deployments: [{ backend: "b", upstream: "u" }], params: { temperature: 0.5 } },
+        { params: {}, upstream: "u" },
+        { params: {} }
+      );
+      assert(
+        z10v3.temperature === 0.5,
+        "z10c) a v3 model has no preset-level params layer, so the model layer still wins (got " + JSON.stringify(z10v3.temperature) + ")"
       );
     } finally {
       childZ10.kill();
@@ -6271,108 +6283,115 @@ async function main() {
       assert(!bodies.includes("secret-value-a") && !bodies.includes("secret-value-b"), "zCE11a) no apiKeyEnv value leaks into any config response");
       assert(bodies.includes("KEY_CE_A"), "zCE11b) the env var NAME is still served (the UI needs it)");
 
-      // v39a)-v39f) bridge the WRITE half: saving and restoring go through the
-      // same conversion the loader already runs, so an old-shape payload can
-      // never land on disk as `providers` again. The two ways an old-shape
-      // write arrives are covered separately - a browser save (v39a/v39b) and a
-      // snapshot restore (v39e/v39f) - because they are independent entry
-      // points onto the same helper.
+      // v39a)-v39j) the WRITE half keeps the shape it was given. A save is not a
+      // migration: the file comes back exactly as the operator wrote it, because a silent
+      // rewrite is a change nobody asked for. The two ways an old-shape write can arrive
+      // are covered separately - a browser save (v39a/v39b) and a snapshot restore
+      // (v39g/v39h) - because they are independent entry points onto the same helper.
       const draft39 = JSON.parse(await rawOnDisk());
       draft39.models["bridge-probe"] = { providers: [{ backend: "ce-a", upstream: "u-probe" }] };
       const r39 = await post("/api/config", { config: draft39, force: true });
       const b39 = await r39.json();
-      assert(r39.status === 200, "v39a) old-shape save is accepted through the bridge (got " + r39.status + ", " + JSON.stringify(b39.errors || b39.error) + ")");
+      assert(r39.status === 200, "v39a) old-shape save is accepted without a bridge (got " + r39.status + ", " + JSON.stringify(b39.errors || b39) + ")");
       const disk39 = JSON.parse(await rawOnDisk());
       assert(
-        !!disk39.models["bridge-probe"].deployments &&
-          disk39.models["bridge-probe"].providers === undefined &&
-          Object.values(disk39.models).every((m) => m.providers === undefined),
-        "v39b) a save writes v3, never a persisted `providers` block (" + JSON.stringify(disk39.models["bridge-probe"]) + ")"
+        Array.isArray(disk39.models["bridge-probe"].providers) && disk39.models["bridge-probe"].deployments === undefined,
+        "v39b) a save writes the shape it was SENT: the legacy entry stays legacy, nothing is migrated (" + JSON.stringify(disk39.models["bridge-probe"]) + ")"
       );
 
-      // The bridge's own warnings reach the CALLER, not just the console: the
-      // Config tab can only tell the operator what it rewrote if the save
-      // response carries it. A repair nobody is told about is a silent edit of
-      // the operator's file. The payload is the block's ORIGINAL old-shape
-      // config - a clone of disk is already v3, so the bridge would not run and
-      // this would prove nothing - carrying a real error-class empty string in
-      // an object-typed position (`models[*].retry`), the exact editor artifact
-      // the production config shipped with: left alone it would 400 the save,
-      // and repaired silently it would rewrite the operator's file.
+      // An empty string that is NEW is still refused: adding the field, or editing it, is a
+      // change, and a change has to be valid. The refusal names the path and the file is
+      // left exactly as it was.
       const draft39c = JSON.parse(JSON.stringify(cfgCE));
       draft39c.models["bridge-probe"] = { providers: [{ backend: "ce-a", upstream: "u-probe" }], retry: "" };
       const expectBridge39c = convertLegacyConfig(draft39c).warnings;
       assert(expectBridge39c.length > 0, "v39c0) the repair fixture really makes the converter warn (" + JSON.stringify(expectBridge39c) + ")");
+      const before39c = await rawOnDisk();
       const r39c = await post("/api/config", { config: draft39c, force: true });
       const b39c = await r39c.json();
-      assert(r39c.status === 200, "v39c1) the repaired save itself succeeds (got " + r39c.status + ", " + JSON.stringify(b39c.errors || b39c.error) + ")");
-      const gotBridge39c = (b39c.warnings || []).filter((w) => w.path === "(bridge)");
       assert(
-        gotBridge39c.length === expectBridge39c.length && gotBridge39c.some((w) => String(w.message).includes("was an empty string")),
-        "v39c2) the save response reports EVERY bridge warning, the repair included (got " + JSON.stringify(gotBridge39c.map((w) => w.message)) + ", expected " + expectBridge39c.length + ")"
+        r39c.status === 400 && (b39c.errors || []).some((e) => e.path === "models.bridge-probe.retry"),
+        "v39c1) a NEWLY introduced empty-string retry is refused, naming its path (got " + r39c.status + ", " + JSON.stringify(b39c.errors || b39c) + ")"
       );
-      const disk39c = JSON.parse(await rawOnDisk());
-      assert(disk39c.models["bridge-probe"].retry === undefined, "v39c3) the repaired value is not on disk (" + JSON.stringify(disk39c.models["bridge-probe"]) + ")");
-      assert(disk39c.models["bridge-probe"].deployments !== undefined, "v39c4) the repair and the conversion land together, not one without the other");
+      assert(
+        !(b39c.warnings || []).some((w) => w.path === "(bridge)"),
+        "v39c2) no bridge warning is reported, because no bridge runs any more (" + JSON.stringify((b39c.warnings || []).map((w) => w.path)) + ")"
+      );
+      assert((await rawOnDisk()) === before39c, "v39c3) the refused save left the live file byte-identical");
+      assert(JSON.parse(await rawOnDisk()).models["bridge-probe"].retry === undefined, "v39c4) the refused value never reached the file");
 
-      // The one refusal the converter STILL has: a converted config whose id is
-      // both a model and a preset cannot be resolved by rule. The fixture is
-      // built from the block's ORIGINAL old-shape config - not from disk, which
-      // is v3 by now - and is deliberately free of every OTHER validator error,
-      // so the 400 below can only come from the bridge: at base an old-shape
-      // preset/model id collision passes as a warning and the snapshot is
-      // written straight through, which is the silent bypass this pair exists
-      // to catch.
+      // The save-boundary half of the exemption, exercised at the level the rule lives at:
+      // the candidate is compared against the document already in force, so no live file
+      // has to be seeded (a direct write to the config the router is watching collides with
+      // its own atomic write on Windows - that is what this replaced).
+      const seededLegacy = {
+        backends: [{ id: "ce-z", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_CE_Z" }],
+        models: { "bridge-probe": { providers: [{ backend: "ce-z", upstream: "u-probe" }], retry: "" } },
+        presets: {},
+      };
+      const vSame = validateConfig(JSON.parse(JSON.stringify(seededLegacy)), seededLegacy, { mode: "save" });
+      assert(
+        !vSame.errors.some((e) => e.path === "models.bridge-probe.retry") &&
+          vSame.warnings.some((w) => String(w.message).includes("unchanged from the config already in force")),
+        "v39c5) an UNCHANGED legacy empty string is not an error, and is reported as a warning (" + JSON.stringify({ errors: vSame.errors.map((e) => e.path), warnings: vSame.warnings.map((w) => w.path) }) + ")"
+      );
+      const noRetry = JSON.parse(JSON.stringify(seededLegacy));
+      delete noRetry.models["bridge-probe"].retry;
+      const vNew = validateConfig(JSON.parse(JSON.stringify(seededLegacy)), noRetry, { mode: "save" });
+      assert(
+        vNew.errors.some((e) => e.path === "models.bridge-probe.retry") &&
+          !vNew.warnings.some((w) => String(w.message).includes("unchanged from the config already in force")),
+        "v39c6) and the SAME value is an error when the document in force does not already have it (" + JSON.stringify(vNew.errors.map((e) => e.path)) + ")"
+      );
+      const docSelf = JSON.parse(JSON.stringify(seededLegacy));
+      const vSelf = validateConfig(docSelf, docSelf, { mode: "load" });
+      assert(
+        vSelf.errors.some((e) => e.path === "models.bridge-probe.retry"),
+        "v39c7) the config check - ONE document passed as both sides - still reports the value, so the exemption cannot make it blind (" + JSON.stringify(vSelf.errors.map((e) => e.path)) + ")"
+      );
+
+      // The refusal the VALIDATOR still has: an id that is both a model and a preset cannot
+      // be resolved by rule. This fixture is v3-shaped, so the validator is what refuses it -
+      // the same collision inside an OLD-shape snapshot stays a warning, which is the
+      // shape-preservation contract asserted further down.
       const before39 = await rawOnDisk();
       const collisionSnap = JSON.parse(JSON.stringify(cfgCE));
       collisionSnap.presets["ce-model"] = { strategy: "failover", models: ["ce-model", "ce-preset"] };
+      collisionSnap.models["ce-model"] = { deployments: [{ backend: "ce-a", upstream: "u-probe" }] };
       collisionSnap.x13Marker = "refused-snapshot-marker";
       await writeFile(join(dirCE, "config.history", "t13-collision.json"), JSON.stringify(collisionSnap, null, 2) + "\n");
-      // Anti-vacuity: if the fixture is not old-shape (a clone of disk would
-      // not be) the bridge never runs and the 400 below would prove nothing.
-      assert(
-        Object.values(collisionSnap.models).some((m) => Array.isArray(m.providers)),
-        "v39d0) the refusal fixture really is an old-shape document, so the bridge is what judges it"
-      );
       const r39d = await post("/api/config/reset", { snapshot: "t13-collision.json", force: true });
       const b39d = await r39d.json();
       assert(
         r39d.status === 400 && (b39d.errors || []).some((e) => String(e.message).includes("both a model and a preset")),
-        "v39d) a snapshot the conversion refuses is refused (400, got " + r39d.status + ", " + JSON.stringify(b39d.errors || b39d.error) + ")"
+        "v39d) a v3 snapshot whose id is both a model and a preset is refused (400, got " + r39d.status + ", " + JSON.stringify(b39d.errors || b39d) + ")"
       );
       const after39 = await rawOnDisk();
       assert(after39 === before39, "v39e) the refused restore left the live file byte-identical");
       assert(after39.indexOf("refused-snapshot-marker") === -1, "v39f) no part of the refused snapshot reached the file");
 
-      // ...and the POSITIVE half, which is the actual gap: at base the restore
-      // wrote the snapshot's `providers` verbatim and the preset kept the
-      // v2-era `affinity` name, so a restored config was silently a shape the
-      // v3 branch would then reject. Cloned from the block's ORIGINAL old-shape
-      // fixture rather than from disk, because by now disk is already v3 and a
-      // clone of it could not fail these assertions.
+      // The positive half: a pre-v3 snapshot restores as the document it IS. The v3 branch
+      // would refuse a bare `providers` block, so the shape has to survive the restore
+      // intact rather than being rewritten into the shape the branch prefers.
       const plainOld = JSON.parse(JSON.stringify(cfgCE));
       plainOld.models["ce-extra"] = { providers: [{ backend: "ce-b", upstream: "u-extra" }] };
-      // `ce-preset` is an identity preset named exactly like a model, so the
-      // conversion drops it. That makes the warning count a property of the
-      // FIXTURE rather than of whatever the converter happens to say today,
-      // while the assertion still counts against an INDEPENDENT conversion
-      // instead of a hardcoded number that would drift.
       plainOld.presets["ce-model"] = { strategy: "failover", models: ["ce-model"] };
       await writeFile(join(dirCE, "config.history", "t13-plain-old.json"), JSON.stringify(plainOld, null, 2) + "\n");
-      const expectBridge39g = convertLegacyConfig(plainOld).warnings;
-      assert(expectBridge39g.length > 0, "v39j0) the restore fixture really makes the bridge warn (" + JSON.stringify(expectBridge39g) + ")");
       const r39g = await post("/api/config/reset", { snapshot: "t13-plain-old.json", force: true });
       const b39g = await r39g.json();
-      assert(r39g.status === 200, "v39g) a valid old-shape snapshot is restored through the bridge (got " + r39g.status + ", " + JSON.stringify(b39g.errors || b39g.error) + ")");
+      assert(r39g.status === 200, "v39g) a valid old-shape snapshot is restored as it stands (got " + r39g.status + ", " + JSON.stringify(b39g.errors || b39g) + ")");
       const restored39 = await readCfg();
       assert(
-        !!restored39.models["ce-extra"].deployments && restored39.models["ce-extra"].providers === undefined,
-        "v39h) the restored file is v3, not the snapshot's own shape (" + JSON.stringify(restored39.models["ce-extra"]) + ")"
+        Array.isArray(restored39.models["ce-extra"].providers) && restored39.models["ce-extra"].deployments === undefined,
+        "v39h) the restored file keeps the SNAPSHOT shape (" + JSON.stringify(restored39.models["ce-extra"]) + ")"
       );
-      assert(restored39.presets["ce-preset"].strategy === "fallback", "v39i) the restored preset carries the v3 strategy name (" + JSON.stringify(restored39.presets["ce-preset"]) + ")");
       assert(
-        (b39g.warnings || []).filter((w) => w.path === "(bridge)").length === expectBridge39g.length,
-        "v39j) every bridge warning the restore's conversion emits is reported to the caller (got " + JSON.stringify((b39g.warnings || []).map((w) => w.path + ":" + w.message)) + ", expected " + expectBridge39g.length + ")"
+        restored39.presets["ce-model"].strategy === "failover",
+        "v39i) the restored preset keeps its own strategy name, not the v3 spelling (" + JSON.stringify(restored39.presets["ce-model"]) + ")"
+      );
+      assert(
+        !(b39g.warnings || []).some((w) => w.path === "(bridge)"),
+        "v39j) a restore reports no bridge warning, because no bridge runs any more (" + JSON.stringify((b39g.warnings || []).map((w) => w.path)) + ")"
       );
     } finally {
       childCE.kill();
@@ -6718,30 +6737,30 @@ async function main() {
     });
     try {
       const live = await (await fetch(base + "/api/config")).json();
-      const deps = live.models && live.models.v37m ? live.models.v37m.deployments : null;
+      const served = live.models && live.models.v37m ? live.models.v37m : null;
+      const provs = served && Array.isArray(served.providers) ? served.providers : null;
       assert(
-        Array.isArray(deps) && deps.length === 3 && deps.map((d) => d.backend).join(",") === "v37a,v37b,v37c" &&
-          deps[0].upstream === "u1" && deps[1].upstream === "u2" && deps[2].upstream === "u3",
-        "v37a) the ROUTER holds the converted v3 form: /api/config serves models.v37m as 3 deployments in declared order (" + JSON.stringify(live.models && live.models.v37m) + ")"
+        Array.isArray(provs) && provs.length === 3 && provs.map((p) => p.backend).join(",") === "v37a,v37b,v37c" &&
+          provs[0].upstream === "u1" && provs[1].upstream === "u2" && provs[2].upstream === "u3",
+        "v37a) the ROUTER holds the shape the FILE has: /api/config serves models.v37m as 3 providers in declared order (" + JSON.stringify(served) + ")"
       );
       assert(
-        live.models.v37m.providers === undefined && live.models.v37m.affinityPool === undefined,
-        "v37b) the legacy keys are gone from the served model, not merged alongside the deployments"
+        !!served && served.deployments === undefined && served.affinityPool === 2,
+        "v37b) no v3 shape is synthesized behind the operator back: the legacy keys are served exactly as written (" + JSON.stringify(served) + ")"
       );
       assert(
-        deps && deps[2].backupOnly === true && deps[0].backupOnly === undefined && deps[1].backupOnly === undefined,
-        "v37c) affinityPool 2 marks only the providers past the pool as backupOnly (" + JSON.stringify(deps && deps.map((d) => d.backupOnly)) + ")"
+        !!provs && provs.every((p) => p.backupOnly === undefined),
+        "v37c) affinityPool stays a runtime concern: no backupOnly flag is materialized onto the providers (" + JSON.stringify(provs && provs.map((p) => p.backupOnly)) + ")"
       );
       assert(
-        deps && deps[1].weight === 3 && deps[0].weight === undefined &&
-          JSON.stringify(deps[0].params) === "{\"temperature\":0.5}" &&
-          JSON.stringify(deps[0].dropParams) === "[\"logit_bias\"]" &&
-          JSON.stringify(deps[0].paramMap) === "{\"max_tokens\":\"max_output_tokens\"}",
-        "v37d) per-provider weight/params/dropParams/paramMap carry onto the deployments (" + JSON.stringify(deps && deps[0]) + ")"
+        !!provs && provs[1].weight === 3 && JSON.stringify(provs[0].params) === JSON.stringify({ temperature: 0.5 }) &&
+          JSON.stringify(provs[0].dropParams) === JSON.stringify(["logit_bias"]) &&
+          JSON.stringify(provs[0].paramMap) === JSON.stringify({ max_tokens: "max_output_tokens" }),
+        "v37d) per-provider weight/params/dropParams/paramMap stay on the provider as written (" + JSON.stringify(provs && provs[0]) + ")"
       );
       assert(
-        live.presets.v37p.strategy === "fallback",
-        "v37e) the served preset strategy is the v3 'fallback' AFTER normalizeConfig, not rewritten to a legacy value (" + JSON.stringify(live.presets.v37p) + ")"
+        live.presets.v37p.strategy === "affinity",
+        "v37e) the served preset keeps the name the FILE uses, not the v3 fallback spelling it was rewritten to (" + JSON.stringify(live.presets.v37p) + ")"
       );
       assert(
         live.presets.v37p.models.length === 1 && live.presets.v37p.models[0].model === "v37m",
@@ -6754,18 +6773,18 @@ async function main() {
   }
 
   {
-    // v37g) R8(b): `providers: []` becomes `deployments: []`, which the v3
-    // validator refuses in SAVE mode (the pre-v3 path only WARNED). The bridge
-    // therefore moves this case across the reload-rejection boundary, and the
-    // boot path must stay NON-FATAL for it (path models.<id>.deployments is not
-    // in the loader's fatal set), so the router still starts.
+    // v37g) R8(b): the converter maps `providers: []` to `deployments: []`, which the v3
+    // validator refuses in SAVE mode (the pre-v3 path only WARNED). That is a pure-converter
+    // fact, asserted directly below. What matters for the ROUTER is that this file - which it
+    // runs as an ordinary pre-v3 document - still BOOTS: the legacy branch names the same
+    // defect as a warning, so the loader is never asked to interpret a shape it cannot.
     const dir = await mkdtemp(join(tmpdir(), "lmr-v37e-"));
     const cfgPath = join(dir, "config.json");
     const envPath = join(dir, ".env");
     const empty = {
       port: 0, prefix: "/v1", masterKeyEnv: null,
       backends: [{ id: "v37e", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_V37E" }],
-      models: { v37em: { providers: [] } },
+      models: { v37em: { providers: [], retry: "" } },
       presets: { v37ep: { strategy: "failover", models: ["v37em"] } }
     };
     await writeFile(cfgPath, JSON.stringify(empty, null, 2));
@@ -6795,11 +6814,23 @@ async function main() {
         });
       });
       assert(
-        /not fatal at boot\): models\.v37em\.deployments: /.test(childErr),
-        "v37g2) BOOT stays non-fatal for the empty-deployments error and names its path (stderr tail: " + JSON.stringify(childErr.slice(-300)) + ")"
+        /config warning: models\.v37em\.providers: no providers/.test(childErr),
+        "v37g2) BOOT stays non-fatal for an empty providers array and names the legacy path (stderr tail: " + JSON.stringify(childErr.slice(-200)) + ")"
       );
       const live = await (await fetch(base + "/api/config")).json();
       assert(!!live.backends.find((b) => b.id === "v37e"), "v37g3) the router really is up and serving the config after that non-fatal error");
+      // v37g4) the reload half of the exemption, and the case the live config actually is:
+      // the file already carries the legacy empty string, an operator changes something
+      // ELSE, and the unchanged value must not block the reload.
+      const reloaded = JSON.parse(JSON.stringify(empty));
+      reloaded.backends.push({ id: "v37e2", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_V37E" });
+      await writeFile(cfgPath, JSON.stringify(reloaded, null, 2));
+      await new Promise((r) => setTimeout(r, 900));
+      const live3 = await (await fetch(base + "/api/config")).json();
+      assert(
+        !!live3.backends.find((b) => b.id === "v37e2") && !/config reload rejected: models\.v37em\.retry/.test(childErr),
+        "v37g4) a reload that leaves the legacy empty string UNCHANGED is adopted, not rejected (added backend served=" + JSON.stringify(!!live3.backends.find((b) => b.id === "v37e2")) + ", log=" + JSON.stringify(childErr.split("\n").filter((l) => /v37em/.test(l)).slice(-2)) + ")"
+      );
     } finally {
       child.kill();
       await rm(dir, { recursive: true, force: true });
@@ -8589,6 +8620,11 @@ async function main() {
       // not a hand-written approximation of it. The SUBJECT comes from that
       // served form, because that is the shape the editor now produces.
       const u9MirrorServed = convertLegacyConfig(mirror).config;
+      // The BEFORE side is the router's OWN view of the mirror - its normalization, which
+      // keeps a pre-v3 file's shape - never a converted form: the router converts nothing,
+      // so `servedIds` and /v1/models have to agree on the document it actually serves.
+      const u9MirrorRouter = JSON.parse(JSON.stringify(mirror));
+      normalizeConfig(u9MirrorRouter);
       const u9Subject = Object.keys((u9MirrorServed && u9MirrorServed.models) || {}).reduce((best, id) => {
         const n = (u9MirrorServed.models[id] && Array.isArray(u9MirrorServed.models[id].deployments) ? u9MirrorServed.models[id].deployments : []).length;
         return n > (best.n || 0) ? { id, n } : best;
@@ -8732,7 +8768,7 @@ async function main() {
         // is exercised on data whose shape is known rather than hoped for.
         // The before/after surface lists are taken from the LIVE mirror here,
         // ahead of the fixture rebuilding a draft of its own.
-        const u9BeforeList = u9Api.servedIds(u9MirrorServed);
+        const u9BeforeList = u9Api.servedIds(u9MirrorRouter);
         const u9FxModel = "u9-fx-dialect-model";
         const u9FxBackend = "u9-fx-backend";
         const u9FxKeyEnv = "U9_FX_KEY";
@@ -8881,7 +8917,7 @@ async function main() {
         let u9ServedAfter = null;
         let u9ServeError = null;
         try {
-          const u9BeforeChild = await startRouterCfg(Object.assign({}, u9MirrorServed, { port: 0 }), "");
+          const u9BeforeChild = await startRouterCfg(Object.assign({}, u9MirrorRouter, { port: 0 }), "");
           try { u9ServedBefore = (await (await fetch(u9BeforeChild.base + "/v1/models")).json()).data.map((x) => x.id); } finally { u9BeforeChild.child.kill(); await rm(u9BeforeChild.dir, { recursive: true, force: true }); }
           const u9AfterChild = await startRouterCfg(Object.assign({}, rCfg.draft, { port: 0 }), "");
           try { u9ServedAfter = (await (await fetch(u9AfterChild.base + "/v1/models")).json()).data.map((x) => x.id); } finally { u9AfterChild.child.kill(); await rm(u9AfterChild.dir, { recursive: true, force: true }); }
@@ -9102,11 +9138,13 @@ async function main() {
           },
           presets: { p1: { strategy: "failover", models: ["p1"] }, p2: { strategy: "failover", models: ["m2"] } },
         };
-        // The router serves the EFFECTIVE config, and `mkPicker` injects exactly
-        // what /api/config returns. Feeding the UI harness the raw old-shape file
-        // would compare the UI's rule for a config the router no longer runs, so
-        // the injected body is the project's own converted form.
-        const xServed = convertLegacyConfig(xCfg).config;
+        // `mkPicker` injects exactly what /api/config returns: the router's OWN
+        // normalization of the file it runs, which for a pre-v3 file keeps the file's
+        // shape. A converted form would compare the UI against a config the router
+        // never serves - and would drop the identity preset `p1` outright, because the
+        // identity drop belongs to the conversion, not to normalization.
+        const xServed = JSON.parse(JSON.stringify(xCfg));
+        normalizeConfig(xServed);
         const X = await mkPicker(xServed, { model: "p1", msgs: [] });
         let servedByServer = null;
         let servedError = null;
