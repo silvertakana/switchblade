@@ -181,7 +181,7 @@ function referencedEnvNames() {
   if (!cfg) return out;
   if (cfg.masterKeyEnv) out.add(cfg.masterKeyEnv);
   if (cfg.uiPasswordEnv) out.add(cfg.uiPasswordEnv);
-  for (const b of cfg.backends || []) if (b.apiKeyEnv) out.add(b.apiKeyEnv);
+  for (const b of cfg.backends || []) if (b && typeof b === "object" && b.apiKeyEnv) out.add(b.apiKeyEnv);
   return out;
 }
 
@@ -300,13 +300,42 @@ function envNames() {
   return Object.keys(process.env).sort();
 }
 
+// v3 backend keys. `model` is the bridge-era default-upstream source and
+// `idleTimeoutMs`/`connectTimeoutMs` are live fields, so all three are known
+// here: a converted live config must not be told its real backend fields are
+// unrecognized.
+const KNOWN_BACKEND_KEYS = new Set([
+  "id", "baseURL", "apiKeyEnv", "params", "dropParams",
+  "connectTimeoutMs", "idleTimeoutMs", "translateDeveloperRole", "timeoutMs", "model",
+]);
+
+// v3 model keys. The dialect/typed fields live per deployment in v3, but a model
+// still carries `params`/`retry`/`meta` and the optional `exposed` flag, and the
+// allowlist keeps the SAME tolerance the backend layer already has: an unknown
+// key warns and never refuses the save. Deliberately absent is `providers`: a
+// converted model has none, and a hand-written v3 model that keeps one is
+// carrying data the v3 read ignores, which the operator needs told.
+const KNOWN_MODEL_KEYS = new Set([
+  "deployments", "exposed", "params", "retry", "meta", "affinityPool",
+  "dropParams", "paramMap", "translateDeveloperRole", "timeoutMs",
+]);
+
+// v3 deployment keys: what a provider could carry, in its new position.
+const KNOWN_DEPLOYMENT_KEYS = new Set([
+  "backend", "upstream", "weight", "backupOnly", "params", "dropParams", "paramMap",
+]);
+
 // Validate a candidate config. Returns { errors, warnings }; a non-empty
 // errors array means the save is refused and the file is left untouched.
-function validateConfig(candidate, current) {
+function validateConfig(candidate, current, opts) {
   const errors = [];
   const warnings = [];
   const err = (path, message) => errors.push({ path, message });
   const warn = (path, message) => warnings.push({ path, message });
+  // 'save' is the default so every existing two-argument caller keeps the
+  // save-time strictness; the load path opts in explicitly to tolerant
+  // handling of a config that is already on disk.
+  const mode = (opts && opts.mode) || "save";
 
   if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
     err("", "config must be a JSON object");
@@ -321,6 +350,18 @@ function validateConfig(candidate, current) {
     if (!(key in candidate)) err(key, `'${key}' is required at the top level`);
   }
   if (errors.length) return { errors, warnings };
+
+  // Shape detection: a config is validated under v3 rules as soon as ANY model
+  // carries `deployments` - a key no pre-v3 config has. Detection is
+  // deliberately CONFIG-WIDE rather than per model. A hand-written mixture is a
+  // config that started migrating, and a v3 router cannot route the entries
+  // that have not: validating each entry under its own shape would accept a
+  // file that only half works. Configs with no `deployments` anywhere never
+  // enter the v3 branch and keep their behavior exactly.
+  const shapeModels = candidate.models;
+  const isV3 =
+    Boolean(shapeModels) && typeof shapeModels === "object" && !Array.isArray(shapeModels) &&
+    Object.values(shapeModels).some((m) => m && typeof m === "object" && m.deployments !== undefined);
 
   // ---- backends ----
   const backends = candidate.backends;
@@ -344,6 +385,17 @@ function validateConfig(candidate, current) {
         );
       }
     });
+    if (isV3) {
+      // v3 backends are allowlisted: an unknown key warns and is never an
+      // error, so a config carrying a field this version does not know still
+      // loads.
+      backends.forEach((b, i) => {
+        if (!b || typeof b !== "object") return;
+        for (const k of Object.keys(b)) {
+          if (!KNOWN_BACKEND_KEYS.has(k)) warn(`backends[${i}]`, `unrecognized backend key '${k}'; the router ignores it`);
+        }
+      });
+    }
   }
 
   // ---- models ----
@@ -360,24 +412,95 @@ function validateConfig(candidate, current) {
         continue;
       }
       const providers = Array.isArray(m.providers) ? m.providers : null;
-      if (!providers) {
-        err(at + ".providers", "must be an array of {backend, upstream}");
-        continue;
+      if (isV3) {
+        // v3 models carry `deployments` instead of `providers`. An entry
+        // without them is a pre-migration model inside an otherwise v3 config,
+        // so the error names that model rather than being skipped.
+        const deps = Array.isArray(m.deployments) ? m.deployments : null;
+        if (!deps || !deps.length) {
+          err(at + ".deployments", "must be a non-empty array of {backend, upstream}");
+        } else {
+          deps.forEach((d, i) => {
+            const dat = `${at}.deployments[${i}]`;
+            if (!d || typeof d !== "object") return err(dat, "must be an object");
+            if (!d.backend) return err(dat + ".backend", "backend is required");
+            if (!backendIds.has(d.backend)) return err(dat + ".backend", `unknown deployment backend '${d.backend}'`);
+            // A v3 deployment always names its upstream: the backend's
+            // bridge-era `model` is not a v3 default-upstream source.
+            if (!d.upstream) err(dat + ".upstream", "upstream is required");
+            if (d.weight !== undefined && (!Number.isInteger(d.weight) || d.weight < 1)) err(dat + ".weight", "weight must be an integer >= 1");
+            if (d.backupOnly !== undefined && typeof d.backupOnly !== "boolean") err(dat + ".backupOnly", "backupOnly must be a boolean");
+            // A deployment holds what a provider used to hold, so the typed
+            // params checks follow the field into its new position.
+            if (d.params !== undefined && (!d.params || typeof d.params !== "object" || Array.isArray(d.params))) err(dat + ".params", "params must be an object");
+            if (d.paramMap !== undefined && (!d.paramMap || typeof d.paramMap !== "object" || Array.isArray(d.paramMap))) err(dat + ".paramMap", "paramMap must be an object");
+            for (const k of Object.keys(d)) {
+              if (!KNOWN_DEPLOYMENT_KEYS.has(k)) warn(dat, `unrecognized deployment key '${k}'; the router ignores it`);
+            }
+          });
+        }
+        if (m.exposed !== undefined && typeof m.exposed !== "boolean") err(at + ".exposed", "exposed must be a boolean");
+        // Allowlist, exactly as the backend layer does it: `backuponly: true`
+        // (a misspelling of `backupOnly`) would otherwise leave the deployment a
+        // PRIMARY and put live traffic on an account the operator marked as
+        // break-glass. A warning, never an error - an unknown key must not be
+        // able to refuse a save.
+        for (const k of Object.keys(m)) {
+          if (!KNOWN_MODEL_KEYS.has(k)) warn(at, `unrecognized model key '${k}'; the router ignores it`);
+        }
+      } else {
+        if (!providers) {
+          err(at + ".providers", "must be an array of {backend, upstream}");
+          continue;
+        }
+        if (!providers.length) warn(at + ".providers", "no providers: this model routes nowhere and will 404");
+        providers.forEach((pr, i) => {
+          const pat = `${at}.providers[${i}]`;
+          if (!pr || typeof pr !== "object") return err(pat, "must be an object");
+          if (!pr.backend) return err(pat + ".backend", "backend is required");
+          if (!backendIds.has(pr.backend)) {
+            return err(pat + ".backend", `unknown backend '${pr.backend}'`);
+          }
+          const b = backendById.get(pr.backend);
+          if (!pr.upstream && !(b && b.model)) {
+            err(pat + ".upstream", `no upstream given and backend '${pr.backend}' has no default model`);
+          }
+        });
       }
-      if (!providers.length) warn(at + ".providers", "no providers: this model routes nowhere and will 404");
-      providers.forEach((pr, i) => {
-        const pat = `${at}.providers[${i}]`;
-        if (!pr || typeof pr !== "object") return err(pat, "must be an object");
-        if (!pr.backend) return err(pat + ".backend", "backend is required");
-        if (!backendIds.has(pr.backend)) {
-          return err(pat + ".backend", `unknown backend '${pr.backend}'`);
+      if (m.affinityPool !== undefined && (!Number.isInteger(m.affinityPool) || m.affinityPool < 1)) {
+        err(at + ".affinityPool", "affinityPool must be an integer >= 1");
+      }
+      if (m.retry !== undefined) {
+        if (!m.retry || typeof m.retry !== "object" || Array.isArray(m.retry)) {
+          err(at + ".retry", "retry must be an object {maxRetries, baseMs, maxMs, multiplier, totalMs}");
+        } else {
+          if (!Number.isInteger(m.retry.maxRetries) || m.retry.maxRetries < 0) err(at + ".retry.maxRetries", "retry.maxRetries must be a non-negative integer");
+          for (const k of ["baseMs", "maxMs", "multiplier", "totalMs"]) {
+            if (m.retry[k] !== undefined && (typeof m.retry[k] !== "number" || !(m.retry[k] >= 0))) err(at + ".retry." + k, "retry." + k + " must be a number");
+          }
         }
-        const b = backendById.get(pr.backend);
-        if (!pr.upstream && !(b && b.model)) {
-          err(pat + ".upstream", `no upstream given and backend '${pr.backend}' has no default model`);
+      }
+      if (m.params !== undefined && (!m.params || typeof m.params !== "object" || Array.isArray(m.params))) {
+        err(at + ".params", "params must be an object");
+      }
+      if (providers) {
+        providers.forEach((pr, i) => {
+          const pat = at + ".providers[" + i + "]";
+          if (pr && pr.params !== undefined && (!pr.params || typeof pr.params !== "object" || Array.isArray(pr.params))) err(pat + ".params", "params must be an object");
+          if (pr && pr.paramMap !== undefined && (!pr.paramMap || typeof pr.paramMap !== "object" || Array.isArray(pr.paramMap))) err(pat + ".paramMap", "paramMap must be an object");
+        });
+      }
+      if (m.meta !== undefined && m.meta.pricing !== undefined) {
+        const prc = m.meta.pricing;
+        if (!prc || typeof prc !== "object" || Array.isArray(prc)) {
+          err(at + ".meta.pricing", "meta.pricing must be an object");
+        } else {
+          for (const k of ["inputPerM", "outputPerM", "cacheHitInputPerM"]) {
+            if (prc[k] !== undefined && typeof prc[k] !== "number") err(at + ".meta.pricing." + k, "meta.pricing." + k + " must be a number");
+          }
         }
-      });
-      if (typeof m.affinityPool === "number" && m.affinityPool > providers.length) {
+      }
+      if (providers && typeof m.affinityPool === "number" && m.affinityPool > providers.length) {
         warn(at + ".affinityPool", `affinityPool ${m.affinityPool} exceeds ${providers.length} provider(s); it clamps at request time`);
       }
     }
@@ -396,10 +519,25 @@ function validateConfig(candidate, current) {
         err(at, "must be an object");
         continue;
       }
-      if (p.strategy && !["affinity", "failover", "weighted"].includes(p.strategy)) {
+      if (isV3) {
+        // v3 narrows the valid strategies to 'fallback' alone: the bridge maps
+        // every legacy value at conversion time, so anything else was authored
+        // against the wrong schema. There is deliberately NO legacy allowlist in
+        // this branch - pre-v3 configs never reach it, and the v2 path below
+        // keeps its own values (including v2's "unknown 'fallback'") untouched.
+        if (p.strategy !== "fallback") warn(at + ".strategy", `v3 preset strategy must be 'fallback'; ${JSON.stringify(p.strategy)} is not a v3 value (the bridge maps the legacy strategies at conversion time)`);
+      } else if (p.strategy && !["affinity", "failover", "weighted"].includes(p.strategy)) {
         warn(at + ".strategy", `unknown strategy '${p.strategy}'; the router falls back to affinity`);
       }
-      if (modelIds.has(id)) warn(at, `id '${id}' is both a model and a preset; the preset wins in /v1/models`);
+      if (modelIds.has(id)) {
+        // One collision rule, verdict by shape: pre-v3 keeps the warn (the real
+        // configs carry 19+ of them, and aborting boot mid-migration is not an
+        // option), while v3 refuses it - a converted config has already resolved
+        // every identity collision.
+        if (isV3) err(at, `id '${id}' is both a model and a preset; v3 ids are one or the other`);
+        else warn(at, `id '${id}' is both a model and a preset; the preset wins in /v1/models`);
+      }
+      if (isV3 && p.exposed !== undefined && typeof p.exposed !== "boolean") err(at + ".exposed", "exposed must be a boolean");
       const list = Array.isArray(p.models) ? p.models : null;
       if (!list) {
         err(at + ".models", "must be an array of model or preset ids");
@@ -412,7 +550,11 @@ function validateConfig(candidate, current) {
         if (typeof entry !== "string" && (!entry || typeof entry !== "object")) return err(sat, "must be a string or {model, weight}");
         if (!ref) return err(sat, "model id is required");
         if (!modelIds.has(ref) && !presetIds.has(ref)) {
-          err(sat, `unknown model or preset '${ref}'`);
+          if (mode === "load") {
+            warn(sat, `unknown model or preset '${ref}'; ref dropped at load`);
+          } else {
+            err(sat, `unknown model or preset '${ref}'`);
+          }
         }
         if (!modelIds.has(ref) && presetIds.has(ref) && ref === id) {
           err(sat, `preset '${id}' references itself`);
@@ -485,10 +627,97 @@ function markHealthy(id, origin) {
   health.set(id, { state: "healthy", nextAvailableAt: 0, fails: 0, backoffMs: 0, lastError: null, generation: nextGeneration(), probeInFlight: false });
 }
 
+// Read a model's deployment list as provider-shaped entries. The v3 read OWNS
+// the routing semantics now (`backupOnly`, `weight`, `exposed`), so this
+// resolves and filters rather than presenting the raw list: the bridge-era
+// pass-through deliberately hands a semantically unusable provider into
+// `deployments` so the VALIDATOR can name it, and that is not licence for the
+// router to build an attempt carrying `model: undefined`. A deployment is
+// routable only when it is a plain object, names a KNOWN backend, and resolves
+// an upstream - the same three reasons v2's loader dropped a provider, reported
+// in the same wording. `backendById` is passed in because the caller already
+// holds it (normalizeConfig, candidates) and re-deriving it per model would be
+// the only reason this function needs the whole config.
+// The backend lookup every shape-aware read needs. Built per call rather than cached: a reload
+// swaps the config object, and a cached map would keep serving the previous backend list.
+function backendsById(cfg) {
+  return new Map((cfg.backends || []).filter((b) => b && typeof b === "object" && b.id).map((b) => [b.id, b]));
+}
+
+function modelDeployments(m, id, backendById) {
+  const list = Array.isArray(m.deployments) ? m.deployments : Array.isArray(m.providers) ? m.providers : [];
+  const out = [];
+  list.forEach((d, i) => {
+    const at = "deployments[" + i + "]";
+    if (!d || typeof d !== "object") {
+      console.warn(`config warning: model '${id}': entry at ${at} is not an object, dropped`);
+      return;
+    }
+    if (typeof d.backend !== "string") {
+      console.warn(`config warning: model '${id}': entry at ${at} names no backend, dropped`);
+      return;
+    }
+    const b = backendById.get(d.backend);
+    if (!b) {
+      console.warn(`config warning: model '${id}': entry at ${at} references unknown backend '${d.backend}', dropped`);
+      return;
+    }
+    const upstream = d.upstream ?? b.model;
+    if (!upstream) {
+      console.warn(`config warning: model '${id}': entry at ${at} (backend '${d.backend}') has no resolvable upstream, dropped`);
+      return;
+    }
+    out.push({ ...d, upstream });
+  });
+  return out;
+}
+
+// v3 primary selection: `backupOnly` deployments are the ordered fallback tail
+// and the primary comes from the weighted heads, so a break-glass deployment
+// never receives live traffic by hash. Weights that are not integers >= 1 are
+// treated as 1 (the validator reports the type; the read must not refuse to
+// route over it).
+function orderDeployments(deps, sessionKey) {
+  const primaries = deps.filter((d) => !d.backupOnly);
+  const backups = deps.filter((d) => d.backupOnly);
+  if (!primaries.length) return [...deps];
+  const weights = primaries.map((d) => (Number.isInteger(d.weight) && d.weight >= 1 ? d.weight : 1));
+  const total = weights.reduce((s, w) => s + w, 0);
+  const h = hashStr(sessionKey) % total;
+  let acc = 0;
+  let pick = 0;
+  for (let i = 0; i < weights.length; i++) {
+    acc += weights[i];
+    if (h < acc) {
+      pick = i;
+      break;
+    }
+  }
+  return [primaries[pick], ...primaries.filter((_, i) => i !== pick), ...backups];
+}
+
+// The session-spread width of a model. In v2 it was `affinityPool`; the
+// converted form records the same fact as the count of deployments that are
+// NOT backupOnly, so a converted config keeps its session spread.
+function modelPool(m) {
+  if (Number.isInteger(m.affinityPool) && m.affinityPool > 0) return m.affinityPool;
+  const deps = Array.isArray(m.deployments) ? m.deployments.filter((d) => d && typeof d === "object") : [];
+  const primary = deps.filter((d) => !d.backupOnly).length;
+  return primary > 0 ? primary : 1;
+}
+
 function ensureBackends(cfg) {
-  for (const b of cfg.backends) {
+  for (const b of cfg.backends || []) {
+    if (!b || typeof b !== "object") continue; // a non-object entry is the validator's to name
     if (!health.has(b.id)) markHealthy(b.id);
   }
+}
+
+// The backends a routing/UI path may actually USE. A non-object entry is kept in
+// the config so the validator can name `backends.N`, which means every consumer
+// that maps the array has to skip it rather than dereference it.
+function usableBackends(cfg) {
+  return (cfg.backends || []).filter((b) => b && typeof b === "object");
 }
 
 // Classify an upstream failure into a backoff "kind".
@@ -992,8 +1221,12 @@ function noteAccountOutage(cfg, attempt, now = Date.now()) {
 // only routes the new config no longer references are dropped.
 function pruneRoutes(cfg) {
   const live = new Set();
-  for (const m of Object.values(cfg.models || {})) {
-    for (const p of m.providers || []) live.add(JSON.stringify([p.backend, p.upstream]));
+  // Through the adapter, never `m.providers`: a legacy entry is converted in memory at load
+  // (providers is replaced by deployments), so reading the raw array here would find NOTHING
+  // live and a reload would drop every cooling route, session exclusion and pin.
+  const byId = backendsById(cfg);
+  for (const [id, m] of Object.entries(cfg.models || {})) {
+    for (const p of modelDeployments(m, id, byId)) live.add(JSON.stringify([p.backend, p.upstream]));
   }
   for (const key of [...ROUTES.keys()]) if (!live.has(key)) ROUTES.delete(key);
   for (const [key, e] of [...SESSION_EXCLUSIONS]) if (!live.has(e.routeKey)) SESSION_EXCLUSIONS.delete(key);
@@ -1009,8 +1242,11 @@ function pruneRoutes(cfg) {
 // session identifiers.
 function routeHealthSnapshot(cfg, now) {
   const modelsByRoute = new Map();
+  // Same adapter as pruneRoutes: a route's logical models must be reported for BOTH shapes, or
+  // every converted (v3) model shows up as a nameless route row on the dashboard.
+  const byId = backendsById(cfg);
   for (const [id, m] of Object.entries(cfg.models || {})) {
-    for (const p of m.providers || []) {
+    for (const p of modelDeployments(m, id, byId)) {
       const key = JSON.stringify([p.backend, p.upstream]);
       if (!modelsByRoute.has(key)) modelsByRoute.set(key, []);
       modelsByRoute.get(key).push(id);
@@ -1681,7 +1917,7 @@ function dashboardPayload(cfg) {
     activeModelCount: k.models.size,
   };
 
-  const byBackend = cfg.backends.map((b) => {
+  const byBackend = usableBackends(cfg).map((b) => {
     const acc = ANALYTICS.byBackend.get(b.id);
     const h = health.get(b.id) || {};
     const isCooling = h.state === "cooling" && h.nextAvailableAt > now;
@@ -1814,14 +2050,184 @@ function seedAnalytics(file) {
   }
 }
 
+// ---- legacy -> v3 bridge ----------------------------------------------------
+
+// Convert today's two-layer config into the three-layer shape. The ORDER is
+// load-bearing and fixed: the identity-preset drop runs FIRST, so every later
+// pass sees the same ids a golden run would, and the residual-collision refusal
+// runs LAST, after the repair sweep has removed the reasons a converted payload
+// would otherwise be unsaveable. Returns { config, warnings }; throws only when
+// a model and a preset still share an id after the drop, which needs a human to
+// decide which one keeps the name.
+// The pre-fix config editor wrote "" for any JSON textarea it rendered empty, so
+// a config saved through it can carry `retry: ""` or `params: ""`. The sentence
+// is ONE constant because two call sites report the same repair (the preset
+// params mapping and the sweep below) and a count that depends on two literals
+// staying byte-identical would drift the moment either is reworded.
+const EMPTY_STRING_REPAIR_MSG = " was an empty string (an older config editor wrote it); dropped - it was already ignored at runtime";
+const repairEmptyString = (obj, at, key, warnings) => {
+  delete obj[key];
+  warnings.push(at + "." + key + EMPTY_STRING_REPAIR_MSG);
+};
+
+function convertLegacyConfig(raw) {
+  const warnings = [];
+  const cfg = JSON.parse(JSON.stringify(raw));
+  cfg.models = cfg.models || {};
+  cfg.presets = cfg.presets || {};
+  // 1) a preset's empty-string `params` is repaired FIRST, before the identity
+  // drop: an IDENTITY preset is deleted in step 2, so a repair reported only
+  // from a later pass would silently skip it - and the live config's only
+  // empty-string preset params sits on exactly such a preset. Reporting it over
+  // the whole set keeps the warning list independent of which presets survive.
+  for (const [id, p] of Object.entries(cfg.presets)) {
+    if (p && typeof p === "object" && p.params === "") repairEmptyString(p, "presets." + id, "params", warnings);
+  }
+  // 2) identity-preset drop: a preset named exactly like a model, listing only
+  // that same name, is a pure pass-through, so dropping it leaves the id served
+  // by the same-named model and frees the name for the v3 XOR rule. Its
+  // `params` move onto that model FIRST, with the preset's value winning: the v2
+  // merge chain applied the preset layer LAST, so folding is exactly equivalent
+  // key by key and the dropped alias keeps the values it used to serve. Doing it
+  // before the drop is what makes it a fold rather than a silent loss.
+  for (const [id, p] of Object.entries(cfg.presets)) {
+    // A structurally malformed preset (null, a number) is NOT the converter's
+    // to judge: it passes through untouched so the validator can name its path,
+    // which is what keeps a hand-edited file a refusal instead of a crash.
+    if (!p || typeof p !== "object") continue;
+    const refs = Array.isArray(p.models) ? p.models : null;
+    if (refs && refs.length === 1) {
+      const only = typeof refs[0] === "string" ? refs[0] : refs[0] && refs[0].model;
+      if (only === id && cfg.models[id]) {
+        const target = cfg.models[id];
+        if (p.params && typeof p.params === "object" && !Array.isArray(p.params) && Object.keys(p.params).length) {
+          target.params = Object.assign({}, target.params && typeof target.params === "object" ? target.params : {}, p.params);
+          warnings.push(
+            "preset '" + id + "' is an identity preset; its params were folded onto model '" + id + "' (preset values win, as the v2 merge order did) and the preset was dropped"
+          );
+        }
+        delete cfg.presets[id];
+        warnings.push("preset '" + id + "' is an identity preset and was dropped; the model stays directly addressable");
+      }
+    }
+  }
+  // 3) per-ref weights and preset affinityPool: warn ONLY when routing-relevant.
+  // A weighted preset's per-ref weights WERE honored at request time (weighted
+  // random over models), so losing them changes behavior; affinity picks by
+  // session hash and failover by declared order, so their weights were already
+  // ignored. preset-affinityPool always warns: pool > 1 widened the session
+  // spread under every strategy and v3's fallback has no pool at all.
+  const skippedPresets = [];
+  for (const [id, p] of Object.entries(cfg.presets)) {
+    if (!p || typeof p !== "object") {
+      skippedPresets.push("presets." + id);
+      continue;
+    }
+    for (const e of p.models || []) {
+      if (e && typeof e === "object" && e.weight != null && p.strategy === "weighted") warnings.push("preset '" + id + "' per-ref weight dropped; weights live on deployments");
+    }
+    if (p.affinityPool !== undefined) warnings.push("preset '" + id + "' affinityPool dropped");
+  }
+  if (skippedPresets.length) {
+    warnings.push("entry at " + skippedPresets.join(", ") + " is not an object and was left for the validator to refuse");
+  }
+  // 4) providers -> deployments 1:1, in declared order. affinityPool N of M
+  // marks the providers past N as backupOnly, which is what the v2 pool meant:
+  // the first N are the session-spread set and the rest are ordered fallbacks.
+  for (const [id, m] of Object.entries(cfg.models)) {
+    if (!m || typeof m !== "object" || !Array.isArray(m.providers)) continue;
+    if (Array.isArray(m.deployments) && m.deployments.length) {
+      warnings.push("model '" + id + "' carries both providers and deployments; providers win and the hand-written deployments are dropped");
+    }
+    const pool = m.affinityPool;
+    m.deployments = m.providers.map((pr, i) => {
+      // A malformed provider (null, a scalar) is passed through as-is: mapping
+      // it to a fabricated deployment would edit what the operator wrote.
+      if (!pr || typeof pr !== "object") return pr;
+      const d = { backend: pr.backend, upstream: pr.upstream };
+      if (pr.weight !== undefined && pr.weight !== 1) d.weight = pr.weight;
+      if (typeof pool === "number" && i >= pool) d.backupOnly = true;
+      for (const k of ["params", "dropParams", "paramMap"]) if (pr[k] !== undefined) d[k] = pr[k];
+      return d;
+    });
+    delete m.providers;
+    delete m.affinityPool;
+    if (m.exposed === undefined) m.exposed = true;
+  }
+  // 5) preset strategies collapse to fallback, preserving declared ref order as
+  // plain model id strings. Only a behavior change warns: an affinity preset
+  // with more than one ref loses its session spread under ordered fallback,
+  // while failover and weighted keep declared order and stay silent.
+  for (const [id, p] of Object.entries(cfg.presets)) {
+    if (!p || typeof p !== "object") continue;
+    if (p.strategy !== "fallback") {
+      if (p.strategy && p.strategy !== "affinity" && p.strategy !== "failover" && p.strategy !== "weighted") warnings.push("preset '" + id + "' unknown strategy treated as fallback");
+      else if (p.strategy === "affinity" && (p.models || []).length > 1) warnings.push("preset '" + id + "' affinity spread mapped to fallback (ordered failover); session-spread behavior changes");
+      p.strategy = "fallback";
+    }
+    p.models = (p.models || []).map((e) => (typeof e === "string" ? e : e.model));
+    delete p.affinityPool;
+    // Dropping a preset's params is a real behavior change when the value is a
+    // non-empty object (the v2 merge chain had a preset layer, v3 has none), so
+    // that case warns. Every OTHER present value - an empty string, or a
+    // non-object such as `params: 5` that the object check above rejects - is an
+    // editor artifact of the class the repair pass drops, and is dropped here
+    // without a second message.
+    if (p.params !== undefined) {
+      if (p.params && typeof p.params === "object" && !Array.isArray(p.params) && Object.keys(p.params).length) {
+        warnings.push("preset '" + id + "' params dropped; v3 has no preset-level params layer");
+      }
+      delete p.params;
+    }
+    // /api/config serves a derived `members` key; nobody reads it in v3, and a
+    // mixed-era snapshot would otherwise convert carrying a stale key.
+    delete p.members;
+    if (p.exposed === undefined) p.exposed = true;
+  }
+  // 6) empty-string repair sweep. Only MODEL-level retry/params are object-
+  // validated, so only those are save/reload ERRORS - but POST /api/config
+  // validates the WHOLE candidate, so ONE surviving error-class value blocks
+  // every save. All of them are dropped regardless: none means anything at
+  // runtime, so this is a repair, and it warns because it rewrites data the
+  // operator never asked to change.
+  const repairEmpty = (obj, at) => {
+    if (!obj || typeof obj !== "object") return;
+    for (const k of ["params", "retry", "dropParams", "paramMap", "offPeak"]) {
+      if (obj[k] === "") repairEmptyString(obj, at, k, warnings);
+    }
+  };
+  // A non-object entry PASSES THROUGH UNTOUCHED: it is the validator's job to
+  // name `backends.N`, and dereferencing it here is what used to take the router
+  // down at boot on a hand-edited file.
+  for (const b of cfg.backends || []) if (b && typeof b === "object") repairEmpty(b, "backends." + b.id);
+  for (const [id, m] of Object.entries(cfg.models)) {
+    repairEmpty(m, "models." + id);
+    (m.deployments || []).forEach((d, i) => repairEmpty(d, "models." + id + ".deployments[" + i + "]"));
+  }
+  for (const [id, p] of Object.entries(cfg.presets)) {
+    if (p && typeof p === "object") repairEmpty(p, "presets." + id);
+  }
+  // 7) residual model/preset collision refuses: a converted config where the
+  // same id is still both cannot be resolved by rule, only by a human.
+  for (const id of Object.keys(cfg.models)) {
+    if (cfg.presets[id]) throw new Error("conversion refused: id '" + id + "' is both a model and a preset");
+  }
+  return { config: cfg, warnings };
+}
+
 // ---- config normalization ---------------------------------------------------
 
 // Normalize the three-layer config at load (initial + hot-reload), in place.
-// Detection is PER ENTRY so single-era configs and accidental mixes both work:
+// This is DUAL-SHAPE for the whole bridge era: it reads the v3 `deployments`
+// shape AND both legacy eras, and the legacy branches are removed only when the
+// bridge is retired. Detection is PER ENTRY so single-era configs and
+// accidental mixes both work:
+// - `models[id]` with `deployments` (v3 shape) is passed through untouched.
 // - `models[id]` with `providers` (new shape) is validated.
 // - `models[id]` with `backends` (pre-presets era, path A) is synthesized into
 //   providers `{backend, upstream: <that backend's model>}`.
-// - `presets[id]` with `models` (new shape) is validated.
+// - `presets[id]` with `models` (new shape) is validated, keeping the v3
+//   `fallback` strategy when the config is v3.
 // - `presets[id]` with `members` (DESIGN-PRESETS era, path B) synthesizes ONE
 //   model per preset (providers = members in order with per-provider upstream)
 //   and rewrites the preset to `{strategy, models: [{model, weight: 1}]}`.
@@ -1833,7 +2239,7 @@ const collisionWarned = new Set(); // model id == preset id warns once per proce
 
 function normalizeConfig(cfg) {
   if (!cfg || typeof cfg !== "object") cfg = {};
-  const backendById = new Map((cfg.backends || []).map((b) => [b.id, b]));
+  const backendById = new Map((cfg.backends || []).filter((b) => b && typeof b === "object" && b.id).map((b) => [b.id, b]));
   if (!cfg.models || typeof cfg.models !== "object") cfg.models = {};
   if (!cfg.presets || typeof cfg.presets !== "object") cfg.presets = {};
 
@@ -1844,6 +2250,11 @@ function normalizeConfig(cfg) {
   };
 
   // ---- 1. models map -----------------------------------------------------
+  // v3 detection mirrors the validator's rule (any model carrying
+  // `deployments` makes the config v3) so the two never disagree about a file.
+  // A v3 model has no legacy branch to run, and synthesizing `providers` onto
+  // it would be the silently-wrong repair R6 forbids.
+  const isV3 = Object.values(cfg.models).some((m) => m && typeof m === "object" && Array.isArray(m.deployments));
   const legacySynthesized = new Set(); // path A model ids (need presets later)
   for (const [id, m] of Object.entries(cfg.models)) {
     if (!m || typeof m !== "object") {
@@ -1851,7 +2262,10 @@ function normalizeConfig(cfg) {
       delete cfg.models[id];
       continue;
     }
-    if (Array.isArray(m.providers)) {
+    if (Array.isArray(m.deployments)) {
+      // v3 shape: the legacy synthesis (providers/backends, affinityPool) is
+      // skipped entirely; the entry is left exactly as written.
+    } else if (Array.isArray(m.providers)) {
       // NEW shape: validate each provider; keep optional dialect fields.
       const valid = [];
       for (const pr of m.providers) {
@@ -1954,7 +2368,11 @@ function normalizeConfig(cfg) {
         refs.push({ model: mref, weight });
       }
       p.models = refs;
-      if (p.strategy !== "affinity" && p.strategy !== "failover" && p.strategy !== "weighted") {
+      // v3 narrows the strategy to 'fallback' alone, and that value is absent
+      // from the legacy allowlist below: rewriting it here would turn every
+      // converted preset into an affinity preset at the first reload, so a v3
+      // config keeps its strategy.
+      if (!isV3 && p.strategy !== "affinity" && p.strategy !== "failover" && p.strategy !== "weighted") {
         console.warn(`config warning: preset '${id}': unknown strategy '${p.strategy}', defaulting to affinity`);
         p.strategy = "affinity";
       }
@@ -2061,7 +2479,7 @@ function normalizeConfig(cfg) {
     for (const mid of flattenPresetModels(pid, new Set())) {
       const m = cfg.models[mid];
       if (!m) continue;
-      for (const pr of m.providers || []) {
+      for (const pr of modelDeployments(m, mid, backendById)) {
         if (seen.has(pr.backend)) continue;
         seen.add(pr.backend);
         members.push({ backend: pr.backend, weight: 1 });
@@ -2082,10 +2500,10 @@ function normalizeConfig(cfg) {
     }
   };
   warnModelInParams(cfg.params, "global");
-  for (const b of cfg.backends || []) warnModelInParams(b.params, `backend ${b.id}`);
+  for (const b of cfg.backends || []) if (b && typeof b === "object") warnModelInParams(b.params, `backend ${b.id}`);
   for (const [mid, m] of Object.entries(cfg.models)) {
     warnModelInParams(m.params, `model ${mid}`);
-    for (const pr of m.providers || []) warnModelInParams(pr.params, `provider ${mid}/${pr.backend}`);
+    for (const pr of modelDeployments(m, mid, backendById)) warnModelInParams(pr.params, `provider ${mid}/${pr.backend}`);
   }
   for (const [pid, p] of Object.entries(cfg.presets)) warnModelInParams(p.params, `preset ${pid}`);
   // dropParams union warnings: every dropped public/request key is a silent
@@ -2095,7 +2513,7 @@ function normalizeConfig(cfg) {
     for (const ref of p.models || []) {
       const m = cfg.models[ref.model];
       if (!m) continue;
-      for (const pr of m.providers || []) {
+      for (const pr of modelDeployments(m, ref.model, backendById)) {
         const b = backendById.get(pr.backend);
         if (!b) continue;
         const drop = new Set([...(b.dropParams || []), ...(pr.dropParams || [])]);
@@ -2271,20 +2689,36 @@ function candidates(cfg, requestedId, sessionKey, rng = Math.random) {
     orderedModels = [modelIds[primaryIdx], ...modelIds.filter((_, i) => i !== primaryIdx)];
   }
 
-  // Model-level provider ordering + flatten + backend dedup.
+  // Model-level deployment ordering + flatten + backend dedup. The shape is
+  // dispatched PER MODEL so a converted config (which is entirely `deployments`)
+  // is not forced through the legacy `providers`/`affinityPool` read, while an
+  // old-shape entry that never went through the bridge keeps working.
   const ordered = [];
-  const seenBackends = new Set();
+  // Two dedup contracts meet here. A legacy entry has no upstream identity of its own beyond
+  // the account, so it keeps backend-only dedup and its routing stays byte-identical. A v3
+  // entry names a PHYSICAL deployment, and one account may hold several (different upstreams,
+  // different dialect settings), so the pair is the unit: cooling is scoped to the pair
+  // (see ROUTES/routeKey), and collapsing the pair here would make that granularity
+  // unreachable - the second deployment could never be tried at all.
+  const seen = new Set();
+  const backendById = backendsById(cfg);
   for (const mid of orderedModels) {
     const m = (cfg.models || {})[mid];
     if (!m) continue;
-    const providers = m.providers || [];
+    const providers = modelDeployments(m, mid, backendById);
     if (providers.length === 0) continue;
-    const pool = Math.min(m.affinityPool || 1, providers.length);
-    const primaryIdx = hashStr(sessionKey) % pool;
-    const providerOrder = [providers[primaryIdx], ...providers.filter((_, i) => i !== primaryIdx)];
+    const providerOrder = Array.isArray(m.deployments)
+      ? orderDeployments(providers, sessionKey)
+      : (() => {
+          const pool = Math.min(modelPool(m), providers.length);
+          const primaryIdx = hashStr(sessionKey) % pool;
+          return [providers[primaryIdx], ...providers.filter((_, i) => i !== primaryIdx)];
+        })();
+    const perDeployment = Array.isArray(m.deployments);
     for (const pr of providerOrder) {
-      if (seenBackends.has(pr.backend)) continue;
-      seenBackends.add(pr.backend);
+      const key = perDeployment ? pr.backend + "\u0000" + pr.upstream : pr.backend;
+      if (seen.has(key)) continue;
+      seen.add(key);
       ordered.push({ model: mid, backend: pr.backend, upstream: pr.upstream });
     }
   }
@@ -2557,24 +2991,26 @@ function newError(status, body) {
 
 // ---- layered parameters ----------------------------------------------------
 
-// Merge request parameters across the six layers, highest priority last:
-// global < backend.params < provider.params < model.params < preset.params <
-// request body. `model` is RESERVED: config-layer model keys are ignored and
-// the forwarded `model` is ALWAYS provider.upstream. Dialect handling runs
+// Merge request parameters across the config layers, highest priority last:
+// global < backend.params < deployment.params < model.params < request body.
+// There is NO preset layer in v3: `preset` is still a parameter so existing
+// callers keep working, but its params are deliberately not read - a preset
+// selects an ordered model list and a deployment holds the per-provider
+// dialect. `model` is RESERVED: config-layer model keys are ignored and the
+// forwarded `model` is ALWAYS the deployment's upstream. Dialect handling runs
 // AFTER the merge, on the PUBLIC/request key space: dropParams (union of
-// backend + provider, legacy backend field still honored) deletes keys first,
-// then provider.paramMap renames the survivors, then the developer-role
+// backend + deployment, the legacy provider field still honored) deletes keys
+// first, then paramMap renames the survivors, then the developer-role
 // translation (backend field, special-cased). Pure: never mutates `body`.
-function buildPayload(body, cfg, preset, model, provider, backend) {
+function buildPayload(body, cfg, preset, model, deployment, backend) {
   const out = {};
   Object.assign(out, cfg.params || {}); // lowest layer
   Object.assign(out, backend.params || {});
-  Object.assign(out, provider.params || {});
+  Object.assign(out, deployment.params || {});
   Object.assign(out, model.params || {});
-  if (preset) Object.assign(out, preset.params || {});
   delete out.model; // reserved in config layers
   Object.assign(out, body); // request body wins
-  out.model = provider.upstream; // always
+  out.model = deployment.upstream; // always
   // An explicit thinking:disabled is authoritative for the reasoning group:
   // strip any config-default reasoning_effort so upstream never receives the
   // contradictory pair (disabled thinking + effort set). 2026-09-09 fix.
@@ -2582,9 +3018,9 @@ function buildPayload(body, cfg, preset, model, provider, backend) {
     delete out.reasoning_effort;
   }
   // Dialect: drop FIRST (public/request key space), then rename survivors.
-  const drop = new Set([...(backend.dropParams || []), ...(provider.dropParams || [])]);
+  const drop = new Set([...(backend.dropParams || []), ...(deployment.dropParams || [])]);
   for (const k of drop) delete out[k];
-  for (const [from, to] of Object.entries(provider.paramMap || {})) {
+  for (const [from, to] of Object.entries(deployment.paramMap || {})) {
     if (from in out) {
       out[to] = out[from];
       delete out[from];
@@ -2856,6 +3292,11 @@ async function handleChat(req, res, cfg, bodyText) {
   let callerGone = false;
   let failedAttempts = 0;
   let opaqueFailures = 0;
+  // Accounts that proved dead for THIS request only. A 5xx or a refused connection says the
+  // endpoint is gone, so the account's remaining deployments are skipped rather than probed
+  // in turn - but only here: the siblings stay globally healthy, recoverable, and eligible
+  // for every other request (v3 spec T5).
+  const deadAccounts = new Set();
   const captureDetail = bodyText.length <= DETAIL_MAX_BODY_BYTES; // size guard: skip huge payloads
   const detailT = Date.now();
   // Request-lifetime cancellation. The caller can vanish at ANY moment, including while the
@@ -2876,14 +3317,18 @@ async function handleChat(req, res, cfg, bodyText) {
     req.off("aborted", onCallerGone);
     res.off("close", onCallerGone);
   };
+  // Built once per request rather than per attempt: the payload builder and the
+  // deployment read both need it, and `modelDeployments` re-resolves the entry.
+  const backendById = backendsById(cfg);
   for (let poolIndex = 0; poolIndex < pool.length; poolIndex++) {
     const attempt = pool[poolIndex];
+    if (deadAccounts.has(attempt.backend)) continue; // this request already lost that account
     if (priorBackend && priorBackend !== attempt.backend) fallbackCount++;
     priorBackend = attempt.backend;
     lastTried = attempt;
-    const backend = cfg.backends.find((b) => b.id === attempt.backend);
+    const backend = backendById.get(attempt.backend);
     const model = (cfg.models || {})[attempt.model];
-    const provider = (model && (model.providers || []).find((p) => p.backend === attempt.backend)) || null;
+    const provider = (model && modelDeployments(model, attempt.model, backendById).find((p) => p.backend === attempt.backend && p.upstream === attempt.upstream)) || null;
     if (!backend || !model || !provider) continue; // defensive: candidates built the attempt
     // Take the recovery lease BEFORE any network await (see claimAttempt) and give
     // it back on every exit: a client or opaque failure settles no route state, so
@@ -3004,6 +3449,10 @@ async function handleChat(req, res, cfg, bodyText) {
       // identically on every provider: fail fast, no retry, no failover. An
       // unexplained rejection proves nothing about the payload, so it falls
       // through to the next provider instead.
+      // A transport-class failure taints the whole account for the rest of this request (see
+      // deadAccounts). An auth, billing or rate failure needs no entry here: those cool the
+      // ACCOUNT, so the next deployment of it is refused by the eligibility check anyway.
+      if (errKind === "server" || result.err.stage === "connect") deadAccounts.add(attempt.backend);
       releaseAttempt(lease);
       if (callerAborted || errKind === "client") break;
       continue;
@@ -4054,16 +4503,112 @@ function requireAuth(cfg, req) {
 
 let cfg = null;
 
+// An old-shape file is one whose models still carry the pre-v3 `providers`
+// array. `models` must itself be a plain object: a malformed one is the
+// validator's to name, not the converter's to walk.
+function isOldShape(raw) {
+  const models = raw && typeof raw === "object" && !Array.isArray(raw) ? raw.models : null;
+  if (!models || typeof models !== "object" || Array.isArray(models)) return false;
+  return Object.values(models).some((m) => m && typeof m === "object" && Array.isArray(m.providers));
+}
+
+const BRIDGE_WARNING_PREFIX = "bridge: ";
+
+// The ONE bridge from a pre-v3 document to the config the router runs, shared by
+// every entry point that can be handed an old-shape document: boot, hot-reload,
+// a save from the Config tab, and a snapshot restore. Three inline copies of
+// this policy is the failure mode it exists to prevent - a save that converts
+// differently from a load is a config whose on-disk meaning depends on how it
+// arrived.
+//
+// The container restore is part of the policy, not an option: the converter
+// SYNTHESIZES `models`/`presets` to work on them, so a truncated file would come
+// back looking complete and the validator's "'presets' is required at the top
+// level" would be repaired away instead of reported. A key the input LACKED is
+// therefore removed again after conversion, so the validator judges what the
+// operator actually wrote.
+//
+// Conversion failure is RETURNED rather than thrown: the converter refuses only
+// on a residual id that is both a model and a preset, which no rule can resolve,
+// and the three callers answer it differently by design - boot aborts on the
+// small set it cannot interpret, a reload keeps the config already running, and
+// save/restore refuse with 400 - so the shared half must not pick one for them.
+const MISSING_TOP_CONTAINERS = ["models", "presets"];
+
+function bridgeToEffectiveConfig(rawInput) {
+  const missingContainers = MISSING_TOP_CONTAINERS.filter((k) => !(rawInput && typeof rawInput === "object" && k in rawInput));
+  if (!isOldShape(rawInput)) {
+    return { effective: rawInput, warnings: [], missingContainers, conversionError: null };
+  }
+  let converted;
+  try {
+    converted = convertLegacyConfig(rawInput);
+  } catch (e) {
+    return { effective: rawInput, warnings: [], missingContainers, conversionError: e };
+  }
+  for (const k of missingContainers) delete converted.config[k];
+  return { effective: converted.config, warnings: converted.warnings, missingContainers, conversionError: null };
+}
+
 async function loadConfig() {
   const raw = await readFileP(CONFIG_PATH, "utf8");
   const parsed = JSON.parse(raw);
+  // Validate the parsed shape BEFORE normalizeConfig repairs it: normalize
+  // silently synthesizes legacy shapes, so validating afterwards would judge
+  // the repair instead of what was written. `cfg` is undefined at boot, which
+  // makes the RESTART_ONLY checks vacuous there; load mode is what makes a
+  // dangling preset reference a warning on this path (save still refuses it).
+  //
+  // The SUBJECT is the effective config: an old-shape file is converted in
+  // memory first, so the validator judges the shape the router will actually
+  // run. Validating the raw input instead would report one shape error per
+  // model for a file that converts cleanly.
+  const bridge = bridgeToEffectiveConfig(parsed);
+  if (bridge.conversionError) {
+    // The loader cannot interpret this file. At reload the previous config
+    // stays running; at boot there is nothing to fall back to, and continuing
+    // would run the router with no config at all.
+    if (!cfg) throw new Error("config conversion failed: " + bridge.conversionError.message);
+    console.error(`[${new Date().toISOString()}] config reload rejected: conversion failed: ${bridge.conversionError.message}`);
+    return cfg;
+  }
+  for (const w of bridge.warnings) console.warn(`[${new Date().toISOString()}] config warning: ${BRIDGE_WARNING_PREFIX}${w}`);
+  const effective = bridge.effective;
+  // The abort is deliberately narrow, because the validator's error set is the
+  // SAVE-side contract and is stricter than what this loader tolerates: it
+  // repairs a non-object `retry` (the live production config carries
+  // retry: ""), synthesizes `models`/`presets` when they are absent or not an
+  // object, and leaves an unset apiKeyEnv to fail closed per backend. A
+  // save-side error the loader repairs must never be able to stop a running
+  // router, so at boot only what the loader genuinely cannot interpret aborts:
+  // a non-object root, or a missing `backends` (ensureBackends and the startup
+  // banner both walk cfg.backends unguarded). A pre-presets-era config file
+  // keeps booting. Everything else is logged and the router starts. At reload,
+  // where a config is already running, ANY error-class finding rejects the
+  // write and the previous config is kept.
+  const verdict = validateConfig(effective, cfg, { mode: "load" });
+  if (verdict.errors.length) {
+    const detail = verdict.errors.map((e) => (e.path || "(root)") + ": " + e.message).join("; ");
+    if (cfg) {
+      console.error(`[${new Date().toISOString()}] config reload rejected: ${detail}`);
+      return cfg;
+    }
+    const fatal = verdict.errors.filter((e) => e.path === "" || e.path === "backends");
+    if (fatal.length) throw new Error("config invalid: " + detail);
+    for (const e of verdict.errors) {
+      console.error(`[${new Date().toISOString()}] config warning (not fatal at boot): ${e.path || "(root)"}: ${e.message}`);
+    }
+  }
+  for (const w of verdict.warnings) {
+    console.error(`[${new Date().toISOString()}] config warning: ${w.path}: ${w.message}`);
+  }
   // Normalize the three-layer shape (backends -> models -> presets) on every
   // load: validate new-shape entries, synthesize legacy configs, derive preset
   // members. Routing and /api/config only ever see the normalized form.
-  normalizeConfig(parsed);
+  normalizeConfig(effective);
   // Reconcile: keep health registry keyed by backend id on reload.
-  const prevIds = new Set(cfg ? cfg.backends.map((b) => b.id) : []);
-  cfg = parsed;
+  const prevIds = new Set(cfg ? (cfg.backends || []).filter((b) => b && typeof b === "object").map((b) => b.id) : []);
+  cfg = effective;
   if (cfg.masterKeyEnv && !process.env[cfg.masterKeyEnv]) {
     console.error(
       `[${new Date().toISOString()}] config warning: masterKeyEnv '${cfg.masterKeyEnv}' set but process.env['${cfg.masterKeyEnv}'] is empty; auth-gated endpoints will reject all requests (fail closed)`
@@ -4090,7 +4635,7 @@ function server() {
 
     if (req.method === "GET" && url === "/health") {
       const now = Date.now();
-      const backends = cfg.backends.map((b) => {
+      const backends = usableBackends(cfg).map((b) => {
         const h = health.get(b.id) || {};
         const isCooling = h.state === "cooling" && h.nextAvailableAt > now;
         return {
@@ -4114,13 +4659,17 @@ function server() {
     }
 
     if (req.method === "GET" && url === p + "/models") {
-      // Preset ids first (config order), then model ids not already listed
-      // (config order). Colliding ids appear exactly once (the preset owns it).
+      // Exposed presets first (config order), then exposed models not already
+      // listed. `exposed: false` is a LISTING rule only: the entry stays
+      // routable, it is just not advertised. The legacy collision rule is gone
+      // with the v3 XOR constraint - a converted config has no collisions left.
       const ids = [];
       for (const id of Object.keys(cfg.presets || {})) {
+        if (cfg.presets[id] && cfg.presets[id].exposed === false) continue;
         if (!ids.includes(id)) ids.push(id);
       }
       for (const id of Object.keys(cfg.models || {})) {
+        if (cfg.models[id] && cfg.models[id].exposed === false) continue;
         if (!ids.includes(id)) ids.push(id);
       }
       const data = ids.map((id) => ({ id, object: "model", owned_by: "local-router" }));
@@ -4229,10 +4778,27 @@ function server() {
         return writeError(res, newError(500, JSON.stringify({ error: { message: `cannot read the current config: ${e.message}`, type: "router_error" } })));
       }
 
-      const verdict = validateConfig(candidate, current);
+      // Convert to the form that will be WRITTEN before anything judges it, so
+      // every check below and the write itself read the same object. Validating
+      // or writing the pre-conversion candidate while the converted object went
+      // to disk would be a bypass: a `providers` payload the v3 branch rejects
+      // would pass the check that ran on the legacy shape and still land on disk.
+      const bridge = bridgeToEffectiveConfig(candidate);
+      if (bridge.conversionError) {
+        res.writeHead(400, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ ok: false, errors: [{ path: "", message: bridge.conversionError.message }], warnings: [] }));
+      }
+      const toSave = bridge.effective;
+      // The bridge's own warnings ride the same channel as the validator's
+      // (R6): a save that repairs the payload is a change the operator did not
+      // ask for and cannot see otherwise.
+      const bridgeWarnings = bridge.warnings.map((message) => ({ path: "(bridge)", message }));
+
+      const verdict = validateConfig(toSave, current);
+      const warnings = bridgeWarnings.concat(verdict.warnings);
       if (verdict.errors.length) {
         res.writeHead(400, { "content-type": "application/json" });
-        return res.end(JSON.stringify({ ok: false, errors: verdict.errors, warnings: verdict.warnings }));
+        return res.end(JSON.stringify({ ok: false, errors: verdict.errors, warnings }));
       }
 
       // Lost-update guard: the browser tells us which revision it edited. If
@@ -4249,7 +4815,7 @@ function server() {
               message: "the config file changed on disk since this page loaded it",
               type: "conflict",
             },
-            warnings: verdict.warnings,
+            warnings,
             current,
             revision: currentRevision,
           })
@@ -4258,21 +4824,24 @@ function server() {
 
       if (dryRun) {
         res.writeHead(200, { "content-type": "application/json" });
-        return res.end(JSON.stringify({ ok: true, dryRun: true, warnings: verdict.warnings, revision: currentRevision }));
+        return res.end(JSON.stringify({ ok: true, dryRun: true, warnings, revision: currentRevision }));
       }
 
       const snapshot = snapshotConfig();
       try {
-        writeConfigAtomic(candidate);
+        writeConfigAtomic(toSave);
       } catch (e) {
         return writeError(res, newError(500, JSON.stringify({ error: { message: `failed to write config: ${e.message}`, type: "router_error" } })));
+      }
+      for (const w of bridgeWarnings) {
+        console.warn(`[${new Date().toISOString()}] config save warning: ${BRIDGE_WARNING_PREFIX}${w.message}`);
       }
       for (const w of verdict.warnings) {
         console.warn(`[${new Date().toISOString()}] config save warning: ${w.path}: ${w.message}`);
       }
       console.error(`[${new Date().toISOString()}] config saved via web UI (snapshot ${snapshot || "unavailable"})`);
       res.writeHead(200, { "content-type": "application/json" });
-      return res.end(JSON.stringify({ ok: true, warnings: verdict.warnings, snapshot, revision: configRevision() }));
+      return res.end(JSON.stringify({ ok: true, warnings, snapshot, revision: configRevision() }));
     }
 
     if (req.method === "POST" && url === "/api/config/reset") {
@@ -4292,21 +4861,62 @@ function server() {
       } catch (e) {
         return writeError(res, newError(500, JSON.stringify({ error: { message: `snapshot is unreadable: ${e.message}`, type: "router_error" } })));
       }
-      const verdict = validateConfig(restored, restored);
+      // Save-class, like every other write to the live file: `current` is what
+      // is actually on disk, so the startup-only keys the UI cannot change are
+      // refused here too, and the snapshot is judged as the config it would
+      // become rather than against itself. A restore is a deliberate user
+      // action, so a bad snapshot is refused with its field paths instead of
+      // being silently loaded.
+      //
+      // The snapshot is converted BEFORE it is judged, exactly as a save is: a
+      // snapshot taken before the bridge is an old-shape document, and writing
+      // it back verbatim would put `providers` on the live file again and let
+      // the v3 branch reject the router's own config on the next reload.
+      const bridge = bridgeToEffectiveConfig(restored);
+      if (bridge.conversionError) {
+        res.writeHead(400, { "content-type": "application/json" });
+        return res.end(
+          JSON.stringify({ ok: false, errors: [{ path: "", message: bridge.conversionError.message }], warnings: [], restored: name })
+        );
+      }
+      const toRestore = bridge.effective;
+      const bridgeWarnings = bridge.warnings.map((message) => ({ path: "(bridge)", message }));
+      let currentRaw;
+      try {
+        currentRaw = readRawConfig();
+      } catch (e) {
+        return writeError(res, newError(500, JSON.stringify({ error: { message: `cannot read the current config: ${e.message}`, type: "router_error" } })));
+      }
+      const verdict = validateConfig(toRestore, currentRaw);
+      const warnings = bridgeWarnings.concat(verdict.warnings);
       if (verdict.errors.length) {
         res.writeHead(400, { "content-type": "application/json" });
-        return res.end(JSON.stringify({ ok: false, errors: verdict.errors, warnings: verdict.warnings }));
+        return res.end(JSON.stringify({ ok: false, errors: verdict.errors, warnings }));
+      }
+      // Same lost-update guard as POST /api/config. Conditional on the caller
+      // having sent a revision: a reset that omits baseRevision is a deliberate
+      // "restore this snapshot now" and must still be accepted.
+      if (input.baseRevision != null && Number(input.baseRevision) !== configRevision() && input.force !== true) {
+        res.writeHead(409, { "content-type": "application/json" });
+        return res.end(
+          JSON.stringify({
+            ok: false,
+            error: { message: "the config file changed on disk since this page loaded it", type: "conflict" },
+            warnings,
+            revision: configRevision(),
+          })
+        );
       }
       // Snapshot the state being replaced so a restore is itself undoable.
       const safety = snapshotConfig();
       try {
-        writeConfigAtomic(restored);
+        writeConfigAtomic(toRestore);
       } catch (e) {
         return writeError(res, newError(500, JSON.stringify({ error: { message: `failed to restore: ${e.message}`, type: "router_error" } })));
       }
       console.error(`[${new Date().toISOString()}] config restored from snapshot ${name} (previous state saved as ${safety || "unavailable"})`);
       res.writeHead(200, { "content-type": "application/json" });
-      return res.end(JSON.stringify({ ok: true, restored: name, warnings: verdict.warnings, revision: configRevision() }));
+      return res.end(JSON.stringify({ ok: true, restored: name, warnings, revision: configRevision() }));
     }
 
     // ---- env editor (managed secrets store) -----------------------------------
@@ -4459,7 +5069,7 @@ function server() {
       }
       const id = body && body.id;
       const action = body && body.action;
-      if (!id || !cfg.backends.some((b) => b.id === id)) {
+      if (!id || !usableBackends(cfg).some((b) => b.id === id)) {
         res.writeHead(404, { "content-type": "application/json" });
         return res.end(JSON.stringify({ error: { message: `backend '${id}' not found`, type: "not_found" } }));
       }
@@ -4664,7 +5274,7 @@ async function main() {
     });
   }
   console.error(`[${new Date().toISOString()}] config: ${CONFIG_PATH}`);
-  console.error(`[${new Date().toISOString()}] backends: ${cfg.backends.map((b) => `${b.id}(${mask(process.env[b.apiKeyEnv])})`).join(", ")}`);
+  console.error(`[${new Date().toISOString()}] backends: ${(cfg.backends || []).filter((b) => b && typeof b === "object").map((b) => `${b.id}(${mask(process.env[b.apiKeyEnv])})`).join(", ")}`);
 }
 
 // Running the file as a script starts the server; importing it (test.mjs
@@ -4678,4 +5288,4 @@ if (isMain) {
 }
 
 export { claimAttempt, releaseAttempt, ineligibility, health, ROUTES };
-export { backoffFor, noteAccountOutage, markSuccess, ACCOUNT_OUTAGE_ROUTES, classify, readUpstreamError, terminalChatError, redactSecrets, capAttemptsSummary, attemptOutcome, candidates, touchSessionPreference, evictSessionPreferences, SESSION_PREFS, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost, writeConfigAtomic, routeKey, routeBackoffMs, authScopeOf, sessionPreferenceKey, beginSessionRequest, orderSessionProviders, rememberProvider, sessionPreferenceStats, clearSessionPreferences };
+export { backoffFor, noteAccountOutage, markSuccess, ACCOUNT_OUTAGE_ROUTES, classify, readUpstreamError, terminalChatError, redactSecrets, capAttemptsSummary, attemptOutcome, candidates, touchSessionPreference, evictSessionPreferences, SESSION_PREFS, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost, writeConfigAtomic, routeKey, routeBackoffMs, authScopeOf, sessionPreferenceKey, beginSessionRequest, orderSessionProviders, rememberProvider, sessionPreferenceStats, clearSessionPreferences, validateConfig, convertLegacyConfig };

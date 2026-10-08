@@ -10,7 +10,7 @@ import { spawn } from "node:child_process";
 import vm from "node:vm";
 // Unit-level imports: server.mjs only starts the server when run as a script,
 // so importing it here gives direct access to strategy selection for tests.
-import { candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost, writeConfigAtomic } from "./server.mjs";
+import { candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost, writeConfigAtomic, validateConfig, convertLegacyConfig } from "./server.mjs";
 // Namespace import so a not-yet-implemented helper reads as undefined and fails
 // its own assertion, rather than crashing the whole file at load time.
 import * as SRV from "./server.mjs";
@@ -87,14 +87,24 @@ async function startRouter(mocks, extraEnv = {}) {
     env: { ...process.env, ROUTER_CONFIG: cfgPath, ROUTER_ENV: envPath, PORT: "0", ...extraEnv },
     stdio: ["ignore", "pipe", "pipe"],
   });
-  // Wait for the listening banner.
+  // Wait for the listening banner. A child that never prints it is the opaque
+  // failure this file already paid for once: carry the child's own stderr tail
+  // and exit state into the thrown error, so a config the loader rejects names
+  // its field paths instead of only "server did not start".
   let port = null;
+  let childErr = "";
+  let childExit = null;
+  child.on("exit", (code, signal) => { childExit = code === null ? "signal:" + signal : code; });
   await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("server did not start")), 8000);
+    const timer = setTimeout(
+      () => reject(new Error("server did not start (exit=" + childExit + ", stderr tail: " + JSON.stringify(childErr.slice(-600)) + ")")),
+      8000
+    );
     let out = "";
     child.stdout.on("data", (d) => { out += d; });
     child.stderr.on("data", (d) => {
       const s = d.toString();
+      childErr += s;
       const m = /listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(s);
       if (m) { port = parseInt(m[1], 10); clearTimeout(timer); resolve(); }
     });
@@ -116,10 +126,18 @@ async function startRouterCfg(cfg, envLines, extraEnv = {}) {
     stdio: ["ignore", "pipe", "pipe"],
   });
   let port = null;
+  let childErr = "";
+  let childExit = null;
+  child.on("exit", (code, signal) => { childExit = code === null ? "signal:" + signal : code; });
   await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("server did not start")), 8000);
+    const timer = setTimeout(
+      () => reject(new Error("server did not start (exit=" + childExit + ", stderr tail: " + JSON.stringify(childErr.slice(-600)) + ")")),
+      8000
+    );
     child.stderr.on("data", (d) => {
-      const m = /listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(d.toString());
+      const s = d.toString();
+      childErr += s;
+      const m = /listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(s);
       if (m) { port = parseInt(m[1], 10); clearTimeout(timer); resolve(); }
     });
   });
@@ -766,6 +784,395 @@ async function main() {
     );
   }
 
+  // v31) typed model validation: the save-side validator rejects a bad type on
+  //      every model field the editor can write (old shape, no schema change).
+  {
+    const base = {
+      backends: [{ id: "b1", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_B1" }],
+      models: {
+        "m1": {
+          providers: [{ backend: "b1", upstream: "u1" }],
+          retry: "",
+          affinityPool: 1.5,
+          params: "nope",
+          meta: { pricing: { inputPerM: "cheap" } }
+        }
+      },
+      presets: { "p1": { strategy: "affinity", models: ["m1"] } }
+    };
+    process.env.KEY_B1 = "x";
+    const v = validateConfig(base, base);
+    const paths = v.errors.map((e) => e.path);
+    assert(paths.includes("models.m1.retry"), "v31a) retry \"\" is an error (" + JSON.stringify(paths) + ")");
+    assert(paths.includes("models.m1.affinityPool"), "v31b) non-integer affinityPool is an error");
+    assert(paths.includes("models.m1.params"), "v31c) non-object params is an error");
+    assert(paths.includes("models.m1.meta.pricing.inputPerM"), "v31d) non-numeric pricing is an error");
+    delete process.env.KEY_B1;
+  }
+
+  // v32) an id that is both a model and a preset stays WARNING-class: the save
+  //      is not blocked, because old-shape configs carry such collisions today.
+  {
+    process.env.KEY_B1 = "x";
+    const cfg = {
+      backends: [{ id: "b1", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_B1" }],
+      models: { "same": { providers: [{ backend: "b1", upstream: "u1" }] } },
+      presets: { "same": { strategy: "affinity", models: ["same"] } }
+    };
+    const v = validateConfig(cfg, cfg);
+    assert(v.errors.length === 0, "v32a) old-shape collision is NOT an error (" + JSON.stringify(v.errors) + ")");
+    assert(v.warnings.some((w) => w.path === "presets.same"), "v32b) old-shape collision warns at presets.same (" + JSON.stringify(v.warnings) + ")");
+    delete process.env.KEY_B1;
+  }
+
+  // v33) save/load validation split: an unknown preset ref is an ERROR at save
+  //      (existing behavior, unchanged) and a warn-and-drop at load. The
+  //      unknown-strategy and unknown-top-level-key branches are characterized
+  //      here as-is: both stay warning-class in BOTH modes.
+  {
+    process.env.KEY_B1 = "x";
+    const cfg = {
+      backends: [{ id: "b1", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_B1" }],
+      models: { "m1": { providers: [{ backend: "b1", upstream: "u1" }] } },
+      presets: {
+        "p1": { strategy: "affinity", models: ["ghost"] },
+        "p2": { strategy: "sideways", models: ["m1"] }
+      },
+      extraFuture: { keep: true }
+    };
+    const v = validateConfig(cfg, cfg);
+    assert(v.errors.some((e) => e.path === "presets.p1.models[0]"), "v33a) unknown preset ref is an error (" + JSON.stringify(v.errors) + ")");
+    assert(v.warnings.some((w) => w.path === "presets.p2.strategy"), "v33b) unknown strategy warns and falls back (" + JSON.stringify(v.warnings) + ")");
+    assert(v.warnings.some((w) => w.path === "extraFuture"), "v33c) unknown top-level key warns");
+    // Save/load split: load tolerates the dangling ref (warn+drop), save refuses it.
+    const vl = validateConfig(cfg, cfg, { mode: "load" });
+    assert(vl.errors.every((e) => e.path !== "presets.p1.models[0]"), "v33d) load mode downgrades the dangling ref to warn (" + JSON.stringify(vl.errors) + ")");
+    assert(vl.warnings.some((w) => w.path === "presets.p1.models[0]"), "v33e) load warn carries the ref path");
+    delete process.env.KEY_B1;
+  }
+
+  // ---- v34) config load wiring: validate before normalize, non-destructive --
+  // Two regimes. BOOT (no previous config): only findings that make the config
+  // UNINTERPRETABLE abort; the classes the loader repairs (an unset apiKeyEnv,
+  // retry: "") log a warning and the router starts. RELOAD (a config is
+  // already running): ANY error-class finding rejects the write and the running
+  // config is kept. The validator's error set is the stricter SAVE-side
+  // contract, so it must never be able to take a running router down.
+  {
+    const dir = await mkdtemp(join(tmpdir(), "lmr-v34-"));
+    const cfgPath = join(dir, "config.json");
+    const envPath = join(dir, ".env");
+    const good = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "v34", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_V34" }],
+      models: { "v34m": { providers: [{ backend: "v34", upstream: "u" }], meta: { label: "good" } } },
+      presets: {}
+    };
+    await writeFile(cfgPath, JSON.stringify(good, null, 2));
+    await writeFile(envPath, "KEY_V34=k\n");
+    const child = spawn(process.execPath, ["server.mjs"], {
+      cwd: join(import.meta.dirname),
+      env: { ...process.env, ROUTER_CONFIG: cfgPath, ROUTER_ENV: envPath },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let base = null;
+    let v34Err = "";
+    await new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error("no start")), 8000);
+      child.stderr.on("data", (d) => {
+        v34Err += d.toString();
+        const m = /listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(d.toString());
+        if (m) { base = "http://127.0.0.1:" + parseInt(m[1], 10); clearTimeout(t); resolve(); }
+      });
+    });
+    try {
+      await new Promise((r) => setTimeout(r, 300));
+      // v34a) THE SAFETY GUARANTEE: a config the router judges BROKEN is never
+      // adopted and the previous config keeps running. RE-PINNED by Task 11 from
+      // a legacy `retry: ""` payload (old label: "bad reload keeps the previous
+      // config running", with meta.label as the probe) to a V3-shaped payload
+      // the converter does NOT repair: the load pipeline now converts an
+      // old-shape file first, and conversion repairs `retry: ""` (and deletes
+      // it) before the validator sees it, so that payload is legitimately
+      // ADOPTED - pinned separately below as v34a3. The guarantee itself is
+      // unchanged and must stay proven, so the probe is a v3 payload with an
+      // unknown deployment backend, which no repair touches.
+      // meta.label SURVIVES normalizeConfig verbatim (normalize never touches
+      // meta), so flipping it proves whether the broken reload was rejected or
+      // loaded.
+      const badV3 = JSON.parse(JSON.stringify(good));
+      badV3.models.v34m = { deployments: [{ backend: "v34-does-not-exist", upstream: "u" }], meta: { label: "broken-write" } };
+      await writeFile(cfgPath, JSON.stringify(badV3, null, 2));
+      await new Promise((r) => setTimeout(r, 900));
+      const live = await (await fetch(base + "/api/config")).json();
+      assert(
+        !!live.models.v34m && live.models.v34m.meta && live.models.v34m.meta.label === "good",
+        "v34a) a reload the router judges broken is not adopted and the previous config keeps running (label=" + (live.models.v34m && live.models.v34m.meta && live.models.v34m.meta.label) + ")"
+      );
+      assert(
+        /config reload rejected/.test(v34Err) && /unknown deployment backend/.test(v34Err),
+        "v34a2) the rejection is logged with the validator's own reason (" + JSON.stringify(v34Err.split("\n").filter((l) => /rejected/.test(l)).join(" | ").slice(0, 300)) + ")"
+      );
+
+      // v34a3) THE NEW OBSERVABLE Task 11 introduces, pinned rather than merely
+      // noted: a LEGACY payload whose only defect is a repaired value (`retry:
+      // ""`) now reloads ADOPTED, because the bridge repairs it before the
+      // validator runs. The reload-rejection boundary therefore does NOT move
+      // for this class, and the repair is reported.
+      const legacyReload = JSON.parse(JSON.stringify(good));
+      legacyReload.models.v34m = { providers: [{ backend: "v34", upstream: "u" }], retry: "", meta: { label: "legacy-repaired" } };
+      await writeFile(cfgPath, JSON.stringify(legacyReload, null, 2));
+      await new Promise((r) => setTimeout(r, 900));
+      const live2 = await (await fetch(base + "/api/config")).json();
+      assert(
+        !!live2.models.v34m && live2.models.v34m.meta && live2.models.v34m.meta.label === "legacy-repaired",
+        "v34a3) a legacy reload whose only defect is a repaired value is repaired and ADOPTED (label=" + (live2.models.v34m && live2.models.v34m.meta && live2.models.v34m.meta.label) + ")"
+      );
+      assert(
+        /models\.v34m\.retry was an empty string/.test(v34Err) && /bridge:/.test(v34Err),
+        "v34a4) and the repair is reported by the bridge's own warning (" + JSON.stringify(v34Err.split("\n").filter((l) => /bridge:/.test(l)).join(" | ").slice(0, 300)) + ")"
+      );
+    } finally {
+      child.kill();
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  {
+    // v34b) BOOT tolerance: a backend whose apiKeyEnv names a variable that is
+    //       not set in the child's process is a save-side error the loader
+    //       lets fail closed per backend, so it must not stop startup.
+    const dir = await mkdtemp(join(tmpdir(), "lmr-v34b-"));
+    const cfgPath = join(dir, "config.json");
+    const envPath = join(dir, ".env");
+    const cfgB = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "v34b", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_V34B_MISSING" }],
+      models: { "v34bm": { providers: [{ backend: "v34b", upstream: "u" }] } },
+      presets: {}
+    };
+    await writeFile(cfgPath, JSON.stringify(cfgB, null, 2));
+    await writeFile(envPath, "V34B_UNUSED=x\n");
+    // The child must NOT see the variable: inheriting it would make the test
+    // vacuous wherever the shell happens to define it.
+    const childEnv = { ...process.env, ROUTER_CONFIG: cfgPath, ROUTER_ENV: envPath };
+    delete childEnv.KEY_V34B_MISSING;
+    const child = spawn(process.execPath, ["server.mjs"], {
+      cwd: join(import.meta.dirname),
+      env: childEnv,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let base = null;
+    let err = "";
+    await new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error("v34b server did not start (stderr tail: " + JSON.stringify(err.slice(-400)) + ")")), 8000);
+      child.stderr.on("data", (d) => {
+        const s = d.toString();
+        err += s;
+        const m = /listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(s);
+        if (m) { base = "http://127.0.0.1:" + parseInt(m[1], 10); clearTimeout(t); resolve(); }
+      });
+    });
+    try {
+      const live = await (await fetch(base + "/api/config")).json();
+      assert(!!(live.backends || []).find((b) => b.id === "v34b"), "v34b) an unset apiKeyEnv does not stop startup");
+      assert(/backends\[0\]\.apiKeyEnv/.test(err) && /config warning/.test(err), "v34b2) the boot tolerance logs the apiKeyEnv field path as a warning");
+    } finally {
+      child.kill();
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  {
+    // v34c) BOOT tolerance on the REAL production shape: the live config
+    //       carries models.glm-5.2.retry === "" (a save-side error the loader
+    //       repairs by warning and deleting). Aborting a boot on it would have
+    //       taken the router down, so this exact shape must start and serve.
+    const dir = await mkdtemp(join(tmpdir(), "lmr-v34c-"));
+    const cfgPath = join(dir, "config.json");
+    const envPath = join(dir, ".env");
+    const cfgC = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "v34c", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_V34C" }],
+      models: { "v34cm": { providers: [{ backend: "v34c", upstream: "u" }], retry: "" } },
+      presets: {}
+    };
+    await writeFile(cfgPath, JSON.stringify(cfgC, null, 2));
+    await writeFile(envPath, "KEY_V34C=k\n");
+    const child = spawn(process.execPath, ["server.mjs"], {
+      cwd: join(import.meta.dirname),
+      env: { ...process.env, ROUTER_CONFIG: cfgPath, ROUTER_ENV: envPath },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let base = null;
+    let err = "";
+    await new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error("v34c server did not start (stderr tail: " + JSON.stringify(err.slice(-400)) + ")")), 8000);
+      child.stderr.on("data", (d) => {
+        const s = d.toString();
+        err += s;
+        const m = /listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(s);
+        if (m) { base = "http://127.0.0.1:" + parseInt(m[1], 10); clearTimeout(t); resolve(); }
+      });
+    });
+    try {
+      const live = await (await fetch(base + "/api/config")).json();
+      assert(!!(live.models && live.models.v34cm), "v34c) a model carrying retry:'' does not stop startup");
+      assert(/models\.v34cm\.retry/.test(err) && /config warning/.test(err), "v34c2) the retry:'' boot tolerance logs the field path as a warning");
+    } finally {
+      child.kill();
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  {
+    // v34d) BOOT abort, so the tolerance above cannot silently widen into
+    //       "nothing ever aborts". The fatal class is what the LOADER cannot
+    //       interpret: a non-object root, or a missing `backends` (ensureBackends
+    //       and the startup banner both walk cfg.backends unguarded). A missing
+    //       `models` or `presets` is NOT fatal, because normalizeConfig
+    //       synthesizes both, so a pre-presets-era config file keeps booting.
+    //
+    //       A missing `backends` also dies on the pre-change code, as an
+    //       incidental TypeError, so "exits without a banner" alone would pass
+    //       in BOTH directions and prove nothing. The assertion therefore
+    //       discriminates on the FAILURE MODE: the validator's field-path
+    //       message, and no TypeError. Waits for real process exit (a fixed
+    //       sleep could pass on timing alone); a timeout is a FAILURE, not a pass.
+    const dir = await mkdtemp(join(tmpdir(), "lmr-v34d-"));
+    const cfgPath = join(dir, "config.json");
+    const envPath = join(dir, ".env");
+    const cfgD = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      models: { "v34dm": { providers: [{ backend: "v34d", upstream: "u" }] } },
+      presets: {}
+      // `backends` deliberately absent.
+    };
+    await writeFile(cfgPath, JSON.stringify(cfgD, null, 2));
+    await writeFile(envPath, "KEY_V34D=k\n");
+    const child = spawn(process.execPath, ["server.mjs"], {
+      cwd: join(import.meta.dirname),
+      env: { ...process.env, ROUTER_CONFIG: cfgPath, ROUTER_ENV: envPath },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let banner = false;
+    let err = "";
+    child.stderr.on("data", (d) => {
+      const s = d.toString();
+      err += s;
+      if (/listening on http:\/\/127\.0\.0\.1:\d+/.test(s)) banner = true;
+    });
+    const exited = await new Promise((resolve) => {
+      const t = setTimeout(() => resolve("timeout"), 15000);
+      child.on("exit", (code) => { clearTimeout(t); resolve(code); });
+    });
+    try {
+      assert(
+        exited !== "timeout" && exited !== 0 && banner === false &&
+        /config invalid:/.test(err) && /'backends' is required at the top level/.test(err) &&
+        !/TypeError/.test(err),
+        "v34d) a config missing `backends` aborts startup with the validator's field-path message, not an incidental TypeError (exit=" + exited + ", banner=" + banner + ", stderr=" + JSON.stringify(err.slice(-240)) + ")"
+      );
+    } finally {
+      child.kill();
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  {
+    // v34e) BOOT tolerance for the two required keys the loader SYNTHESIZES.
+    //       `backends` is the only one normalizeConfig does not create, which is
+    //       why v34d can abort on it; a missing `presets` or `models` must still
+    //       start and serve. The legacy fixtures pin this incidentally (and fail
+    //       opaquely, at the first child, if it ever regresses); this pins the
+    //       modern shape directly and names the warning's field path.
+    for (const missing of ["presets", "models"]) {
+      const dir = await mkdtemp(join(tmpdir(), "lmr-v34e-" + missing + "-"));
+      const cfgPath = join(dir, "config.json");
+      const envPath = join(dir, ".env");
+      const cfgE = {
+        port: 0, prefix: "/v1", masterKeyEnv: null,
+        backends: [{ id: "v34e", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_V34E" }],
+        models: { "v34em": { providers: [{ backend: "v34e", upstream: "u" }] } },
+        presets: { "v34ep": { strategy: "affinity", models: ["v34em"] } }
+      };
+      delete cfgE[missing];
+      await writeFile(cfgPath, JSON.stringify(cfgE, null, 2));
+      await writeFile(envPath, "KEY_V34E=k\n");
+      const child = spawn(process.execPath, ["server.mjs"], {
+        cwd: join(import.meta.dirname),
+        env: { ...process.env, ROUTER_CONFIG: cfgPath, ROUTER_ENV: envPath },
+        stdio: ["ignore", "pipe", "pipe"]
+      });
+      let base = null;
+      let err = "";
+      await new Promise((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error("v34e (" + missing + ") did not start (stderr tail: " + JSON.stringify(err.slice(-400)) + ")")), 8000);
+        child.stderr.on("data", (d) => {
+          const s = d.toString();
+          err += s;
+          const m = /listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(s);
+          if (m) { base = "http://127.0.0.1:" + parseInt(m[1], 10); clearTimeout(t); resolve(); }
+        });
+      });
+      try {
+        const live = await (await fetch(base + "/api/config")).json();
+        assert(
+          missing === "presets" ? !!(live.models && live.models.v34em) : !!(live.backends || []).find((b) => b.id === "v34e"),
+          "v34e) a config with no `" + missing + "` still boots and serves"
+        );
+        assert(
+          new RegExp("not fatal at boot\\): " + missing + ": ").test(err),
+          "v34e2) the missing `" + missing + "` tolerance logs its boot warning at the " + missing + " path"
+        );
+      } finally {
+        child.kill();
+        await rm(dir, { recursive: true, force: true });
+      }
+    }
+  }
+
+  {
+    // v34f) BOOT abort for a NON-OBJECT ROOT: the other half of the fatal class
+    //       v34d pins. The `e.path === ""` branch is the only thing that stops
+    //       this shape; without it the run falls through to normalizeConfig and
+    //       ensureBackends and dies as an incidental TypeError (exit 1 with no
+    //       banner in BOTH directions), so the assertion discriminates on the
+    //       FAILURE MODE, exactly as v34d does for a missing `backends`.
+    const dir = await mkdtemp(join(tmpdir(), "lmr-v34f-"));
+    const cfgPath = join(dir, "config.json");
+    const envPath = join(dir, ".env");
+    await writeFile(cfgPath, JSON.stringify([{ id: "v34f" }], null, 2) + "\n");
+    await writeFile(envPath, "KEY_V34F=k\n");
+    const child = spawn(process.execPath, ["server.mjs"], {
+      cwd: join(import.meta.dirname),
+      env: { ...process.env, ROUTER_CONFIG: cfgPath, ROUTER_ENV: envPath },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let banner = false;
+    let err = "";
+    child.stderr.on("data", (d) => {
+      const s = d.toString();
+      err += s;
+      if (/listening on http:\/\/127\.0\.0\.1:\d+/.test(s)) banner = true;
+    });
+    const exited = await new Promise((resolve) => {
+      const t = setTimeout(() => resolve("timeout"), 15000);
+      child.on("exit", (code) => { clearTimeout(t); resolve(code); });
+    });
+    try {
+      assert(
+        exited !== "timeout" && exited !== 0 && banner === false &&
+        /config invalid:/.test(err) && /\(root\)/.test(err) &&
+        !/TypeError/.test(err),
+        "v34f) a non-object config root aborts startup with the validator's (root) message, not an incidental TypeError (exit=" + exited + ", banner=" + banner + ", stderr=" + JSON.stringify(err.slice(-240)) + ")"
+      );
+    } finally {
+      child.kill();
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
   // ---- z-series: three-layer routing (new-shape configs, mock backends) ----
 
   const BO = { rateLimitBaseMs: 50, rateLimitMaxMs: 200, serverBaseMs: 50, serverMaxMs: 200, authBaseMs: 50, authMaxMs: 200, weeklyDefaultMs: 1000 };
@@ -1080,8 +1487,9 @@ async function main() {
     }
   }
 
-  // z10) same-key precedence + reserved model: preset 0.2 > model 0.5, body 0.9
-  //      wins; params-layer `model` keys ignored; forwarded model = upstream.
+  // z10) same-key precedence + reserved model: the MODEL layer applies (0.5),
+  //      body 0.9 wins, params-layer `model` keys ignored, forwarded model =
+  //      upstream. The preset layer is gone: see the re-pin note below.
   {
     const z10 = mockBackend("z10", {});
     const portZ10 = await listen(z10.srv);
@@ -1095,16 +1503,49 @@ async function main() {
       presets: { "p10": { strategy: "affinity", models: ["m10"], params: { temperature: 0.2, model: "evil-preset" } } },
       backoff: BO,
     };
-    const { child: childZ10, base: baseZ10, dir: dirZ10 } = await startRouterCfg(cfgZ10, "KEY_Z10=test-key-z10\n");
+    // Spawned directly rather than through startRouterCfg so the child's stderr
+    // is available: the dropped preset params must be REPORTED, and reading that
+    // warning is half of what this block now pins.
+    const dirZ10 = await mkdtemp(join(tmpdir(), "lmr-z10-"));
+    const cfgZ10Path = join(dirZ10, "config.json");
+    const envZ10Path = join(dirZ10, ".env");
+    await writeFile(cfgZ10Path, JSON.stringify(cfgZ10, null, 2));
+    await writeFile(envZ10Path, "KEY_Z10=test-key-z10\n");
+    const childZ10 = spawn(process.execPath, ["server.mjs"], {
+      cwd: join(import.meta.dirname),
+      env: { ...process.env, ROUTER_CONFIG: cfgZ10Path, ROUTER_ENV: envZ10Path },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const z10Warnings = [];
+    let baseZ10 = null;
+    await new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error("z10 server did not start")), 8000);
+      childZ10.stderr.on("data", (d) => {
+        const s = d.toString();
+        z10Warnings.push(s);
+        const m = /listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(s);
+        if (m) { baseZ10 = "http://127.0.0.1:" + parseInt(m[1], 10); clearTimeout(t); resolve(); }
+      });
+    });
     try {
       await api(baseZ10, "/v1/chat/completions", { body: { model: "p10", messages: [], temperature: 0.9 } });
       const bodyWin = JSON.parse(z10.hits[z10.hits.length - 1].body);
       await api(baseZ10, "/v1/chat/completions", { body: { model: "p10", messages: [] } });
       const presetWin = JSON.parse(z10.hits[z10.hits.length - 1].body);
+      // RE-PINNED by Task 11 (dispatch ruling C): a SURVIVING non-identity preset
+      // carrying `params` has no v3 layer to merge it at, so the load pipeline's
+      // bridge drops it and says so. The old expectation here (preset 0.2 beats
+      // model 0.5) was the pre-bridge behaviour. The model layer still applies,
+      // the reserved `model` key is still ignored, and the loss is reported by
+      // the converter's own warning, which is asserted below rather than noted.
       assert(
         bodyWin.temperature === 0.9 && bodyWin.model === "deepseek-v4-flash" &&
-        presetWin.temperature === 0.2 && presetWin.model === "deepseek-v4-flash",
-        "z10) precedence body>preset>model; params-layer model ignored (" + JSON.stringify({ bodyWin, presetWin }) + ")"
+        presetWin.temperature === 0.5 && presetWin.model === "deepseek-v4-flash",
+        "z10) precedence body>model after the bridge (a preset-level params layer no longer exists in v3); params-layer model ignored (" + JSON.stringify({ bodyWin, presetWin }) + ")"
+      );
+      assert(
+        z10Warnings.some((w) => w.includes("p10") && /params dropped/.test(w)),
+        "z10b) the dropped preset params are REPORTED, naming the preset, not silently lost (" + JSON.stringify(z10Warnings.join("").split("\n").filter((l) => /warning/.test(l))) + ")"
       );
     } finally {
       childZ10.kill();
@@ -4548,7 +4989,7 @@ async function main() {
       await rr.text();
       assert(
         rr.status === 503 && badHits === 3,
-        "z21b) the last eligible provider is still retried (1 + 2 retries) before cooling (status=" + rr.status + ", badHits=" + badHits + ")"
+        "z21h) the last eligible provider is still retried (1 + 2 retries) before cooling (status=" + rr.status + ", badHits=" + badHits + ")"
       );
     } finally {
       childZ21b.kill();
@@ -4736,7 +5177,7 @@ async function main() {
     }
   }
 
-  // z21) unit-level: top-level strategy governs ordering over the EXPANDED
+  // z21e-z21g) unit-level: top-level strategy governs ordering over the EXPANDED
   //      list. failover through a nested preset's models in declared order;
   //      weighted keeps the top-level weight of the nested preset position.
   {
@@ -4763,20 +5204,20 @@ async function main() {
     assert(
       JSON.stringify(fo.models) === JSON.stringify(["m1", "m2", "m3", "m4"]) &&
       JSON.stringify(fo.ordered.map((o) => o.model)) === JSON.stringify(["m1", "m2", "m3", "m4"]),
-      "z21a) failover: nested presets expand in declared order, top-level strategy governs (" + JSON.stringify(fo.ordered.map((o) => o.model)) + ")"
+      "z21e) failover: nested presets expand in declared order, top-level strategy governs (" + JSON.stringify(fo.ordered.map((o) => o.model)) + ")"
     );
     // weighted: rng 0.01 -> glm band (weight 3) -> first model m1; rest weight
     // desc with declared-order tiebreak: m2 (glm's second), then os models.
     const cw = candidates(wcfg, "superW", "sess", () => 0.01);
     assert(
       JSON.stringify(cw.ordered.map((o) => o.model)) === JSON.stringify(["m1", "m2", "m3", "m4"]),
-      "z21b) weighted: nested preset refs carry top-level weight (" + JSON.stringify(cw.ordered.map((o) => o.model)) + ")"
+      "z21f) weighted: nested preset refs carry top-level weight (" + JSON.stringify(cw.ordered.map((o) => o.model)) + ")"
     );
     // nested preset's own strategy is ignored for ordering (os is affinity but
     // inside a failover parent it contributes declared order).
     assert(
       JSON.stringify(candidates(wcfg, "super", "sess").ordered.map((o) => o.backend)) === JSON.stringify(["b1", "b2", "b3", "b4"]),
-      "z21c) nested preset own strategy ignored: failover parent, declared order (" + JSON.stringify(candidates(wcfg, "super", "sess").ordered.map((o) => o.backend)) + ")"
+      "z21g) nested preset own strategy ignored: failover parent, declared order (" + JSON.stringify(candidates(wcfg, "super", "sess").ordered.map((o) => o.backend)) + ")"
     );
   }
 
@@ -4822,7 +5263,7 @@ async function main() {
     }
   }
 
-  // y1) session affinity from request body session fields (session_id / sessionId);
+  // y10-y12) session affinity from request body session fields (session_id / sessionId);
   //     x-session-id header still takes precedence over the body.
   {
     const srvA = mockBackend("sya", {});
@@ -4852,14 +5293,14 @@ async function main() {
       const b1a = await backendOf({ body: { ...baseOpts, session_id: "sy-body-1" } });
       const b1b = await backendOf({ body: { ...baseOpts, session_id: "sy-body-1" } });
       const b1c = await backendOf({ body: { ...baseOpts, session_id: "sy-body-1" } });
-      assert(b1a && b1a === b1b && b1b === b1c, "y1) body session_id binds one session to one backend (" + JSON.stringify([b1a, b1b, b1c]) + ")");
+      assert(b1a && b1a === b1b && b1b === b1c, "y10) body session_id binds one session to one backend (" + JSON.stringify([b1a, b1b, b1c]) + ")");
       const b2a = await backendOf({ body: { ...baseOpts, sessionId: "sy-case-1" } });
       const b2b = await backendOf({ body: { ...baseOpts, sessionId: "sy-case-1" } });
-      assert(b2a && b2a === b2b, "y2) body sessionId (camelCase) binds one session to one backend (" + JSON.stringify([b2a, b2b]) + ")");
+      assert(b2a && b2a === b2b, "y11) body sessionId (camelCase) binds one session to one backend (" + JSON.stringify([b2a, b2b]) + ")");
       const h1 = await backendOf({ body: { ...baseOpts, session_id: "sy-body-1" }, headers: { "x-session-id": "sy-head-1" } });
       const h2 = await backendOf({ body: { ...baseOpts, session_id: "sy-body-1" }, headers: { "x-session-id": "sy-head-1" } });
       const h3 = await backendOf({ body: { ...baseOpts }, headers: { "x-session-id": "sy-head-1" } });
-      assert(h1 && h1 === h2 && h2 === h3, "y3) x-session-id header wins over body session_id (" + JSON.stringify([h1, h2, h3]) + ")");
+      assert(h1 && h1 === h2 && h2 === h3, "y12) x-session-id header wins over body session_id (" + JSON.stringify([h1, h2, h3]) + ")");
     } finally {
       childSY.kill();
       srvA.srv.close(); srvB.srv.close();
@@ -5788,6 +6229,40 @@ async function main() {
       const r10b = await post("/api/config/reset", { snapshot: "nope.json" });
       assert(r10b.status === 404, "zCE10b) unknown snapshot -> 404 (got " + r10b.status + ")");
 
+      // reset hardening: the restore path is a SAVE-class write to the live
+      // file, so it runs the same validator against what is actually on disk
+      // and enforces the same lost-update guard. A snapshot is a config the
+      // browser asked us to restore, not an escape from the save contract.
+      const snaps35 = await (await fetch(baseCE + "/api/config/raw")).json();
+      // The newest snapshot is the pre-reset state zCE9 replaced, so its bytes
+      // DIFFER from the live file: any write on the refused path is visible.
+      const newerSnap = snaps35.snapshots[0];
+      const before35 = await rawOnDisk();
+      const r35 = await post("/api/config/reset", { snapshot: newerSnap, baseRevision: 1 });
+      const b35 = await r35.json();
+      assert(
+        r35.status === 409 && b35.error && b35.error.type === "conflict",
+        "v35a) stale baseRevision on reset -> 409 conflict (got " + r35.status + ")"
+      );
+      assert((await rawOnDisk()) === before35, "v35a2) a conflicted reset did not touch the live file");
+      const r35b = await post("/api/config/reset", { snapshot: newerSnap, baseRevision: 1, force: true });
+      assert(r35b.status === 200, "v35b) forced reset with guards passes (got " + r35b.status + ")");
+
+      // the startup-only key guard is part of the reset contract too: a snapshot
+      // that changes `port` is refused with the field path instead of being
+      // applied (validateConfig(restored, restored) made this vacuous).
+      const snapPort = JSON.parse(await rawOnDisk());
+      snapPort.port = 9999;
+      await writeFile(join(dirCE, "config.history", "v35-port.json"), JSON.stringify(snapPort, null, 2) + "\n");
+      const before35c = await rawOnDisk();
+      const r35c = await post("/api/config/reset", { snapshot: "v35-port.json", force: true });
+      const b35c = await r35c.json();
+      assert(
+        r35c.status === 400 && (b35c.errors || []).some((e) => e.path === "port"),
+        "v35c) a snapshot that changes a startup-only key is refused (400, got " + r35c.status + ", errors=" + JSON.stringify((b35c.errors || []).map((e) => e.path)) + ")"
+      );
+      assert((await rawOnDisk()) === before35c, "v35c2) a refused reset left the live file byte-identical");
+
       // CE11) secret hygiene: no apiKeyEnv VALUE appears in any response body
       const bodies = [
         JSON.stringify(raw1), JSON.stringify(b2), JSON.stringify(b4),
@@ -5795,9 +6270,1047 @@ async function main() {
       ].join("\n");
       assert(!bodies.includes("secret-value-a") && !bodies.includes("secret-value-b"), "zCE11a) no apiKeyEnv value leaks into any config response");
       assert(bodies.includes("KEY_CE_A"), "zCE11b) the env var NAME is still served (the UI needs it)");
+
+      // v39a)-v39f) bridge the WRITE half: saving and restoring go through the
+      // same conversion the loader already runs, so an old-shape payload can
+      // never land on disk as `providers` again. The two ways an old-shape
+      // write arrives are covered separately - a browser save (v39a/v39b) and a
+      // snapshot restore (v39e/v39f) - because they are independent entry
+      // points onto the same helper.
+      const draft39 = JSON.parse(await rawOnDisk());
+      draft39.models["bridge-probe"] = { providers: [{ backend: "ce-a", upstream: "u-probe" }] };
+      const r39 = await post("/api/config", { config: draft39, force: true });
+      const b39 = await r39.json();
+      assert(r39.status === 200, "v39a) old-shape save is accepted through the bridge (got " + r39.status + ", " + JSON.stringify(b39.errors || b39.error) + ")");
+      const disk39 = JSON.parse(await rawOnDisk());
+      assert(
+        !!disk39.models["bridge-probe"].deployments &&
+          disk39.models["bridge-probe"].providers === undefined &&
+          Object.values(disk39.models).every((m) => m.providers === undefined),
+        "v39b) a save writes v3, never a persisted `providers` block (" + JSON.stringify(disk39.models["bridge-probe"]) + ")"
+      );
+
+      // The bridge's own warnings reach the CALLER, not just the console: the
+      // Config tab can only tell the operator what it rewrote if the save
+      // response carries it. A repair nobody is told about is a silent edit of
+      // the operator's file. The payload is the block's ORIGINAL old-shape
+      // config - a clone of disk is already v3, so the bridge would not run and
+      // this would prove nothing - carrying a real error-class empty string in
+      // an object-typed position (`models[*].retry`), the exact editor artifact
+      // the production config shipped with: left alone it would 400 the save,
+      // and repaired silently it would rewrite the operator's file.
+      const draft39c = JSON.parse(JSON.stringify(cfgCE));
+      draft39c.models["bridge-probe"] = { providers: [{ backend: "ce-a", upstream: "u-probe" }], retry: "" };
+      const expectBridge39c = convertLegacyConfig(draft39c).warnings;
+      assert(expectBridge39c.length > 0, "v39c0) the repair fixture really makes the converter warn (" + JSON.stringify(expectBridge39c) + ")");
+      const r39c = await post("/api/config", { config: draft39c, force: true });
+      const b39c = await r39c.json();
+      assert(r39c.status === 200, "v39c1) the repaired save itself succeeds (got " + r39c.status + ", " + JSON.stringify(b39c.errors || b39c.error) + ")");
+      const gotBridge39c = (b39c.warnings || []).filter((w) => w.path === "(bridge)");
+      assert(
+        gotBridge39c.length === expectBridge39c.length && gotBridge39c.some((w) => String(w.message).includes("was an empty string")),
+        "v39c2) the save response reports EVERY bridge warning, the repair included (got " + JSON.stringify(gotBridge39c.map((w) => w.message)) + ", expected " + expectBridge39c.length + ")"
+      );
+      const disk39c = JSON.parse(await rawOnDisk());
+      assert(disk39c.models["bridge-probe"].retry === undefined, "v39c3) the repaired value is not on disk (" + JSON.stringify(disk39c.models["bridge-probe"]) + ")");
+      assert(disk39c.models["bridge-probe"].deployments !== undefined, "v39c4) the repair and the conversion land together, not one without the other");
+
+      // The one refusal the converter STILL has: a converted config whose id is
+      // both a model and a preset cannot be resolved by rule. The fixture is
+      // built from the block's ORIGINAL old-shape config - not from disk, which
+      // is v3 by now - and is deliberately free of every OTHER validator error,
+      // so the 400 below can only come from the bridge: at base an old-shape
+      // preset/model id collision passes as a warning and the snapshot is
+      // written straight through, which is the silent bypass this pair exists
+      // to catch.
+      const before39 = await rawOnDisk();
+      const collisionSnap = JSON.parse(JSON.stringify(cfgCE));
+      collisionSnap.presets["ce-model"] = { strategy: "failover", models: ["ce-model", "ce-preset"] };
+      collisionSnap.x13Marker = "refused-snapshot-marker";
+      await writeFile(join(dirCE, "config.history", "t13-collision.json"), JSON.stringify(collisionSnap, null, 2) + "\n");
+      // Anti-vacuity: if the fixture is not old-shape (a clone of disk would
+      // not be) the bridge never runs and the 400 below would prove nothing.
+      assert(
+        Object.values(collisionSnap.models).some((m) => Array.isArray(m.providers)),
+        "v39d0) the refusal fixture really is an old-shape document, so the bridge is what judges it"
+      );
+      const r39d = await post("/api/config/reset", { snapshot: "t13-collision.json", force: true });
+      const b39d = await r39d.json();
+      assert(
+        r39d.status === 400 && (b39d.errors || []).some((e) => String(e.message).includes("both a model and a preset")),
+        "v39d) a snapshot the conversion refuses is refused (400, got " + r39d.status + ", " + JSON.stringify(b39d.errors || b39d.error) + ")"
+      );
+      const after39 = await rawOnDisk();
+      assert(after39 === before39, "v39e) the refused restore left the live file byte-identical");
+      assert(after39.indexOf("refused-snapshot-marker") === -1, "v39f) no part of the refused snapshot reached the file");
+
+      // ...and the POSITIVE half, which is the actual gap: at base the restore
+      // wrote the snapshot's `providers` verbatim and the preset kept the
+      // v2-era `affinity` name, so a restored config was silently a shape the
+      // v3 branch would then reject. Cloned from the block's ORIGINAL old-shape
+      // fixture rather than from disk, because by now disk is already v3 and a
+      // clone of it could not fail these assertions.
+      const plainOld = JSON.parse(JSON.stringify(cfgCE));
+      plainOld.models["ce-extra"] = { providers: [{ backend: "ce-b", upstream: "u-extra" }] };
+      // `ce-preset` is an identity preset named exactly like a model, so the
+      // conversion drops it. That makes the warning count a property of the
+      // FIXTURE rather than of whatever the converter happens to say today,
+      // while the assertion still counts against an INDEPENDENT conversion
+      // instead of a hardcoded number that would drift.
+      plainOld.presets["ce-model"] = { strategy: "failover", models: ["ce-model"] };
+      await writeFile(join(dirCE, "config.history", "t13-plain-old.json"), JSON.stringify(plainOld, null, 2) + "\n");
+      const expectBridge39g = convertLegacyConfig(plainOld).warnings;
+      assert(expectBridge39g.length > 0, "v39j0) the restore fixture really makes the bridge warn (" + JSON.stringify(expectBridge39g) + ")");
+      const r39g = await post("/api/config/reset", { snapshot: "t13-plain-old.json", force: true });
+      const b39g = await r39g.json();
+      assert(r39g.status === 200, "v39g) a valid old-shape snapshot is restored through the bridge (got " + r39g.status + ", " + JSON.stringify(b39g.errors || b39g.error) + ")");
+      const restored39 = await readCfg();
+      assert(
+        !!restored39.models["ce-extra"].deployments && restored39.models["ce-extra"].providers === undefined,
+        "v39h) the restored file is v3, not the snapshot's own shape (" + JSON.stringify(restored39.models["ce-extra"]) + ")"
+      );
+      assert(restored39.presets["ce-preset"].strategy === "fallback", "v39i) the restored preset carries the v3 strategy name (" + JSON.stringify(restored39.presets["ce-preset"]) + ")");
+      assert(
+        (b39g.warnings || []).filter((w) => w.path === "(bridge)").length === expectBridge39g.length,
+        "v39j) every bridge warning the restore's conversion emits is reported to the caller (got " + JSON.stringify((b39g.warnings || []).map((w) => w.path + ":" + w.message)) + ", expected " + expectBridge39g.length + ")"
+      );
     } finally {
       childCE.kill();
       await rm(dirCE, { recursive: true, force: true });
+    }
+  }
+
+  // ---- legacy -> v3 bridge converter ----------------------------------------
+  // The converter is the only bridge between today's two-layer config and the
+  // three-layer shape, so its warnings are a contract: warn exactly when the
+  // conversion changes routing behavior, stay silent when it does not. The
+  // fixture also carries the three empty-string values the pre-fix config
+  // editor used to write, because no config in the repo carries them and the
+  // repair sweep would otherwise be unpinned.
+  {
+    // a served id is addressable when either layer still answers for it
+    const addressable = (cfg, id) => Boolean(cfg.models[id]) || Boolean(cfg.presets[id]);
+    const old = {
+      backends: [
+        { id: "b1", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_B1" },
+        { id: "b2", baseURL: "http://127.0.0.1:2", apiKeyEnv: "KEY_B2", params: "" },
+        { id: "b3", baseURL: "http://127.0.0.1:3", apiKeyEnv: "KEY_B3" }
+      ],
+      models: {
+        m1: { providers: [{ backend: "b1", upstream: "u" }, { backend: "b2", upstream: "u", params: "" }, { backend: "b3", upstream: "u" }], affinityPool: 2 },
+        "kimi-k3": { providers: [{ backend: "b1", upstream: "u" }] },
+        "glm-5.2": { providers: [{ backend: "b1", upstream: "u" }], retry: "" },
+        "qwen3.7-plus": { providers: [{ backend: "b1", upstream: "u" }] }
+      },
+      presets: {
+        "kimi-k3": { strategy: "affinity", models: [{ model: "kimi-k3", weight: 1 }] },
+        w: { strategy: "weighted", models: ["m1"] },
+        tier: { strategy: "failover", models: ["m1", "kimi-k3"] },
+        amulti: { strategy: "affinity", models: ["m1", "kimi-k3"] },
+        "muse-spark-1.3-contributor": { strategy: "affinity", models: ["glm-5.2"], params: "" },
+        // the live config's actual shape: the empty-string preset params sits on
+        // an IDENTITY preset, which step 1 deletes. Only the repair pass BEFORE
+        // the mapping step can report it - the mapping step never sees it.
+        "qwen3.7-plus": { strategy: "affinity", models: [{ model: "qwen3.7-plus", weight: 1 }], params: "" }
+      },
+      params: { temperature: 0.2 },
+      backoff: { serverBaseMs: 50 }
+    };
+    const r = convertLegacyConfig(old);
+    assert(r.config.models.m1.deployments.length === 3, "v36a) providers map 1:1 to deployments");
+    assert(r.config.models.m1.deployments[2].backupOnly === true, "v36b) affinityPool 2 of 3 marks providers[2..] backupOnly");
+    assert(!r.config.presets["kimi-k3"], "v36c) identity preset dropped, model stays addressable");
+    assert(r.config.presets.w.strategy === "fallback", "v36d) weighted preset maps to fallback silently (order preserved; per-ref weights warned separately)");
+    assert(r.warnings.some((w) => w.includes("kimi-k3")), "v36e) identity drop warned first");
+    assert(r.config.params.temperature === 0.2 && r.config.backoff.serverBaseMs === 50, "v36f) untouched blocks carried through");
+    // Warn ONLY on behavior changes: an affinity preset with MORE THAN ONE ref
+    // loses its session spread under ordered fallback. The live mirror's five
+    // affinity presets are each single-ref, so none is a behavior change (the
+    // three that are identity presets fell to step 1, and the two aliases keep
+    // behaving exactly as before). failover->fallback and weighted->fallback
+    // preserve declared order, so they stay silent.
+    assert(r.warnings.some((w) => w.includes("amulti")), "v36g) affinity multi-model preset warns (session-spread lost)");
+    assert(!r.warnings.some((w) => w.includes("'tier'")), "v36h) failover->fallback does not warn (order preserved)");
+    assert(!r.warnings.some((w) => w.includes("'w'") && w.includes("strategy")), "v36i) weighted->fallback does not warn (order preserved)");
+    // the empty-string repair sweep: the pre-fix editor wrote "" for any JSON
+    // textarea it rendered empty, and a model-level retry/params "" is a
+    // save-mode ERROR that blocks EVERY save (the whole candidate is
+    // validated), so the sweep has to drop every position it can reach.
+    assert(r.config.models["glm-5.2"].retry === undefined, "v36j) a model-level empty-string retry is dropped");
+    assert(old.backends[1].params === "", "v36k2) the sweep does not mutate its input");
+    assert(r.config.backends[1].params === undefined, "v36k) a backend-level empty-string params is dropped");
+    assert(r.config.models.m1.deployments[1].params === undefined, "v36k3) a DEPLOYMENT-level empty-string params is dropped (the provider position maps into the deployment)");
+    assert(r.config.presets["muse-spark-1.3-contributor"].params === undefined, "v36l) a preset-level empty-string params is dropped");
+    assert(
+      r.warnings.filter((w) => w.includes("was an empty string")).length === 5,
+      "v36m) every repaired value warns, all five from one shared sentence (" + JSON.stringify(r.warnings.filter((w) => w.includes("was an empty string"))) + ")"
+    );
+    // the repair pass runs BEFORE the identity drop and before the mapping step.
+    // The live config's shape is exactly this: an empty-string preset params on
+    // a preset that is ALSO an identity preset, so the mapping step never sees
+    // it. Only this assertion makes the early pass load-bearing - with the
+    // mapping step's own silent delete in place, the drop is otherwise invisible.
+    const idRepair = r.warnings.filter((w) => w.includes("presets.qwen3.7-plus.params"));
+    assert(
+      idRepair.length === 1 && idRepair[0].endsWith("was an empty string (an older config editor wrote it); dropped - it was already ignored at runtime"),
+      "v36m2) an empty-string params on an IDENTITY preset is still repaired and reported (" + JSON.stringify(idRepair) + ")"
+    );
+    assert(
+      !r.config.presets["qwen3.7-plus"] && r.config.models["qwen3.7-plus"],
+      "v36m3) and that preset is still dropped as an identity, its id served by the model"
+    );
+    assert(
+      r.warnings.filter((w) => w.includes("presets.muse-spark-1.3-contributor.params")).length === 1,
+      "v36m4) a surviving preset's repair is reported exactly once (no double warn)"
+    );
+    // a non-object preset params (e.g. the number 5, which validateConfig
+    // rejects outright) must not survive conversion either: the repair pass
+    // owns empty strings and the mapping step owns everything else present.
+    const oddPreset = JSON.parse(JSON.stringify(old));
+    oddPreset.presets.tier.params = 5;
+    const r3 = convertLegacyConfig(oddPreset);
+    assert(r3.config.presets.tier.params === undefined, "v36m5) a non-object preset params is dropped by the mapping step");
+    // step 5: a collision that survives the identity drop is refused, not guessed.
+    let refused = null;
+    try {
+      const clash = JSON.parse(JSON.stringify(old));
+      clash.presets.tier.models = ["m1", "tier"];
+      clash.models.tier = { providers: [{ backend: "b1", upstream: "u" }] };
+      convertLegacyConfig(clash);
+    } catch (e) {
+      refused = e;
+    }
+    assert(refused && /conversion refused/.test(refused.message) && refused.message.includes("'tier'"), "v36n) a residual model/preset collision is refused");
+    assert(r.config.models.m1.exposed === true && r.config.presets.w.exposed === true, "v36o) converted entries default to exposed");
+    // Structural completeness: the conversion FINISHED rather than merely ran.
+    // v3-only validator checks are Task 10b's, so what this block can pin today
+    // is that no legacy key survived anywhere and no empty-string artifact did
+    // either. Scope note: the sweep is defined over the value positions the
+    // converter owns (backend, model, deployment, preset), NOT over arbitrary
+    // nested UI data - a nested `meta.pricing.offPeak: ""` in the live file is
+    // deliberately left alone (it is only ever read as === true), so this
+    // assertion is about the fixture's value positions, not a global property.
+    {
+      const emptyAt = [];
+      const walk = (obj, at) => {
+        if (!obj || typeof obj !== "object") return;
+        for (const [k, v] of Object.entries(obj)) {
+          if (v === "") emptyAt.push(at + "." + k);
+          else if (v && typeof v === "object") walk(v, at + "." + k);
+        }
+      };
+      walk(r.config, "config");
+      assert(emptyAt.length === 0, "v36p) no empty-string value survives at any value position of the fixture (" + JSON.stringify(emptyAt) + ")");
+      const legacy = [];
+      for (const [id, m] of Object.entries(r.config.models)) {
+        if (m.providers !== undefined) legacy.push("models." + id + ".providers");
+        if (m.affinityPool !== undefined) legacy.push("models." + id + ".affinityPool");
+        if (!Array.isArray(m.deployments) || !m.deployments.length) legacy.push("models." + id + ".deployments");
+        else {
+          m.deployments.forEach((d, i) => {
+            if (typeof d.backend !== "string" || !d.backend) legacy.push("models." + id + ".deployments[" + i + "].backend");
+            if (typeof d.upstream !== "string" || !d.upstream) legacy.push("models." + id + ".deployments[" + i + "].upstream");
+          });
+        }
+      }
+      for (const [id, p] of Object.entries(r.config.presets)) {
+        if (p.strategy !== "fallback") legacy.push("presets." + id + ".strategy=" + p.strategy);
+        if (p.members !== undefined) legacy.push("presets." + id + ".members");
+        if (p.models.some((e) => typeof e !== "string")) legacy.push("presets." + id + ".models[non-string]");
+      }
+      assert(legacy.length === 0, "v36q) every model is v3-shaped and every preset is fallback with string refs (" + JSON.stringify(legacy) + ")");
+      // exposed defaults where absent and is PRESERVED where already set.
+      const withFlag = JSON.parse(JSON.stringify(old));
+      withFlag.models.m1.exposed = false;
+      withFlag.presets.w.exposed = false;
+      const r2 = convertLegacyConfig(withFlag);
+      assert(r2.config.models.m1.exposed === false && r2.config.presets.w.exposed === false, "v36r) an existing exposed:false is preserved, not overwritten");
+    }
+    // Step 1 is what makes a 20-collision production config convertible, so its
+    // arithmetic is pinned directly: every identity preset goes, and every
+    // model-level id it used to shadow stays addressable.
+    assert(Object.keys(r.config.presets).length === 4, "v36s) exactly the identity preset was dropped (" + Object.keys(r.config.presets).join(",") + ")");
+    assert(
+      Object.keys(old.presets).every((id) => addressable(r.config, id)),
+      "v36t) every preset id dropped as an identity stays served by the same-named model"
+    );
+  }
+
+  // ---- v3 typed validation ---------------------------------------------------
+  // A config whose shape is v3 (detected by at least one model carrying
+  // `deployments`) is checked under v3 rules. The pre-v3 path is untouched: its
+  // strategy allowlist, its collision WARN and its `providers` requirement all
+  // still apply to a config that has not migrated, which the last four
+  // assertions here characterize.
+  {
+    const savedKeyB1 = process.env.KEY_B1;
+    process.env.KEY_B1 = "x";
+    try {
+      const base = () => ({
+        backends: [{ id: "b1", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_B1", idleTimeoutMs: 5000, connectTimeoutMs: 2000, model: "bridge-era-upstream" }],
+        models: { m1: { deployments: [{ backend: "b1", upstream: "u" }], exposed: true } },
+        presets: { p1: { strategy: "fallback", models: ["m1"], exposed: true } }
+      });
+      const bad1 = base(); bad1.models.m1.deployments = [];
+      assert(validateConfig(bad1, bad1).errors.some((e) => e.path === "models.m1.deployments"), "v36xa) empty deployments is an error");
+      const bad2 = base(); bad2.models.m1.deployments = [{ backend: "ghost", upstream: "u" }];
+      assert(validateConfig(bad2, bad2).errors.some((e) => e.path === "models.m1.deployments[0].backend"), "v36xb) unknown deployment backend ref is an error");
+      const bad3 = base(); bad3.models.m1.deployments = [{ backend: "b1", upstream: "" }];
+      assert(validateConfig(bad3, bad3).errors.some((e) => e.path === "models.m1.deployments[0].upstream"), "v36xc) empty upstream is an error");
+      const bad4 = base(); bad4.models.m1.deployments = [{ backend: "b1", upstream: "u", weight: "abc" }];
+      assert(validateConfig(bad4, bad4).errors.some((e) => e.path === "models.m1.deployments[0].weight"), "v36xd) non-integer weight is an error");
+      const bad5 = base(); bad5.models.m1.deployments = [{ backend: "b1", upstream: "u", backupOnly: "yes" }];
+      assert(validateConfig(bad5, bad5).errors.some((e) => e.path === "models.m1.deployments[0].backupOnly"), "v36xe) non-boolean backupOnly is an error");
+      const bad5e = base(); bad5e.models.m1.exposed = "yes";
+      assert(validateConfig(bad5e, bad5e).errors.some((e) => e.path === "models.m1.exposed"), "v36xk) non-boolean model exposed is an error");
+      const bad6 = base(); bad6.presets.p1.strategy = "affinity";
+      const v6 = validateConfig(bad6, bad6);
+      assert(v6.errors.length === 0 && v6.warnings.some((w) => w.path === "presets.p1.strategy"), "v36xf) v3 non-fallback strategy warns only (the bridge already mapped the legacy shapes)");
+      const good = base();
+      const vg = validateConfig(good, good);
+      assert(vg.errors.length === 0 && vg.warnings.length === 0, "v36xg) known backend fields (idleTimeoutMs/connectTimeoutMs + bridge-era model) never warn (" + JSON.stringify(vg.warnings) + ")");
+      const coll = base(); coll.presets.m1 = { strategy: "fallback", models: ["m1"], exposed: true };
+      assert(validateConfig(coll, coll).errors.some((e) => e.path === "presets.m1"), "v36xh) v3-shaped collision is an error (G1 XOR)");
+      // Pre-v3 input must NOT hit the v3 branch: affinity/failover/weighted stay
+      // silent here, and nothing the v3 branch adds may appear at a strategy path.
+      const old = { backends: base().backends, models: { "m1": { providers: [{ backend: "b1", upstream: "u" }] } }, presets: { "p1": { strategy: "affinity", models: ["m1"] } } };
+      assert(!validateConfig(old, old).warnings.some((w) => w.path === "presets.p1.strategy"), "v36xi) old-shape strategy untouched by the v3 warn set");
+      // The other half of the warn-set narrowing, stated truthfully: what the
+      // pre-v3 path keeps silent is affinity/failover/weighted. A pre-v3 preset
+      // spelled `strategy: "fallback"` warns TODAY, because `fallback` is the v3
+      // name and the old allowlist does not know it - and that pre-existing
+      // verdict must not change (old shapes keep their behaviour exactly).
+      const legacy4 = {
+        backends: base().backends,
+        models: { "m1": { providers: [{ backend: "b1", upstream: "u" }] } },
+        presets: {
+          "la": { strategy: "affinity", models: ["m1"] },
+          "lf": { strategy: "failover", models: ["m1"] },
+          "lw": { strategy: "weighted", models: ["m1"] },
+          "lb": { strategy: "fallback", models: ["m1"] }
+        }
+      };
+      const vj = validateConfig(legacy4, legacy4);
+      const stratPaths = vj.warnings.filter((w) => /\.strategy$/.test(w.path)).map((w) => w.path);
+      assert(
+        !stratPaths.some((p) => p !== "presets.lb.strategy"),
+        "v36xj) old-shape input keeps affinity/failover/weighted silent and no v3 strategy warn leaks into the pre-v3 path (" + JSON.stringify(stratPaths) + ")"
+      );
+      assert(
+        stratPaths.length === 1 && stratPaths[0] === "presets.lb.strategy",
+        "v36xj2) characterization: 'fallback' on a PRE-v3 preset keeps exactly its one pre-existing v2 'unknown strategy' warning (" + JSON.stringify(stratPaths) + ")"
+      );
+      // v3 parity for the typed positions the pre-v3 path checks on a provider:
+      // a deployment now holds them, so the same values are errors there.
+      const badp = base(); badp.models.m1.deployments = [{ backend: "b1", upstream: "u", params: 5 }];
+      assert(validateConfig(badp, badp).errors.some((e) => e.path === "models.m1.deployments[0].params"), "v36xl2) a non-object deployment params is an error (parity with the pre-v3 provider check)");
+      const badpe = base(); badpe.presets.p1.exposed = "yes";
+      assert(validateConfig(badpe, badpe).errors.some((e) => e.path === "presets.p1.exposed"), "v36xl) non-boolean preset exposed is an error");
+      // The detection boundary, pinned rather than accidental: at least one model
+      // with `deployments` puts the WHOLE config under v3 rules. For a
+      // hand-written mixture the honest verdict is the error below, not a silent
+      // pass - the pre-migration entry has no deployments, so a v3 router cannot
+      // route it, and validating each entry under its own shape would accept a
+      // file that only half works. A converted payload is purely v3 (the bridge
+      // converts or refuses), so this only bites input that skipped the bridge.
+      const mixed = () => ({
+        backends: base().backends,
+        models: {
+          "v3m": { deployments: [{ backend: "b1", upstream: "u" }], exposed: true },
+          "oldm": { providers: [{ backend: "b1", upstream: "u" }] }
+        },
+        presets: { "pm": { strategy: "fallback", models: ["v3m", "oldm"], exposed: true } }
+      });
+      const mixedVerdict = validateConfig(mixed(), mixed());
+      assert(
+        mixedVerdict.errors.some((e) => e.path === "models.oldm.deployments") &&
+          !mixedVerdict.errors.some((e) => e.path.startsWith("models.v3m") || e.path === "models.oldm.providers"),
+        "v36xm) a MIXED config is validated config-wide as v3: the unmigrated model errors at models.oldm.deployments, the v3 model is clean, and the pre-v3 `providers` requirement is NOT applied (" + JSON.stringify(mixedVerdict.errors.map((e) => e.path)) + ")"
+      );
+      const m2 = mixed();
+      const swapped = { backends: m2.backends, models: { "oldm": m2.models.oldm, "v3m": m2.models.v3m }, presets: m2.presets };
+      const swappedVerdict = validateConfig(swapped, swapped);
+      assert(
+        JSON.stringify(swappedVerdict.errors.map((e) => e.path)) === JSON.stringify(mixedVerdict.errors.map((e) => e.path)),
+        "v36xm2) detection is order-independent: the same mixture in the other order gives the same verdict (" + JSON.stringify(swappedVerdict.errors.map((e) => e.path)) + ")"
+      );
+      // *** THE DEFERRED ZERO-ERROR CRITERION (Task 10's acceptance criterion, closed here). ***
+      // The bridge and the validator must AGREE end to end: a pre-v3 config runs
+      // through convertLegacyConfig and is then validated in SAVE mode - the mode
+      // POST /api/config uses - and must report ZERO errors, including the shape
+      // and env classes that were the only ones left when this criterion was
+      // deferred. The apiKeyEnv name stands in the process above. The fixture
+      // carries the pre-fix editor's empty-string artifacts on purpose, since
+      // their repair is what keeps every later save from being blocked.
+      const legacy = {
+        backends: [{ id: "b1", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_B1", idleTimeoutMs: 5000, connectTimeoutMs: 2000, model: "bridge-era-upstream" }],
+        models: {
+          "m1": { providers: [{ backend: "b1", upstream: "u" }, { backend: "b1", upstream: "u2" }], affinityPool: 1 },
+          "m2": { providers: [{ backend: "b1", upstream: "u" }], retry: "" }
+        },
+        presets: {
+          "m1": { strategy: "affinity", models: [{ model: "m1", weight: 1 }] },
+          "p1": { strategy: "failover", models: ["m1", "m2"], params: "" }
+        },
+        params: { temperature: 0.2 }
+      };
+      const converted = convertLegacyConfig(legacy);
+      const vc = validateConfig(converted.config, converted.config);
+      assert(
+        vc.errors.length === 0,
+        "v36xn) a converted pre-v3 config validates in SAVE mode with ZERO errors - the bridge and the validator agree (" + JSON.stringify(vc.errors) + "; validator warnings " + JSON.stringify(vc.warnings) + ")"
+      );
+    } finally {
+      if (savedKeyB1 === undefined) delete process.env.KEY_B1;
+      else process.env.KEY_B1 = savedKeyB1;
+    }
+  }
+
+  // ---- v37) the DUAL-SHAPE load pipeline -----------------------------------
+  // loadConfig must convert an old-shape file in memory BEFORE validating and
+  // normalizing it, so one loader serves both eras. Every assertion below runs
+  // on a config THIS BLOCK builds and hands to a child process or calls
+  // directly; none of them reads config.json, so the working-tree mirror and
+  // the committed mirror cannot change a result.
+  {
+    // v37a)-v37d) the real load path: an old-shape temp config is served as v3
+    // by /api/config, which is what proves `cfg = effective` (the router, not
+    // just the converter, holds the converted form).
+    const dir = await mkdtemp(join(tmpdir(), "lmr-v37-"));
+    const cfgPath = join(dir, "config.json");
+    const envPath = join(dir, ".env");
+    const old = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "v37a", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_V37" },
+        { id: "v37b", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_V37" },
+        { id: "v37c", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_V37" }
+      ],
+      models: {
+        v37m: {
+          providers: [
+            { backend: "v37a", upstream: "u1", params: { temperature: 0.5 }, dropParams: ["logit_bias"], paramMap: { max_tokens: "max_output_tokens" } },
+            { backend: "v37b", upstream: "u2", weight: 3 },
+            { backend: "v37c", upstream: "u3" }
+          ],
+          affinityPool: 2
+        }
+      },
+      presets: { v37p: { strategy: "affinity", models: ["v37m"] } }
+    };
+    await writeFile(cfgPath, JSON.stringify(old, null, 2));
+    await writeFile(envPath, "KEY_V37=k\n");
+    const child = spawn(process.execPath, ["server.mjs"], {
+      cwd: join(import.meta.dirname),
+      env: { ...process.env, ROUTER_CONFIG: cfgPath, ROUTER_ENV: envPath },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let base = null;
+    let childErr = "";
+    await new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error("v37 child did not start (stderr tail: " + JSON.stringify(childErr.slice(-400)) + ")")), 8000);
+      child.stderr.on("data", (d) => {
+        const s = d.toString();
+        childErr += s;
+        const m = /listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(s);
+        if (m) { base = "http://127.0.0.1:" + parseInt(m[1], 10); clearTimeout(t); resolve(); }
+      });
+    });
+    try {
+      const live = await (await fetch(base + "/api/config")).json();
+      const deps = live.models && live.models.v37m ? live.models.v37m.deployments : null;
+      assert(
+        Array.isArray(deps) && deps.length === 3 && deps.map((d) => d.backend).join(",") === "v37a,v37b,v37c" &&
+          deps[0].upstream === "u1" && deps[1].upstream === "u2" && deps[2].upstream === "u3",
+        "v37a) the ROUTER holds the converted v3 form: /api/config serves models.v37m as 3 deployments in declared order (" + JSON.stringify(live.models && live.models.v37m) + ")"
+      );
+      assert(
+        live.models.v37m.providers === undefined && live.models.v37m.affinityPool === undefined,
+        "v37b) the legacy keys are gone from the served model, not merged alongside the deployments"
+      );
+      assert(
+        deps && deps[2].backupOnly === true && deps[0].backupOnly === undefined && deps[1].backupOnly === undefined,
+        "v37c) affinityPool 2 marks only the providers past the pool as backupOnly (" + JSON.stringify(deps && deps.map((d) => d.backupOnly)) + ")"
+      );
+      assert(
+        deps && deps[1].weight === 3 && deps[0].weight === undefined &&
+          JSON.stringify(deps[0].params) === "{\"temperature\":0.5}" &&
+          JSON.stringify(deps[0].dropParams) === "[\"logit_bias\"]" &&
+          JSON.stringify(deps[0].paramMap) === "{\"max_tokens\":\"max_output_tokens\"}",
+        "v37d) per-provider weight/params/dropParams/paramMap carry onto the deployments (" + JSON.stringify(deps && deps[0]) + ")"
+      );
+      assert(
+        live.presets.v37p.strategy === "fallback",
+        "v37e) the served preset strategy is the v3 'fallback' AFTER normalizeConfig, not rewritten to a legacy value (" + JSON.stringify(live.presets.v37p) + ")"
+      );
+      assert(
+        live.presets.v37p.models.length === 1 && live.presets.v37p.models[0].model === "v37m",
+        "v37f) the served preset still resolves to the same model id (" + JSON.stringify(live.presets.v37p.models) + ")"
+      );
+    } finally {
+      child.kill();
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  {
+    // v37g) R8(b): `providers: []` becomes `deployments: []`, which the v3
+    // validator refuses in SAVE mode (the pre-v3 path only WARNED). The bridge
+    // therefore moves this case across the reload-rejection boundary, and the
+    // boot path must stay NON-FATAL for it (path models.<id>.deployments is not
+    // in the loader's fatal set), so the router still starts.
+    const dir = await mkdtemp(join(tmpdir(), "lmr-v37e-"));
+    const cfgPath = join(dir, "config.json");
+    const envPath = join(dir, ".env");
+    const empty = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "v37e", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_V37E" }],
+      models: { v37em: { providers: [] } },
+      presets: { v37ep: { strategy: "failover", models: ["v37em"] } }
+    };
+    await writeFile(cfgPath, JSON.stringify(empty, null, 2));
+    await writeFile(envPath, "KEY_V37E=k\n");
+    const conv = convertLegacyConfig(empty);
+    const saveVerdict = validateConfig(conv.config, conv.config, { mode: "save" });
+    assert(
+      Array.isArray(conv.config.models.v37em.deployments) && conv.config.models.v37em.deployments.length === 0 &&
+        saveVerdict.errors.some((e) => e.path === "models.v37em.deployments"),
+      "v37g) an empty providers array converts to an empty deployments array that SAVE mode refuses (" + JSON.stringify(saveVerdict.errors.map((e) => e.path)) + ")"
+    );
+    const child = spawn(process.execPath, ["server.mjs"], {
+      cwd: join(import.meta.dirname),
+      env: { ...process.env, ROUTER_CONFIG: cfgPath, ROUTER_ENV: envPath },
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let base = null;
+    let childErr = "";
+    try {
+      await new Promise((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error("v37g child did not start (stderr tail: " + JSON.stringify(childErr.slice(-400)) + ")")), 8000);
+        child.stderr.on("data", (d) => {
+          const s = d.toString();
+          childErr += s;
+          const m = /listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(s);
+          if (m) { base = "http://127.0.0.1:" + parseInt(m[1], 10); clearTimeout(t); resolve(); }
+        });
+      });
+      assert(
+        /not fatal at boot\): models\.v37em\.deployments: /.test(childErr),
+        "v37g2) BOOT stays non-fatal for the empty-deployments error and names its path (stderr tail: " + JSON.stringify(childErr.slice(-300)) + ")"
+      );
+      const live = await (await fetch(base + "/api/config")).json();
+      assert(!!live.backends.find((b) => b.id === "v37e"), "v37g3) the router really is up and serving the config after that non-fatal error");
+    } finally {
+      child.kill();
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  {
+    // v37h)-v37j) R6: normalizeConfig is DUAL-SHAPE. A v3 model must not be
+    // synthesized into `providers`, must not acquire `affinityPool`, and its
+    // preset must keep the v3 'fallback' strategy; a legacy model in the same
+    // config keeps its exact current treatment.
+    const v3 = {
+      backends: [{ id: "v37n" }],
+      models: {
+        v37nm: { deployments: [{ backend: "v37n", upstream: "u", weight: 2 }], exposed: false },
+        v37lm: { providers: [{ backend: "v37n", upstream: "u" }], affinityPool: 2 }
+      },
+      presets: {
+        v37np: { strategy: "fallback", models: ["v37nm"], exposed: true },
+        v37lp: { strategy: "failover", models: ["v37lm"] }
+      }
+    };
+    normalizeConfig(v3);
+    assert(
+      v3.models.v37nm.deployments.length === 1 && v3.models.v37nm.deployments[0].weight === 2 &&
+        v3.models.v37nm.deployments[0].backend === "v37n" && v3.models.v37nm.exposed === false,
+      "v37h) the v3 model survives normalize byte-for-byte (" + JSON.stringify(v3.models.v37nm) + ")"
+    );
+    assert(
+      v3.models.v37nm.providers === undefined && v3.models.v37nm.affinityPool === undefined,
+      "v37i) normalize writes NO legacy key onto a v3 model (" + JSON.stringify(Object.keys(v3.models.v37nm)) + ")"
+    );
+    assert(
+      v3.presets.v37np.strategy === "fallback" && v3.presets.v37np.models.length === 1 &&
+        v3.presets.v37np.models[0].model === "v37nm" && v3.presets.v37np.models[0].weight === 1 &&
+        v3.presets.v37np.exposed === true,
+      "v37j) the v3 preset keeps 'fallback' and its ref, with the ref normalized to {model, weight} (" + JSON.stringify(v3.presets.v37np) + ")"
+    );
+    assert(
+      Array.isArray(v3.models.v37lm.providers) && v3.models.v37lm.providers.length === 1 && v3.models.v37lm.providers[0].backend === "v37n" &&
+        v3.models.v37lm.affinityPool === 2 && v3.models.v37lm.deployments === undefined &&
+        v3.presets.v37lp.strategy === "failover",
+      "v37j2) the LEGACY entry in the same config keeps its current treatment (dual-shape, not v3-only) (" + JSON.stringify(v3.models.v37lm) + ")"
+    );
+  }
+
+  {
+    // v37k)-v37m) R5, the M-4 obligation: three structurally malformed entries
+    // used to raise a RAW TypeError out of the converter, which the new load
+    // path would turn into a router crash instead of a refusal. Each must PASS
+    // THROUGH UNTOUCHED so the VALIDATOR names it, and the load verdict (which
+    // is what loadConfig logs and what decides boot-vs-reject) must carry that
+    // path.
+    const malformed = (models, presets) => ({
+      backends: [{ id: "v37k", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_V37K" }],
+      models,
+      presets
+    });
+    const cases = [
+      ["presets: {x: null}", malformed({ v37km: { providers: [{ backend: "v37k", upstream: "u" }] } }, { x: null }), "presets.x"],
+      ["presets: {x: 5}", malformed({ v37km: { providers: [{ backend: "v37k", upstream: "u" }] } }, { x: 5 }), "presets.x"],
+      ["providers: [null]", malformed({ v37km: { providers: [null] } }, { v37kp: { strategy: "affinity", models: ["v37km"] } }), "models.v37km.deployments[0]"]
+    ];
+    for (const [label, raw, path] of cases) {
+      let conv = null;
+      let threw = null;
+      try {
+        conv = convertLegacyConfig(raw);
+      } catch (e) {
+        threw = e;
+      }
+      const verdict = conv ? validateConfig(conv.config, conv.config, { mode: "load" }) : { errors: [] };
+      assert(
+        threw === null && verdict.errors.some((e) => e.path === path),
+        "v37k) " + label + " converts without throwing and the LOAD verdict names " + path +
+          " (threw " + (threw ? threw.constructor.name + ": " + threw.message : "no") + "; errors " + JSON.stringify(verdict.errors.map((e) => e.path)) + ")"
+      );
+    }
+    // The malformed entry is not DROPPED either: the operator's bytes survive
+    // into the payload the validator judges, and the boot abort set (a non-object
+    // root, or a missing/non-array backends) does not include any of these paths.
+    const kept = convertLegacyConfig(malformed({ v37km: { providers: [{ backend: "v37k", upstream: "u" }] } }, { x: null }));
+    const nonFatal = validateConfig(kept.config, kept.config, { mode: "load" }).errors.every((e) => e.path !== "" && e.path !== "backends");
+    assert(
+      kept.config.presets.x === null && nonFatal,
+      "v37l) the malformed preset survives the converter untouched and its error is outside the boot-abort set (" + JSON.stringify(kept.config.presets.x) + ")"
+    );
+    const keptProviders = convertLegacyConfig(malformed({ v37km: { providers: [null] } }, {}));
+    const nonFatal2 = validateConfig(keptProviders.config, keptProviders.config, { mode: "load" }).errors.every((e) => e.path !== "" && e.path !== "backends");
+    assert(
+      keptProviders.config.models.v37km.deployments.length === 1 && keptProviders.config.models.v37km.deployments[0] === null && nonFatal2,
+      "v37m) the null provider survives as a null deployment (not dropped, not thrown on) and its error is outside the boot-abort set (" + JSON.stringify(keptProviders.config.models.v37km.deployments) + ")"
+    );
+  }
+
+  {
+    // v37n)-v37o) R8(a): a model carrying BOTH providers and deployments loses
+    // the hand-written v3 deployments to converter step 4. The behaviour is kept
+    // (it cannot arise from production, where the file is old-shape throughout);
+    // the goal here is that the loss is VISIBLE, naming the model.
+    const both = convertLegacyConfig({
+      backends: [{ id: "v37n", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_V37N" }],
+      models: {
+        v37bm: {
+          providers: [{ backend: "v37n", upstream: "from-providers" }],
+          deployments: [{ backend: "v37n", upstream: "from-deployments", backupOnly: true }]
+        }
+      },
+      presets: { v37bp: { strategy: "fallback", models: ["v37bm"], exposed: true } }
+    });
+    assert(
+      both.config.models.v37bm.deployments.length === 1 &&
+        both.config.models.v37bm.deployments[0].upstream === "from-providers" &&
+        both.config.models.v37bm.deployments[0].backupOnly === undefined,
+      "v37n) providers still win and the hand-written deployments are discarded (" + JSON.stringify(both.config.models.v37bm.deployments) + ")"
+    );
+    assert(
+      both.warnings.some((w) => w.includes("v37bm") && /deployments/.test(w) && /dropped|discard/i.test(w)),
+      "v37o) the discard is VISIBLE: a warning names the model and says the deployments were dropped (" + JSON.stringify(both.warnings) + ")"
+    );
+    // R7: a MIXTURE converts model by model - the already-v3 entry keeps its own
+    // deployments while the old-shape entry is converted, so one config-wide
+    // predicate in the pipeline is enough and no per-model predicate is needed.
+    const mixed = convertLegacyConfig({
+      backends: [{ id: "v37n", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_V37N" }],
+      models: {
+        v37mm: { deployments: [{ backend: "v37n", upstream: "already-v3" }], exposed: true },
+        v37om: { providers: [{ backend: "v37n", upstream: "was-old-shape" }] }
+      },
+      presets: { v37mp: { strategy: "fallback", models: ["v37mm", "v37om"], exposed: true } }
+    });
+    assert(
+      mixed.config.models.v37mm.deployments[0].upstream === "already-v3" &&
+        mixed.config.models.v37om.deployments[0].upstream === "was-old-shape" &&
+        mixed.config.models.v37om.providers === undefined,
+      "v37p) a MIXED config converts the old-shape entry and leaves the v3 entry's deployments alone (" + JSON.stringify(mixed.config.models) + ")"
+    );
+  }
+
+  {
+    // v38a)-v38d) the v3 routing read. `candidates()` reads `deployments` with
+    // backupOnly ordering and sticky weighted primaries, and it must do so from
+    // the same code path the router actually runs for a converted config: a v3
+    // model is dispatched to the v3 branch PER ENTRY, while the legacy
+    // `providers`/`affinityPool` read stays reachable for the pre-bridge blocks
+    // that call `candidates()` directly with old-shape fixtures.
+    const cfg = {
+      backends: [{ id: "b1" }, { id: "b2" }, { id: "b3" }],
+      models: {
+        m1: {
+          deployments: [
+            { backend: "b1", upstream: "u" },
+            { backend: "b2", upstream: "u", weight: 2 },
+            { backend: "b3", upstream: "u", backupOnly: true },
+          ],
+          exposed: true,
+        },
+        hid: { deployments: [{ backend: "b1", upstream: "uh" }], exposed: false },
+      },
+      presets: {
+        tier: { strategy: "fallback", models: ["m1", "hid"] },
+        secret: { strategy: "fallback", models: ["m1"], exposed: false },
+      },
+    };
+    normalizeConfig(cfg);
+    const c = candidates(cfg, "m1", "sess-a");
+    // This block does NOT pin "the base got backupOnly wrong". Measured against
+    // 5ec0549: the base shim's `modelPool` already EXCLUDED `backupOnly` (pool =
+    // 2 over {b1, b2}), `sess-1`'s base primary is `b2`, and `b3` is primary for
+    // 0 of 5000 base keys. What these four pin is the CONVERTED-config path
+    // holding the same exclusion - the head routes by `deployments` rather than
+    // `providers`/`affinityPool`, and they fail if that read loses the
+    // `backupOnly` tail. The ordering rule itself is carried by `z8`, `v38d`
+    // and `v38d3`, which an ordering-bypass mutation DOES flip.
+    assert(
+      c.ordered[0].backend !== "b3",
+      "v38a) backupOnly never primary (" + JSON.stringify(c.ordered) + ")"
+    );
+    const sweep = [];
+    for (let i = 0; i < 300; i++) sweep.push(candidates(cfg, "m1", "sess-" + i).ordered.map((a) => a.backend));
+    assert(
+      sweep.every((o) => o[0] !== "b3"),
+      "v38a2) backupOnly is never the PRIMARY for any of 300 session keys (" + JSON.stringify(sweep.slice(0, 6)) + ")"
+    );
+    assert(
+      c.ordered[c.ordered.length - 1].backend === "b3",
+      "v38b) backupOnly tried last (" + JSON.stringify(c.ordered) + ")"
+    );
+    assert(
+      sweep.every((o) => o[o.length - 1] === "b3"),
+      "v38b2) backupOnly is LAST for every session key, not just the favourably-hashed ones (" + JSON.stringify(sweep.slice(0, 6)) + ")"
+    );
+    assert(
+      candidates(cfg, "m1", "sess-a").ordered.map((a) => a.backend).join(",") ===
+        candidates(cfg, "m1", "sess-a").ordered.map((a) => a.backend).join(","),
+      "v38c) two SEPARATE calls with the same session key pick the same primary, so a later call cannot drift"
+    );
+    // The fixture's weights are b1:1, b2:2 over a total of 3, so the pick is the
+    // session hash modulo 3: buckets 0 -> b1, 1 and 2 -> b2. Spread, ratio and
+    // the backupOnly exclusion are three properties the same 300-key sweep
+    // measures, and every one of them can fail.
+    const picks = { b1: 0, b2: 0, b3: 0 };
+    for (let i = 0; i < 300; i++) {
+      const first = candidates(cfg, "m1", "sess-" + i).ordered[0].backend;
+      picks[first] = (picks[first] || 0) + 1;
+    }
+    assert(
+      picks.b1 > 0 && picks.b2 > 0,
+      "v38d) both weighted primaries are picked at least once (" + JSON.stringify(picks) + ")"
+    );
+    assert(
+      picks.b3 === 0,
+      "v38d2) backupOnly never wins the pick for ANY session key (" + JSON.stringify(picks) + ")"
+    );
+    const b1Share = picks.b1 / 300;
+    assert(
+      b1Share >= 0.2 && b1Share <= 0.45 && picks.b2 === 300 - picks.b1,
+      "v38d3) the picks land in the fixture's 1:2 weight band (" + JSON.stringify(picks) + ")"
+    );
+    const t = candidates(cfg, "tier", "sess-a");
+    assert(t.models.includes("hid"), "v38d4) hidden model still routable through preset (" + JSON.stringify(t.models) + ")");
+  }
+
+  {
+    // v38e)-v38f) T3: exposure is a LISTING rule, not a routing rule. An
+    // `exposed: false` preset and model stay routable while being absent from
+    // /v1/models, and the list is exposed presets first, then exposed models
+    // (the order the plan sanctions; the legacy collision rule is gone).
+    const hid = mockBackend("hidB", {});
+    hid.port = await listen(hid.srv);
+    const hcfg = {
+      port: 0,
+      prefix: "/v1",
+      masterKeyEnv: null,
+      backends: [{ id: "hidB", baseURL: "http://127.0.0.1:" + hid.port, apiKeyEnv: "KEY_HID" }],
+      models: {
+        "shown-m": { deployments: [{ backend: "hidB", upstream: "u" }], exposed: true },
+        "hidden-m": { deployments: [{ backend: "hidB", upstream: "u" }], exposed: false },
+      },
+      presets: {
+        "shown-p": { strategy: "fallback", models: ["shown-m"], exposed: true },
+        "hidden-p": { strategy: "fallback", models: ["hidden-m"], exposed: false },
+      },
+    };
+    const { child: hidChild, base: hidBase, dir: hidDir } = await startRouterCfg(hcfg, "KEY_HID=k\n");
+    try {
+      const served = (await (await api(hidBase, "/v1/models", { method: "GET" })).json()).data.map((x) => x.id);
+      assert(
+        served.join(",") === "shown-p,shown-m",
+        "v38e) exposed:false model and preset ids are ABSENT from /v1/models (exposed presets first, then exposed models; got " +
+          JSON.stringify(served) + ")"
+      );
+      const rh = await api(hidBase, "/v1/chat/completions", { body: { model: "hidden-p", messages: [{ role: "user", content: "hi" }] } });
+      const rm = await api(hidBase, "/v1/chat/completions", { body: { model: "hidden-m", messages: [{ role: "user", content: "hi" }] } });
+      assert(
+        rh.status === 200 && rm.status === 200,
+        "v38f) an exposed:false preset and an exposed:false model stay routable (preset=" + rh.status + ", model=" + rm.status + ")"
+      );
+    } finally {
+      hidChild.kill();
+      hid.srv.close();
+      await rm(hidDir, { recursive: true, force: true });
+    }
+  }
+
+  {
+    // v38g)-v38h) R6: the READ path must not USE a deployment it cannot route.
+    // The bridge-era pass-through hands a structurally intact but semantically
+    // unusable provider into `deployments` so the VALIDATOR can name it; that is
+    // not licence for the router to build an attempt carrying `model: undefined`.
+    // Four unusable entries are mixed with two good ones: an unknown backend, a
+    // missing upstream on a backend with no default model, a non-object entry,
+    // and an entry with no backend at all. Each good deployment uses its OWN
+    // backend, because the attempt list dedups by backend id - a rule this block
+    // deliberately stays clear of so it measures the drop and nothing else.
+    const cfg = {
+      backends: [{ id: "b1" }, { id: "b2" }],
+      models: {
+        m1: {
+          deployments: [
+            { backend: "b1", upstream: "u1" },
+            { backend: "ghost", upstream: "u2" },
+            { backend: "b1" },
+            null,
+            { upstream: "u3" },
+            { backend: "b2", upstream: "u4", backupOnly: true },
+          ],
+        },
+      },
+      presets: { p1: { strategy: "fallback", models: ["m1"] } },
+    };
+    const seen = new Set();
+    const realWarn = console.warn;
+    console.warn = (msg) => seen.add(String(msg));
+    let c = null;
+    try {
+      normalizeConfig(cfg);
+      c = candidates(cfg, "m1", "sess-a");
+    } finally {
+      console.warn = realWarn;
+    }
+    assert(
+      c.ordered.map((a) => a.backend + "/" + a.upstream).join(",") === "b1/u1,b2/u4",
+      "v38g) only resolvable deployments reach the attempt list (" + JSON.stringify(c.ordered) + ")"
+    );
+    assert(
+      c.ordered.every((a) => a.backend && a.upstream),
+      "v38g2) no attempt carries an undefined backend or upstream (" + JSON.stringify(c.ordered) + ")"
+    );
+    // Each unusable entry is dropped for ITS OWN reason, and the v2 wording is
+    // pinned down to the entry so a silent drop cannot hide behind a count.
+    const expectWarn = [
+      "model 'm1': entry at deployments[1] references unknown backend 'ghost', dropped",
+      "model 'm1': entry at deployments[2] (backend 'b1') has no resolvable upstream, dropped",
+      "model 'm1': entry at deployments[3] is not an object, dropped",
+      "model 'm1': entry at deployments[4] names no backend, dropped",
+    ];
+    assert(
+      [...seen].filter((m) => m.includes("model 'm1'")).length === 4 && expectWarn.every((w) => [...seen].some((m) => m.includes(w))),
+      "v38h) each unusable deployment is dropped with its OWN v2-wording warning naming the model and the entry (" + JSON.stringify(expectWarn) + " vs " + JSON.stringify([...seen]) + ")"
+    );
+    let sessB = null;
+    const realWarn2 = console.warn;
+    console.warn = () => {};
+    try {
+      sessB = candidates(cfg, "m1", "sess-b").ordered.map((a) => a.backend + "/" + a.upstream).join(",");
+    } finally {
+      console.warn = realWarn2;
+    }
+    assert(
+      sessB === "b1/u1,b2/u4",
+      "v38h3) the drop is not session-dependent (" + sessB + ")"
+    );
+  }
+
+  {
+    // v38i)-v38j) R3: a MISSPELLED key in a v3 model or deployment is the hazard
+    // this validator branch exists to catch - `backuponly: true` silently makes a
+    // deployment the operator intended as a backup into a PRIMARY that receives
+    // live traffic. The backend layer already allowlists its keys; the same
+    // pattern now covers models and deployments, as a WARNING (never an error).
+    const v3cfg = (model) => ({
+      port: 0,
+      prefix: "/v1",
+      masterKeyEnv: null,
+      backends: [{ id: "b1", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_R3" }],
+      models: { m1: model },
+      presets: { p1: { strategy: "fallback", models: ["m1"], exposed: true } },
+    });
+    // The validator also reports an unset apiKeyEnv as an error; these fixtures
+    // are about the KEY axis, so the env name is provided and the assertions
+    // name the exact paths they care about instead of a bare error count.
+    const prevKeyR3 = process.env.KEY_R3;
+    process.env.KEY_R3 = "k";
+    let misspelled = null;
+    let modelTypo = null;
+    let clean = null;
+    try {
+      misspelled = validateConfig(
+        v3cfg({ deployments: [{ backend: "b1", upstream: "u", backuponly: true, wieght: 2 }] }),
+        null,
+        {}
+      );
+      modelTypo = validateConfig(v3cfg({ deployments: [{ backend: "b1", upstream: "u" }], expossed: false }), null, {});
+      // The allowlist must be complete for the shape the converter PRODUCES and
+      // for the fields the live config really carries, or every boot logs noise.
+      clean = validateConfig(
+        v3cfg({
+          deployments: [
+            { backend: "b1", upstream: "u", weight: 2, params: { temperature: 1 }, dropParams: ["logit_bias"], paramMap: { a: "b" } },
+            { backend: "b1", upstream: "u2", backupOnly: true },
+          ],
+          params: { temperature: 0.5 },
+          retry: { maxRetries: 1 },
+          meta: { label: "l", contextWindow: 1000, pricing: { inputPerM: 1 } },
+          exposed: true,
+        }),
+        null,
+        {}
+      );
+    } finally {
+      if (prevKeyR3 === undefined) delete process.env.KEY_R3;
+      else process.env.KEY_R3 = prevKeyR3;
+    }
+    assert(
+      misspelled.warnings.some((w) => w.path === "models.m1.deployments[0]" && /backuponly/.test(w.message)) &&
+        misspelled.warnings.some((w) => w.path === "models.m1.deployments[0]" && /wieght/.test(w.message)),
+      "v38i) an unknown v3 DEPLOYMENT key warns with its real path (" + JSON.stringify(misspelled.warnings) + ")"
+    );
+    assert(
+      misspelled.errors.filter((e) => e.path.startsWith("models.m1")).length === 0,
+      "v38i2) an unknown key is a WARNING, never an error (" + JSON.stringify(misspelled.errors) + ")"
+    );
+    assert(
+      modelTypo.warnings.some((w) => w.path === "models.m1" && /expossed/.test(w.message)) &&
+        modelTypo.errors.filter((e) => e.path.startsWith("models.m1")).length === 0,
+      "v38j) an unknown v3 MODEL key warns at the model path and is not an error (" + JSON.stringify(modelTypo.warnings) + ")"
+    );
+    assert(
+      clean.warnings.length === 0,
+      "v38j2) every key the converter produces is known: no spurious warning (" + JSON.stringify(clean.warnings) + ")"
+    );
+    // The warning must reach the OPERATOR at boot, not only the save verdict -
+    // that is the whole point of closing the misspelled-key hazard. The child is
+    // spawned inline so its stderr is captured and assertable.
+    const typoDir = await mkdtemp(join(tmpdir(), "lmr-v38j-"));
+    const typoCfgPath = join(typoDir, "config.json");
+    await writeFile(typoCfgPath, JSON.stringify(v3cfg({ deployments: [{ backend: "b1", upstream: "u", backuponly: true }] }), null, 2));
+    await writeFile(join(typoDir, ".env"), "KEY_R3=k\n");
+    const typoChild = spawn(process.execPath, ["server.mjs"], {
+      cwd: join(import.meta.dirname),
+      env: { ...process.env, ROUTER_CONFIG: typoCfgPath, ROUTER_ENV: join(typoDir, ".env") },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let typoBase = null;
+    let typoErr = "";
+    try {
+      await new Promise((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error("v38j4 child did not start (stderr tail: " + JSON.stringify(typoErr.slice(-400)) + ")")), 8000);
+        typoChild.stderr.on("data", (d) => {
+          const s = d.toString();
+          typoErr += s;
+          const m = /listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(s);
+          if (m) { typoBase = "http://127.0.0.1:" + parseInt(m[1], 10); clearTimeout(t); resolve(); }
+        });
+      });
+      const live = await (await api(typoBase, "/api/config", { method: "GET" })).json();
+      assert(
+        !!live && !!live.models && !!live.models.m1,
+        "v38j3) the router boots and serves a config carrying the misspelling (sanity)"
+      );
+      assert(
+        /backuponly/.test(typoErr) && /models\.m1/.test(typoErr),
+        "v38j4) the misspelling reaches the OPERATOR at boot, naming the model path (stderr tail: " + JSON.stringify(typoErr.slice(-400)) + ")"
+      );
+    } finally {
+      typoChild.kill();
+      await rm(typoDir, { recursive: true, force: true });
+    }
+  }
+
+  {
+    // v38k) R5: `backends: [null]` is a hand-edited config that used to take the
+    // router DOWN at boot - an unguarded `.id` dereference in normalizeConfig's
+    // backendById map (base 197824a line 1522, and HEAD's converter sweep wrapped
+    // by loadConfig as "config conversion failed"). A non-object entry must pass
+    // through untouched so the validator names `backends.0` and boot stays
+    // tolerant: a warning, not death.
+    const r5cfg = {
+      port: 0,
+      prefix: "/v1",
+      masterKeyEnv: null,
+      backends: [null, { id: "r5b", baseURL: "http://127.0.0.1:1", apiKeyEnv: "KEY_R5" }],
+      models: { r5m: { deployments: [{ backend: "r5b", upstream: "u" }], exposed: true } },
+      presets: { r5p: { strategy: "fallback", models: ["r5m"], exposed: true } },
+    };
+    // The warning path is asserted the same way: the point of the fix is BOTH
+    // that boot survives AND that the operator is told which entry is junk. The
+    // child is spawned inline so its stderr stays in scope for the assertion,
+    // which runs BEFORE the finally-block cleanup so it can still read it.
+    const r5Dir = await mkdtemp(join(tmpdir(), "lmr-v38k-"));
+    const r5CfgPath = join(r5Dir, "config.json");
+    await writeFile(r5CfgPath, JSON.stringify(r5cfg, null, 2));
+    await writeFile(join(r5Dir, ".env"), "KEY_R5=k\n");
+    const r5Child = spawn(process.execPath, ["server.mjs"], {
+      cwd: join(import.meta.dirname),
+      env: { ...process.env, ROUTER_CONFIG: r5CfgPath, ROUTER_ENV: join(r5Dir, ".env") },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let r5Base = null;
+    let r5Err = "";
+    try {
+      await new Promise((resolve, reject) => {
+        const t = setTimeout(() => reject(new Error("v38k child did not start (stderr tail: " + JSON.stringify(r5Err.slice(-400)) + ")")), 8000);
+        r5Child.stderr.on("data", (d) => {
+          const s = d.toString();
+          r5Err += s;
+          const m = /listening on http:\/\/127\.0\.0\.1:(\d+)/.exec(s);
+          if (m) { r5Base = "http://127.0.0.1:" + parseInt(m[1], 10); clearTimeout(t); resolve(); }
+        });
+      });
+      // The child prints its listen banner from the listen callback, so it is
+      // accepting connections already; a first-request ECONNRESET here would be
+      // a real defect, and the failure is carried into the assertion rather than
+      // crashing the whole run.
+      const r5Get = async (path) => {
+        let lastErr = null;
+        for (let i = 0; i < 5; i++) {
+          try {
+            return await (await api(r5Base, path, { method: "GET" })).json();
+          } catch (e) {
+            lastErr = e;
+            await new Promise((r) => setTimeout(r, 100));
+          }
+        }
+        throw lastErr;
+      };
+      const health = await r5Get("/health");
+      const r5served = (await r5Get("/v1/models")).data.map((x) => x.id);
+      assert(
+        health.ok === true && r5served.join(",") === "r5p,r5m",
+        "v38k) a config carrying backends:[null] BOOTS and serves instead of dying (health=" +
+          JSON.stringify(health.ok) + ", served=" + JSON.stringify(r5served) + ")"
+      );
+      assert(
+        /backends\[0\][\s\S]*must be an object/.test(r5Err),
+        "v38k2) the junk backend entry is NAMED at boot with its validator path (stderr tail: " + JSON.stringify(r5Err.slice(-400)) + ")"
+      );
+    } finally {
+      r5Child.kill();
+      await rm(r5Dir, { recursive: true, force: true });
     }
   }
 
@@ -6243,6 +7756,2049 @@ async function main() {
       );
     }
   }
+  // ---- config editor: merge-preserve contract (index.html) -------------------
+  // index.html ships its UI as one inline <script>, and the config editor's
+  // collect/apply pair are top-level declarations - so they are extracted BY NAME
+  // with brace matching and evaluated in a node:vm context against stub globals.
+  // That runs the real production editor code headlessly: no browser, no jsdom,
+  // no dependency. The extractor is the part that can rot silently, so u6a proves
+  // it found every function before any contract assertion runs and fails loudly
+  // (naming what was missing) if it did not.
+  {
+    let htmlSource = "";
+    let readError = null;
+    try {
+      htmlSource = await readFile(join(import.meta.dirname, "index.html"), "utf8");
+    } catch (e) {
+      readError = e.message;
+    }
+
+    // Source of one top-level `function NAME(...) {...}`, located by name. Strings,
+    // template literals and comments are skipped so a brace inside one cannot end
+    // the body early (none of the extracted bodies holds a regex literal).
+    function sliceFunction(source, name) {
+      let at = source.indexOf("\nfunction " + name + "(");
+      if (at < 0) at = source.indexOf("\nasync function " + name + "(");
+      if (at < 0) return null;
+      let depth = 0;
+      for (let i = source.indexOf("{", at); i >= 0 && i < source.length; i++) {
+        const c = source[i];
+        if (c === "\"" || c === "'" || c === "`") {
+          for (i++; i < source.length && source[i] !== c; i++) if (source[i] === "\\") i++;
+          continue;
+        }
+        if (c === "/" && source[i + 1] === "/") {
+          const nl = source.indexOf("\n", i);
+          if (nl < 0) break;
+          i = nl;
+          continue;
+        }
+        if (c === "/" && source[i + 1] === "*") {
+          const end = source.indexOf("*/", i + 2);
+          if (end < 0) break;
+          i = end + 1;
+          continue;
+        }
+        if (c === "{") depth++;
+        else if (c === "}" && --depth === 0) return source.slice(at + 1, i + 1);
+      }
+      return null;
+    }
+
+    const needed = ["cfgDeepCopy", "cfgParseMaybeJson", "cfgJsonText", "cfgMutate", "cfgCloseModal", "deploymentListOf", "renderCfgModal", "renderDeployList", "cfgModalCollect", "cfgApplyModal", "countRefsTo"];
+    const bodies = [];
+    const broken = [];
+    for (const name of needed) {
+      const body = sliceFunction(htmlSource, name);
+      if (!body || !(() => { try { new vm.Script(body); return true; } catch { return false; } })()) {
+        broken.push(name);
+        continue;
+      }
+      bodies.push(body);
+    }
+    const dollarDecl = (htmlSource.match(/\nconst \$ = [^\n;]*;/) || [])[0];
+    if (!dollarDecl || !(() => { try { new vm.Script(dollarDecl); return true; } catch { return false; } })()) broken.push("$");
+
+    // The vm globals: `cfg` is the draft/modal state, getElementById serves form
+    // stubs, and the HTML-building helpers stay inert - only the two functions
+    // that read the form and write the draft are under test here.
+    const fields = new Map();
+    const stubField = (v) => ({ value: typeof v === "boolean" ? String(v) : v == null ? "" : String(v), checked: v === true, style: {}, innerHTML: "", textContent: "" });
+    const mountFields = (spec) => {
+      fields.clear();
+      for (const [id, v] of Object.entries(spec)) fields.set(id, stubField(v));
+    };
+    const confirmLog = [];
+    let confirmAnswer = true;
+    const cfg = { draft: null, modal: null, dirty: false };
+    const sandbox = {
+      cfg,
+      console,
+      confirm: (msg) => { confirmLog.push(msg); return confirmAnswer; },
+      renderConfig: () => {},
+      ICONS: { warn: "" },
+      document: { getElementById: (id) => { if (!fields.has(id)) fields.set(id, stubField("")); return fields.get(id); } },
+      esc: (v) => String(v == null ? "" : v),
+      cfgField: () => "",
+      cfgJsonText: () => "",
+      cfgEnvNames: () => [],
+      renderDeployList: () => {},
+      renderPresetModelList: () => {},
+    };
+    let api = null;
+    let evalError = null;
+    if (broken.length === 0) {
+      const program = [dollarDecl]
+        .concat(bodies, ["({ $, cfgDeepCopy, cfgParseMaybeJson, cfgJsonText, cfgMutate, cfgCloseModal, deploymentListOf, renderCfgModal, renderDeployList, cfgModalCollect, cfgApplyModal, countRefsTo })"])
+        .join("\n");
+      try {
+        api = vm.runInContext(program, vm.createContext(sandbox));
+      } catch (e) {
+        evalError = e.message;
+      }
+    }
+    const harnessOk = broken.length === 0 && !evalError && !!api && typeof api.$ === "function" && typeof api.cfgModalCollect === "function" && typeof api.cfgApplyModal === "function";
+    assert(
+      harnessOk,
+      "u6a) the index.html editor harness extracted " + bodies.length + "/" + needed.length + " function(s) plus $ and evaluated them in a vm context" +
+        (readError ? " [index.html unreadable: " + readError + "]" : "") +
+        (broken.length ? " [NOT FOUND OR UNPARSEABLE: " + broken.join(", ") + "]" : "") +
+        (evalError ? " [evaluation failed: " + evalError + "]" : "")
+    );
+
+    if (!harnessOk) {
+      assert(false, "u6a2) the config editor merge-preserve contract could not be exercised: the harness did not come up");
+    } else {
+      const norm = (v) => JSON.stringify(v, (k, x) => (x && typeof x === "object" && !Array.isArray(x) ? Object.keys(x).sort().reduce((o, kk) => ((o[kk] = x[kk]), o), {}) : x));
+      const same = (a, b) => norm(a) === norm(b);
+      const open = (kind, key, data, index) => {
+        cfg.modal = { kind, key, data: api.cfgDeepCopy(data || {}), index: index == null ? null : index, deploys: [], models: [], exposedOn: !(data && data.exposed === false) };
+      };
+
+      // The trickiest input this editor can be handed: BOTH arrays. The rows come
+      // from `providers` because that is what the server's own converter reads
+      // (v37n), so a form that took the hand-written `deployments` would show a
+      // list the router is not honouring.
+      const modelEntry = {
+        providers: [
+          { backend: "go", upstream: "glm-5.3", dropParams: ["temperature"], params: { top_p: 1 }, paramMap: { max_tokens: "max_output_tokens" }, unownedRowKey: 7 },
+          { backend: "cc", upstream: "glm-5.3-cc", dropParams: ["top_p"] },
+        ],
+        affinityPool: 2,
+        retry: { maxRetries: 2, baseMs: 500, maxMs: 4000, multiplier: 2, totalMs: 20000 },
+        params: { temperature: 0.7 },
+        meta: { label: "GLM 5.3", contextWindow: 200000, unownedMeta: "keep", pricing: { inputPerM: 0.1, outputPerM: 0.4, cacheHitInputPerM: 0.01, unownedPricing: "keep" } },
+        exposed: false,
+        deployments: [{ backend: "go", upstream: "glm-5.3", backupOnly: true }],
+      };
+      // What the two provider rows become: same order, same dialect keys, and no
+      // `affinityPool` (v3 removed the concept, so nothing reads it back).
+      const modelDeploys = [
+        { backend: "go", upstream: "glm-5.3", dropParams: ["temperature"], params: { top_p: 1 }, paramMap: { max_tokens: "max_output_tokens" }, unownedRowKey: 7 },
+        { backend: "cc", upstream: "glm-5.3-cc", dropParams: ["top_p"] },
+      ];
+      // An entry already in v3, with every default the form must NOT write back.
+      const v3Entry = {
+        deployments: [
+          { backend: "go", upstream: "v3-one" },
+          { backend: "cc", upstream: "v3-two", weight: 3, backupOnly: true, params: { top_p: 1 }, dropParams: ["temperature"], paramMap: { max_tokens: "max_output_tokens" } },
+        ],
+        retry: { maxRetries: 1 },
+        params: { temperature: 0.7 },
+        meta: { label: "v3", contextWindow: 200000, pricing: { inputPerM: 0.1, outputPerM: 0.4, cacheHitInputPerM: 0.01 } },
+      };
+      const presetEntry = {
+        strategy: "failover",
+        models: ["glm-5.3-flash", { model: "z", weight: 3 }],
+        affinityPool: 3,
+        params: { reasoning_effort: "high" },
+        exposed: false,
+        strategyV3: { kind: "ordered" },
+        meta: { label: "Tier", tier: "balanced", whenToUse: "cheap", unownedMeta: "keep" },
+      };
+      const backendEntry = { id: "go", baseURL: "http://go", apiKeyEnv: "KEY_GO", translateDeveloperRole: true, model: "deepseek-v4-flash", timeoutMs: 90000, params: { temperature: 0.2 }, dropParams: ["n"], unownedBackendKey: "keep" };
+      const freshDraft = () => ({
+        port: 8787,
+        backends: [{ id: "go", baseURL: "http://go", apiKeyEnv: "KEY_GO" }, { id: "cc", baseURL: "http://cc", apiKeyEnv: "KEY_CC" }],
+        models: {
+          a: { providers: [{ backend: "go", upstream: "ua" }] },
+          "glm-5.3-flash": api.cfgDeepCopy(modelEntry),
+          z: { providers: [{ backend: "cc", upstream: "uz" }] },
+        },
+        presets: {
+          "p-one": { strategy: "affinity", models: [{ model: "glm-5.3-flash", weight: 2 }] },
+          "p-two": { strategy: "failover", models: ["glm-5.3-flash"] },
+        },
+      });
+      // The deployment-row boxes the real render emits for entry `entry`.
+      const jsonText = (v) => (v === undefined ? "" : JSON.stringify(v, null, 2));
+      const deployFields = (entry, over) => {
+        const list = Array.isArray(entry.providers) ? entry.providers : Array.isArray(entry.deployments) ? entry.deployments : [];
+        const spec = {};
+        list.forEach((d, i) => {
+          spec["f_d" + i + "_backend"] = d.backend || "";
+          spec["f_d" + i + "_upstream"] = d.upstream || "";
+          spec["f_d" + i + "_weight"] = d.weight == null ? "" : String(d.weight);
+          spec["f_d" + i + "_backupOnly"] = !!d.backupOnly;
+          spec["f_d" + i + "_params"] = jsonText(d.params);
+          spec["f_d" + i + "_dropParams"] = jsonText(d.dropParams);
+          spec["f_d" + i + "_paramMap"] = jsonText(d.paramMap);
+        });
+        return Object.assign(spec, over || {});
+      };
+      const modelFields = (over) =>
+        Object.assign(
+          {
+            f_id: "glm-5.3-flash",
+            f_metaLabel: "GLM 5.3",
+            f_metaCtx: "200000",
+            f_priceIn: "0.1",
+            f_priceOut: "0.4",
+            f_priceCache: "0.01",
+            f_offPeak: "",
+            f_params: '{"temperature":0.7}',
+            f_retry: '{"maxRetries":2,"baseMs":500,"maxMs":4000,"multiplier":2,"totalMs":20000}',
+          },
+          over || {}
+        );
+
+      // A model whose providers carry dialect keys, rendered by the REAL
+      // renderCfgModal: the row objects it builds are what collect sees, so a row
+      // that stops carrying its previous provider fails here.
+      cfg.draft = freshDraft();
+      open("models", "glm-5.3-flash", Object.assign({ id: "glm-5.3-flash" }, api.cfgDeepCopy(modelEntry)));
+      mountFields(deployFields(modelEntry, modelFields()));
+      api.renderCfgModal();
+      assert(
+        cfg.modal.deploys.length === 2 && !!cfg.modal.deploys[0].prev && same(cfg.modal.deploys[0].prev.dropParams, ["temperature"]),
+        "u6f) the real modal render keeps each deployment's previous object reachable on its row"
+      );
+      const merged = api.cfgModalCollect();
+      assert(same(merged.deployments, modelDeploys), "u6b2) collect keeps dropParams/params/paramMap and unowned row keys on every deployment, converting the provider rows in declared order");
+      assert(merged.exposed === false && !("providers" in merged) && !("affinityPool" in merged), "u6b3) collect keeps a model-level unowned key (exposed: false) and REPLACES providers/affinityPool - the server reads a both-keys model as providers-wins, so keeping the legacy key would silently discard this edit");
+      assert("deployments" in merged, "u6b3b) a model that arrived with BOTH providers and deployments collects deployments derived from the PROVIDERS (the array the server's converter honours)");
+      assert(merged.meta.unownedMeta === "keep" && merged.meta.pricing.unownedPricing === "keep", "u6b4) collect keeps unowned keys inside meta and meta.pricing");
+
+      const mergedSnap = api.cfgDeepCopy(merged);
+      delete mergedSnap.id;
+      api.cfgApplyModal();
+      const storedModel = cfg.draft.models["glm-5.3-flash"];
+      assert(
+        !!storedModel && same(storedModel, mergedSnap) && !("prev" in storedModel) && !("data" in storedModel),
+        "u6c) apply stores the merged model under its own key with no modal bookkeeping keys left behind"
+      );
+
+      cfg.draft.presets.mix = api.cfgDeepCopy(presetEntry);
+      open("presets", "mix", Object.assign({ id: "mix" }, api.cfgDeepCopy(presetEntry)));
+      mountFields({ f_id: "mix", f_strategy: "failover", f_metaLabel: "Tier", f_metaTier: "balanced", f_metaWhen: "cheap", f_params: '{"reasoning_effort":"high"}' });
+      api.renderCfgModal();
+      const mergedPreset = api.cfgModalCollect();
+      assert(
+        mergedPreset.exposed === false && same(mergedPreset.strategyV3, { kind: "ordered" }) && mergedPreset.meta.unownedMeta === "keep" && !("affinityPool" in mergedPreset),
+        "u6d) a preset keeps unowned keys (exposed, a real v3 field) and unowned meta keys, and drops the affinityPool the form no longer owns (v3 removed the concept)"
+      );
+      const presetSnap = api.cfgDeepCopy(mergedPreset);
+      delete presetSnap.id;
+      api.cfgApplyModal();
+      assert(
+        same(cfg.draft.presets.mix, presetSnap) && same(cfg.draft.presets.mix.models, ["glm-5.3-flash", { model: "z", weight: 3 }]),
+        "u6d2) apply stores the merged preset without disturbing its model rows"
+      );
+
+      cfg.draft = freshDraft();
+      cfg.draft.backends[0] = api.cfgDeepCopy(backendEntry);
+      open("backends", "go", api.cfgDeepCopy(backendEntry), 0);
+      mountFields({ f_id: "go", f_baseURL: "http://go", f_apiKeyEnv: "KEY_GO", f_timeoutMs: "90000", f_translateDeveloperRole: true, f_model: "deepseek-v4-flash", f_params: '{"temperature":0.2}' });
+      api.renderCfgModal();
+      assert(same(api.cfgModalCollect(), backendEntry), "u6e) a backend keeps unowned keys (dropParams, backend-level params) through collect");
+
+      // An emptied box is an explicit clear: its key must go, never silently keep
+      // the previous value.
+      cfg.draft = freshDraft();
+      open("models", "glm-5.3-flash", Object.assign({ id: "glm-5.3-flash" }, api.cfgDeepCopy(modelEntry)));
+      mountFields(deployFields(modelEntry, modelFields({ f_metaLabel: "", f_metaCtx: "", f_priceIn: "", f_priceOut: "", f_priceCache: "", f_params: "", f_retry: "" })));
+      api.renderCfgModal();
+      const cleared = api.cfgModalCollect();
+      assert(!("params" in cleared) && !("retry" in cleared) && !("affinityPool" in cleared), "u6f1) an emptied model field removes its key instead of silently keeping the previous value (affinityPool is never written at all)");
+      assert(
+        !!cleared.meta && !("label" in cleared.meta) && !("contextWindow" in cleared.meta) && !("inputPerM" in cleared.meta) && cleared.meta.unownedMeta === "keep" && cleared.meta.pricing.unownedPricing === "keep",
+        "u6f2) clearing meta/pricing fields removes only the keys the form owns"
+      );
+      cfg.draft.models.bare = { providers: [{ backend: "go", upstream: "u" }], meta: { label: "x" } };
+      open("models", "bare", { id: "bare", providers: [{ backend: "go", upstream: "u" }], meta: { label: "x" } });
+      mountFields({ f_id: "bare" });
+      api.renderCfgModal();
+      assert(!("meta" in api.cfgModalCollect()), "u6f3) a meta object whose every form-owned key was cleared is dropped, not left as {}");
+      cfg.draft = freshDraft();
+      cfg.draft.backends[0] = api.cfgDeepCopy(backendEntry);
+      open("backends", "go", api.cfgDeepCopy(backendEntry), 0);
+      mountFields({ f_id: "go", f_baseURL: "http://go", f_apiKeyEnv: "KEY_GO", f_translateDeveloperRole: false });
+      api.renderCfgModal();
+      assert(!("translateDeveloperRole" in api.cfgModalCollect()), "u6f4) unchecking the developer-role box clears its key (an unchecked box is an explicit clear)");
+
+      cfg.draft = freshDraft();
+      open("models", "glm-5.3-flash", Object.assign({ id: "glm-5.3-flash" }, api.cfgDeepCopy(modelEntry)));
+      mountFields(deployFields(modelEntry, modelFields({ f_metaLabel: "Renamed", f_metaCtx: "100000", f_priceIn: "0.2", f_priceOut: "", f_priceCache: "", f_offPeak: '{"inputPerM":0.14}', f_params: '{"temperature":0.9}', f_retry: '{"maxRetries":5}' })));
+      api.renderCfgModal();
+      const edited = api.cfgModalCollect();
+      assert(
+        !("affinityPool" in edited) && edited.meta.label === "Renamed" && edited.meta.contextWindow === 100000 && edited.meta.pricing.inputPerM === 0.2 &&
+          same(edited.meta.pricing.offPeak, { inputPerM: 0.14 }) && same(edited.params, { temperature: 0.9 }) && same(edited.retry, { maxRetries: 5 }) && !("outputPerM" in edited.meta.pricing),
+        "u6g) a non-empty field overrides the previous value and a cleared one is removed, in the same save, and no field writes the removed affinityPool"
+      );
+
+      // R9: a value equal to the DEFAULT is omitted, so the form's own defaults
+      // never become config the operator did not type.
+      const w1 = api.cfgDeepCopy(modelEntry.providers);
+      w1[0].weight = 1;
+      cfg.draft = freshDraft();
+      open("models", "glm-5.3-flash", Object.assign({ id: "glm-5.3-flash" }, api.cfgDeepCopy(modelEntry)));
+      mountFields(deployFields({ providers: w1 }, modelFields()));
+      api.renderCfgModal();
+      const w1Out = api.cfgModalCollect();
+      assert(!("weight" in w1Out.deployments[0]), "u6g2) a deployment whose weight field is blank or 1 collects NO weight key (the default is 1, and writing it would put an explicit weight: 1 on every deployment)");
+
+      cfg.draft = freshDraft();
+      open("models", "glm-5.3-flash", Object.assign({ id: "glm-5.3-flash" }, api.cfgDeepCopy(modelEntry)));
+      mountFields(deployFields(modelEntry, modelFields({ "f_d0_weight": "2", "f_d0_backupOnly": true, "f_d1_dropParams": "", "f_d0_paramMap": '{"max_tokens":"max_output_tokens"}' })));
+      api.renderCfgModal();
+      const w2Out = api.cfgModalCollect();
+      assert(
+        w2Out.deployments[0].weight === 2 && w2Out.deployments[0].backupOnly === true && !("dropParams" in w2Out.deployments[1]) && same(w2Out.deployments[0].paramMap, { max_tokens: "max_output_tokens" }),
+        "u6g3) a deployment's weight and backupOnly round-trip from their boxes, and an emptied dialect box clears only its own key"
+      );
+
+      // An unchecked exposure box is the one direction that writes; a checked one
+      // omits the key, because `exposed: true` IS the default.
+      cfg.draft = freshDraft();
+      open("models", "glm-5.3-flash", Object.assign({ id: "glm-5.3-flash" }, api.cfgDeepCopy(modelEntry)));
+      mountFields(deployFields(modelEntry, modelFields({ f_exposed: false })));
+      api.renderCfgModal();
+      assert(api.cfgModalCollect().exposed === false, "u6g4) an UNCHECKED Exposed box on a model collects exposed: false");
+      cfg.draft.presets.mix = api.cfgDeepCopy(presetEntry);
+      open("presets", "mix", Object.assign({ id: "mix" }, api.cfgDeepCopy(presetEntry)));
+      mountFields({ f_id: "mix", f_strategy: "failover", f_exposed: false });
+      api.renderCfgModal();
+      assert(api.cfgModalCollect().exposed === false, "u6g5) an UNCHECKED Exposed box on a preset collects exposed: false too (exposure covers both namespaces)");
+
+      // The v3 round-trip on an entry that is ALREADY v3: nothing may be added,
+      // moved or dropped, so the deployment objects come back exactly as given.
+      // This fixture carries every box the form has a field for - label, context
+      // window, the three prices, the retry budget and the per-deployment dialect
+      // keys - and `modelFields` fills exactly those boxes, which is what the real
+      // render does for this entry.
+      const v3Want = Object.assign({ id: "v3" }, api.cfgDeepCopy(v3Entry));
+      const v3Fields = { f_id: "v3", f_metaLabel: "v3", f_metaCtx: "200000", f_priceIn: "0.1", f_priceOut: "0.4", f_priceCache: "0.01", f_params: '{"temperature":0.7}', f_retry: '{"maxRetries":1}' };
+      cfg.draft = freshDraft();
+      cfg.draft.models.v3 = api.cfgDeepCopy(v3Entry);
+      open("models", "v3", Object.assign({ id: "v3" }, api.cfgDeepCopy(v3Entry)));
+      api.renderCfgModal();
+      mountFields(deployFields(v3Entry, modelFields(v3Fields)));
+      cfg.modal.exposedOn = true;
+      const v3Out = api.cfgModalCollect();
+      assert(
+        same(v3Out, v3Want),
+        "u6g6) an entry that is ALREADY v3 round-trips byte-identically through the real render: no weight: 1 written on the weight-less deployment, no exposed added, no dialect key moved (" + JSON.stringify(v3Out) + ")"
+      );
+      // The same entry with its Exposed box UNCHECKED: that is the one direction
+      // which writes, and it must change that single key and nothing else.
+      open("models", "v3", Object.assign({ id: "v3" }, api.cfgDeepCopy(v3Entry)));
+      api.renderCfgModal();
+      mountFields(deployFields(v3Entry, modelFields(v3Fields)));
+      cfg.modal.exposedOn = false;
+      const v3HiddenOut = api.cfgModalCollect();
+      assert(
+        same(v3HiddenOut, Object.assign({}, v3Want, { exposed: false })),
+        "u6g6b) unchecking Exposed on a v3 entry changes that one key and nothing else (" + JSON.stringify(v3HiddenOut) + ")"
+      );
+
+      // The XOR, the invariant a future refactor is most likely to break: collect
+      // may never emit a model carrying both arrays, from any of the three inputs.
+      // A model with both is read by the server as providers-wins, so emitting
+      // both would discard the operator's own edit.
+      const xorCases = {
+        "old shape": { providers: [{ backend: "go", upstream: "u1" }] },
+        "new shape": { deployments: [{ backend: "go", upstream: "u1" }] },
+        "both shapes": { providers: [{ backend: "go", upstream: "u1" }], deployments: [{ backend: "cc", upstream: "u9" }] },
+      };
+      const xorBroken = [];
+      for (const [label, entry] of Object.entries(xorCases)) {
+        cfg.draft = freshDraft();
+        open("models", "xorm", Object.assign({ id: "xorm" }, api.cfgDeepCopy(entry)));
+        mountFields(deployFields(entry, { f_id: "xorm" }));
+        api.renderCfgModal();
+        const out = api.cfgModalCollect();
+        if ("providers" in out) xorBroken.push(label + ": emitted providers");
+        if (!Array.isArray(out.deployments) || out.deployments.length !== 1) xorBroken.push(label + ": deployments " + JSON.stringify(out.deployments));
+        if (out.deployments && out.deployments[0] && out.deployments[0].upstream !== "u1") xorBroken.push(label + ": rows came from the wrong array (" + JSON.stringify(out.deployments) + ")");
+      }
+      assert(
+        xorBroken.length === 0,
+        "u6g7) collect NEVER emits `providers`, and takes its rows from `providers` when that array is present - for an old-shape input, a v3 input, and an input carrying both (" + (xorBroken.length ? xorBroken.join(" | ") : "all three clean") + ")"
+      );
+
+      // Create path: no previous entry exists, so nothing may leak from the keys
+      // the modal itself keeps, and a row added with the + button stays clean.
+      cfg.draft = freshDraft();
+      open("models", null, {});
+      mountFields({ f_id: "fresh", f_metaLabel: "Fresh", f_params: '{"a":1}' });
+      api.renderCfgModal();
+      cfg.modal.deploys.push({ backend: "go", upstream: "go-model", weight: null, backupOnly: false, orig: { params: "", dropParams: "", paramMap: "" } });
+      const hOut = api.cfgModalCollect();
+      assert(
+        same(hOut, { id: "fresh", deployments: [{ backend: "go", upstream: "go-model" }], meta: { label: "Fresh" }, params: { a: 1 } }),
+        "u6h) a brand-new model with no previous entry collects a clean object: deployments, a row with no invented weight or backupOnly, and no affinityPool/providers residue (" + JSON.stringify(hOut) + ")"
+      );
+      open("presets", null, {});
+      mountFields({ f_id: "freshp", f_strategy: "fallback" });
+      api.renderCfgModal();
+      cfg.modal.models.push({ model: "a", weight: null });
+      const h2Out = api.cfgModalCollect();
+      assert(
+        same(h2Out, { id: "freshp", strategy: "fallback", models: ["a"] }),
+        "u6h2) a brand-new preset with no previous entry collects a clean object, at the v3 default strategy and with no exposed key (the default is exposed) (" + JSON.stringify(h2Out) + ")"
+      );
+      open("backends", null, {});
+      mountFields({ f_id: "newb", f_baseURL: "http://new", f_apiKeyEnv: "KEY_NEW", f_timeoutMs: "1000" });
+      api.renderCfgModal();
+      assert(
+        same(api.cfgModalCollect(), { id: "newb", baseURL: "http://new", apiKeyEnv: "KEY_NEW", timeoutMs: 1000 }),
+        "u6h3) a brand-new backend with no previous entry collects a clean object"
+      );
+
+      // The apply half still renames: prompt, reference rewrite, key order.
+      cfg.draft = freshDraft();
+      confirmLog.length = 0;
+      confirmAnswer = true;
+      open("models", "glm-5.3-flash", Object.assign({ id: "glm-5.3-flash" }, api.cfgDeepCopy(modelEntry)));
+      mountFields(deployFields(modelEntry, modelFields({ f_id: "glm-5.4-flash", f_metaLabel: "", f_metaCtx: "", f_priceIn: "", f_priceOut: "", f_priceCache: "", f_offPeak: "", f_params: "", f_retry: "" })));
+      api.renderCfgModal();
+      api.cfgApplyModal();
+      assert(Object.keys(cfg.draft.models).join(",") === "a,glm-5.4-flash,z", "u6i) renaming a model keeps its position in the ordered key rebuild");
+      assert(
+        confirmLog.length === 1 && /Rename 'glm-5\.3-flash' to 'glm-5\.4-flash'\?/.test(confirmLog[0]) && /2 reference\(s\)/.test(confirmLog[0]),
+        "u6i2) the rename prompt still names both ids and the reference count"
+      );
+      assert(
+        cfg.draft.presets["p-one"].models[0].model === "glm-5.4-flash" && cfg.draft.presets["p-two"].models[0] === "glm-5.4-flash",
+        "u6i3) a rename rewrites preset references in both row shapes"
+      );
+      assert(same(cfg.draft.models["glm-5.4-flash"].deployments, modelDeploys), "u6i4) the renamed entry keeps its per-deployment dialect keys");
+      cfg.draft.backends[0] = { id: "go", baseURL: "http://go", apiKeyEnv: "KEY_GO", dropParams: ["y"] };
+      confirmLog.length = 0;
+      open("backends", "go", api.cfgDeepCopy(cfg.draft.backends[0]), 0);
+      mountFields({ f_id: "go-2", f_baseURL: "http://go", f_apiKeyEnv: "KEY_GO" });
+      api.renderCfgModal();
+      api.cfgApplyModal();
+      assert(
+        cfg.draft.models.a.providers[0].backend === "go-2" && cfg.draft.models["glm-5.4-flash"].deployments[0].backend === "go-2",
+        "u6i5) renaming a backend still rewrites the references that point at it, in both the v3 array and the legacy one an unsaved entry still carries"
+      );
+
+      // Collect must copy the previous entry: starting from the live draft object
+      // and deleting keys on it would edit the draft before the user saves.
+      cfg.draft = freshDraft();
+      const draftSnap = api.cfgDeepCopy(cfg.draft);
+      open("models", "glm-5.3-flash", Object.assign({ id: "glm-5.3-flash" }, api.cfgDeepCopy(modelEntry)));
+      mountFields(deployFields(modelEntry, modelFields({ f_metaLabel: "", f_params: "" })));
+      api.renderCfgModal();
+      api.cfgModalCollect();
+      assert(same(cfg.draft, draftSnap), "u6j) collect copies the previous entry instead of aliasing and editing the live draft");
+
+      // Deployment rows fed directly, so the row contract is pinned independently of
+      // the modal render: emptied upstream, unowned row key, backend-less row, new row.
+      // The render is called FIRST because it rebuilds the row list; the rows are
+      // then replaced with what the render would have produced for the same entry,
+      // and each dialect box is mounted holding that row's own baseline text.
+      cfg.draft = freshDraft();
+      open("models", "glm-5.3-flash", Object.assign({ id: "glm-5.3-flash" }, api.cfgDeepCopy(modelEntry)));
+      api.renderCfgModal();
+      const rowBaseline = (json) => {
+        const text = api.cfgJsonText(json);
+        return { text, stub: text, parsed: api.cfgParseMaybeJson(text) };
+      };
+      const b0params = rowBaseline({ top_p: 1 });
+      const b0drop = rowBaseline(["temperature"]);
+      const b0map = rowBaseline({ max_tokens: "max_output_tokens" });
+      cfg.modal.deploys = [
+        { backend: "go", upstream: "", prev: Object.assign({ backend: "go", upstream: "glm-5.3", dropParams: ["temperature"], unownedRowKey: 1 }, { params: b0params.parsed, paramMap: b0map.parsed }), weight: null, backupOnly: false, orig: { params: b0params.text, dropParams: b0drop.text, paramMap: b0map.text } },
+        { backend: "", upstream: "ghost", prev: { backend: "old", upstream: "ghost" }, weight: null, backupOnly: false, orig: { params: "", dropParams: "", paramMap: "" } },
+        { backend: "cc", upstream: "new-upstream", weight: null, backupOnly: false, orig: { params: "", dropParams: "", paramMap: "" } },
+      ];
+      mountFields({ "f_d0_params": b0params.stub, "f_d0_dropParams": b0drop.stub, "f_d0_paramMap": b0map.stub });
+      const rowMerged = api.cfgModalCollect();
+      assert(
+        rowMerged.deployments.length === 2 && same(rowMerged.deployments[0], { backend: "go", dropParams: ["temperature"], unownedRowKey: 1, params: b0params.parsed, paramMap: b0map.parsed }) && same(rowMerged.deployments[1], { backend: "cc", upstream: "new-upstream" }),
+        "u6k) an emptied upstream is deleted, unowned row keys survive, a backend-less row is dropped, and a new row stays clean - each row's dialect box is compared against the baseline text the row was fed, so an unchanged box keeps its key (" + JSON.stringify(rowMerged.deployments) + ")"
+      );
+
+      // The blank-box-means-clear rule is expressed against the text the box was
+      // RENDERED with. A row that carries no rendered baseline at all therefore
+      // cannot be read as a clear: an empty box on such a row would otherwise
+      // delete a dialect key the operator never saw, which is silent data loss on
+      // any future modal path that builds a row without filling `orig`.
+      cfg.draft = freshDraft();
+      cfg.draft.models.glm5 = { deployments: [{ backend: "go", upstream: "u1", params: { top_p: 1 }, dropParams: ["temperature"], paramMap: { max_tokens: "max_output_tokens" } }] };
+      open("models", "glm5", api.cfgDeepCopy(cfg.draft.models.glm5));
+      api.renderCfgModal();
+      cfg.modal.deploys = [{ backend: "go", upstream: "u1", weight: null, backupOnly: false, prev: { backend: "go", upstream: "u1", params: { top_p: 1 }, dropParams: ["temperature"], paramMap: { max_tokens: "max_output_tokens" } } }];
+      mountFields({ "f_d0_params": "", "f_d0_dropParams": "", "f_d0_paramMap": "" });
+      const noBaseline = api.cfgModalCollect();
+      assert(
+        same(noBaseline.deployments, [{ backend: "go", upstream: "u1", params: { top_p: 1 }, dropParams: ["temperature"], paramMap: { max_tokens: "max_output_tokens" } }]),
+        "u6k2) a deployment row with NO rendered baseline keeps every dialect key even though its boxes are empty - a blank box only clears a key the operator was shown (" + JSON.stringify(noBaseline.deployments) + ")"
+      );
+
+      // A backend's id lives INSIDE its element (draft.backends is an array), so
+      // apply has to leave it there; models and presets are keyed maps and drop it.
+      // A config that lost the id does not merely look wrong - it fails validation.
+      const ENV_KEY = "U6_BACKEND_ID_KEY";
+      process.env[ENV_KEY] = "set-for-validation";
+      const vDraft = () => ({
+        port: 8787,
+        backends: [{ id: "go", baseURL: "http://go", apiKeyEnv: ENV_KEY, idleTimeoutMs: 120000 }, { id: "cc", baseURL: "http://cc", apiKeyEnv: ENV_KEY }],
+        models: { m1: { providers: [{ backend: "go", upstream: "u1", dropParams: ["z"] }] } },
+        presets: { p1: { strategy: "affinity", models: ["m1"] } },
+      });
+      const backendFields = (over) =>
+        Object.assign({ f_id: "go", f_baseURL: "http://go", f_apiKeyEnv: ENV_KEY, f_timeoutMs: "90000", f_translateDeveloperRole: true, f_model: "deepseek-v4-flash", f_params: '{"temperature":0.2}' }, over || {});
+      const saveErrors = () => validateConfig(cfg.draft, null, { mode: "save" }).errors || [];
+
+      cfg.draft = vDraft();
+      open("backends", "go", api.cfgDeepCopy(cfg.draft.backends[0]), 0);
+      mountFields(backendFields());
+      api.renderCfgModal();
+      api.cfgApplyModal();
+      assert(!!cfg.draft.backends[0] && cfg.draft.backends[0].id === "go", "u6l1) editing a backend stores the element with its id intact");
+      assert(saveErrors().length === 0, "u6l2) the config a backend edit produces validates in save mode" + (saveErrors().length ? " - " + saveErrors().map((e) => e.path + ": " + e.message).join("; ") : ""));
+
+      cfg.draft = vDraft();
+      open("backends", null, {});
+      mountFields(backendFields({ f_id: "fresh-backend" }));
+      api.renderCfgModal();
+      api.cfgApplyModal();
+      const pushedBackend = cfg.draft.backends[cfg.draft.backends.length - 1];
+      assert(!!pushedBackend && pushedBackend.id === "fresh-backend", "u6l3) adding a backend stores the pushed element with its id intact");
+      assert(saveErrors().length === 0, "u6l4) the config a backend add produces validates in save mode");
+
+      cfg.draft = vDraft();
+      confirmLog.length = 0;
+      confirmAnswer = true;
+      open("backends", "go", api.cfgDeepCopy(cfg.draft.backends[0]), 0);
+      mountFields(backendFields({ f_id: "go-renamed" }));
+      api.renderCfgModal();
+      api.cfgApplyModal();
+      assert(!!cfg.draft.backends[0] && cfg.draft.backends[0].id === "go-renamed", "u6l5) accepting a backend rename stores the element under the new id");
+      assert(cfg.draft.models.m1.providers[0].backend === "go-renamed", "u6l6) a backend rename still rewrites the reference in a legacy `providers` array (this draft is the pre-v3 shape, which a rename must not silently drop)");
+      assert(confirmLog.length === 1 && /Rename 'go' to 'go-renamed'\?/.test(confirmLog[0]), "u6l7) the rename prompt is still offered for a backend id change");
+      delete process.env[ENV_KEY];
+
+      // A form value the user never filled in must not become a value: an emptied
+      // id has no identity to store under, so apply refuses it with a message
+      // instead of offering "Rename 'go' to 'undefined'?" and then a 400.
+      cfg.draft = vDraft();
+      confirmLog.length = 0;
+      open("backends", "go", api.cfgDeepCopy(cfg.draft.backends[0]), 0);
+      mountFields(backendFields({ f_id: "" }));
+      api.renderCfgModal();
+      api.cfgApplyModal();
+      assert(
+        cfg.draft.backends[0].id === "go" && confirmLog.length === 0 && /id is required/.test(fields.get("cfgModalIssues").innerHTML || ""),
+        "u6n1) an emptied backend id is refused with a message instead of a rename to undefined"
+      );
+      cfg.draft = freshDraft();
+      confirmLog.length = 0;
+      open("models", "glm-5.3-flash", Object.assign({ id: "glm-5.3-flash" }, api.cfgDeepCopy(modelEntry)), 0);
+      mountFields(deployFields(modelEntry, modelFields({ f_id: "" })));
+      api.renderCfgModal();
+      api.cfgApplyModal();
+      assert(
+        confirmLog.length === 0 && /id is required/.test(fields.get("cfgModalIssues").innerHTML || ""),
+        "u6n2) an emptied model id is refused too (one rule across the three kinds)"
+      );
+
+      // ---- real-render mode ----------------------------------------------------
+      // The block above hand-feeds every scalar form value, so it cannot see the
+      // render -> form-value -> collect half: a field helper that manufactures a
+      // value nobody typed (cfgField JSON-encoding an ABSENT textarea into the two
+      // characters `""`, say) is invisible to it. This mode reads the HTML that
+      // renderCfgModal actually emits, the way a browser would, and then opens and
+      // saves every entry of the real mirror config untouched.
+      const renderNeeded = ["cfgDeepCopy", "cfgParseMaybeJson", "cfgJsonText", "cfgMutate", "cfgCloseModal", "cfgEnvNames", "cfgField", "deploymentListOf", "renderDeployList", "renderCfgModal", "cfgModalCollect", "cfgApplyModal", "countRefsTo"];
+      const rBodies = [];
+      const rBroken = [];
+      const parses = (src) => { try { new vm.Script(src); return true; } catch { return false; } };
+      for (const name of renderNeeded) {
+        const body = sliceFunction(htmlSource, name);
+        if (!body || !parses(body)) {
+          rBroken.push(name);
+          continue;
+        }
+        rBodies.push(body);
+      }
+      const rDollar = (htmlSource.match(/\nconst \$ = [^\n]*\n/) || [])[0];
+      const rEsc = (htmlSource.match(/\nconst esc = [^\n]*\n/) || [])[0];
+      for (const pair of [["$", rDollar], ["esc", rEsc]]) if (!pair[1] || !parses(pair[1])) rBroken.push(pair[0]);
+
+      // A fake DOM fed by the emitted HTML: <input value='..'>, <textarea>..</textarea>
+      // and the selected <select> option, unescaped through the same five entities
+      // esc writes. cfgModalBody.innerHTML is the seam the renderer writes through.
+      const rFields = new Map();
+      const rField = (id) => {
+        if (!rFields.has(id)) {
+          // A field can be a HOST the renderer writes into after the body was
+          // parsed (the deployment list and the preset model list both are), so
+          // its innerHTML setter parses the rows it is handed. That parse MERGES:
+          // the body assignment below owns the reset, because it is the one write
+          // that starts a fresh modal.
+          let inner = "";
+          rFields.set(id, {
+            value: "",
+            checked: false,
+            style: {},
+            textContent: "",
+            get innerHTML() { return inner; },
+            set innerHTML(html) { inner = html; rParse(html); },
+          });
+        }
+        return rFields.get(id);
+      };
+      const rUnesc = (s) => String(s).replace(/&#39;/g, "'").replace(/&quot;/g, "\"").replace(/&gt;/g, ">").replace(/&lt;/g, "<").replace(/&amp;/g, "&");
+      const rAttrs = (s) => {
+        const out = {};
+        for (const m of s.matchAll(/([A-Za-z0-9_-]+)(?:='([^']*)')?/g)) out[m[1]] = m[2] === undefined ? "" : rUnesc(m[2]);
+        return out;
+      };
+      const rParse = (html) => {
+        for (const m of html.matchAll(/<input\b([^>]*)>/g)) {
+          const a = rAttrs(m[1]);
+          if (a.id) rFields.set(a.id, { value: a.value || "", checked: "checked" in a, style: {}, innerHTML: "", textContent: "" });
+        }
+        for (const m of html.matchAll(/<textarea\b([^>]*)>([\s\S]*?)<\/textarea>/g)) {
+          const a = rAttrs(m[1]);
+          if (a.id) rFields.set(a.id, { value: rUnesc(m[2]), checked: false, style: {}, innerHTML: "", textContent: "" });
+        }
+        for (const m of html.matchAll(/<select\b([^>]*)>([\s\S]*?)<\/select>/g)) {
+          const a = rAttrs(m[1]);
+          if (!a.id) continue;
+          const opt = /<option value='([^']*)' selected>/.exec(m[2]);
+          rFields.set(a.id, { value: opt ? rUnesc(opt[1]) : "", checked: false, style: {}, innerHTML: "", textContent: "" });
+        }
+      };
+      const rBody = {
+        value: "",
+        checked: false,
+        style: {},
+        textContent: "",
+        get innerHTML() { return ""; },
+        set innerHTML(html) { rFields.clear(); rParse(html); },
+      };
+      const rCfg = { draft: null, modal: null, dirty: false, envNames: [], loaded: false };
+      const rSandbox = {
+        cfg: rCfg,
+        console,
+        confirm: () => true,
+        renderConfig: () => {},
+        ICONS: { warn: "" },
+        document: { getElementById: (id) => (id === "cfgModalBody" ? rBody : rField(id)) },
+        renderPresetModelList: () => {},
+      };
+      let apiR = null;
+      let rEvalError = null;
+      if (rBroken.length === 0) {
+        const program = [rDollar, rEsc]
+          .concat(rBodies, ["({ $, esc, cfgField, cfgJsonText, cfgEnvNames, renderCfgModal, cfgModalCollect, cfgApplyModal, cfgDeepCopy })"])
+          .join("\n");
+        try {
+          apiR = vm.runInContext(program, vm.createContext(rSandbox));
+        } catch (e) {
+          rEvalError = e.message;
+        }
+      }
+      const renderOk = rBroken.length === 0 && !rEvalError && !!apiR && typeof apiR.renderCfgModal === "function" && typeof apiR.cfgApplyModal === "function" && typeof apiR.cfgField === "function";
+      assert(
+        renderOk,
+        "u6m1) the real-render harness extracted " + rBodies.length + "/" + renderNeeded.length + " function(s) plus $ and esc" +
+          (rBroken.length ? " [NOT FOUND OR UNPARSEABLE: " + rBroken.join(", ") + "]" : "") +
+          (rEvalError ? " [evaluation failed: " + rEvalError + "]" : "")
+      );
+
+      let mirror = null;
+      let mirrorError = null;
+      try {
+        mirror = JSON.parse(await readFile(join(import.meta.dirname, "config.json"), "utf8"));
+      } catch (e) {
+        mirrorError = e.message;
+      }
+      assert(!!mirror && Array.isArray(mirror.backends) && !!mirror.models && !!mirror.presets, "u6m2) the mirror config.json was read for the round-trip check" + (mirrorError ? " [unreadable: " + mirrorError + "]" : ""));
+
+      const rJson = (v) => JSON.stringify(v);
+      const firstDiff = (a, b, path) => {
+        const p = path || "";
+        if (Array.isArray(a) || Array.isArray(b)) {
+          if (!Array.isArray(a) || !Array.isArray(b)) return p + " " + rJson(a) + " -> " + rJson(b);
+          for (let i = 0; i < Math.max(a.length, b.length); i++) if (rJson(a[i]) !== rJson(b[i])) return firstDiff(a[i], b[i], p + "[" + i + "]");
+          return p;
+        }
+        if (a && b && typeof a === "object" && typeof b === "object") {
+          for (const k of Array.from(new Set(Object.keys(a).concat(Object.keys(b))))) {
+            if (!(k in a)) return p + "." + k + " added: " + rJson(b[k]);
+            if (!(k in b)) return p + "." + k + " LOST: " + rJson(a[k]);
+            if (rJson(a[k]) !== rJson(b[k])) return firstDiff(a[k], b[k], p + "." + k);
+          }
+          return p;
+        }
+        return p + " " + rJson(a) + " -> " + rJson(b);
+      };
+
+      const rDiffs = [];
+      const rErrs = [];
+      let rCount = 0;
+      let rDiffer = 0;
+      let rIdFields = 0;
+      let rInvalid = 0;
+      let rModelSaves = 0;
+      let rModelsMatchingConverter = 0;
+      // What a no-op save is EXPECTED to produce. Backends and presets have no v3
+      // migration, so they must come back exactly as they went in. A model is the
+      // one entry the bridge re-writes: `providers` becomes `deployments` derived
+      // by the SERVER's own converter (so the expectation is not a second policy
+      // written here), and the editor's own omission rules are applied on top -
+      // no `weight` at the default 1, no `exposed` at the default true, dialect
+      // keys taken from the former provider rows.
+      const modelExpectation = (entry) => {
+        const conv = convertLegacyConfig({ models: { m: JSON.parse(JSON.stringify(entry)) }, presets: {} }).config.models.m;
+        const out = {};
+        for (const k of Object.keys(conv)) {
+          if (k === "providers" || k === "affinityPool") continue;
+          out[k] = conv[k];
+        }
+        out.deployments = (conv.deployments || []).map((d) => Object.assign({}, d));
+        for (const d of out.deployments) if (d.weight === 1) delete d.weight;
+        if (out.exposed === true) delete out.exposed;
+        return out;
+      };
+      // The editor's migration is the SERVER's migration, or the save would write
+      // a shape the router reads differently from the one the UI showed.
+      const bridgeAgrees = (stored, entry) => {
+        const want = modelExpectation(entry);
+        return rJson(stored) === rJson(want);
+      };
+      // POST /api/config runs the same bridge over the whole candidate before it
+      // validates or writes, so the draft is measured the way the server would
+      // read it. The mirror cannot be clean on its own account: 19 ids are both a
+      // model and a preset, which the v3 validator refuses, so the baseline error
+      // set is captured once and a save is only counted against what it ADDS.
+      const rBridged = (draft) => convertLegacyConfig(JSON.parse(JSON.stringify(draft))).config;
+      const rErrKeys = (cfgIn) => validateConfig(cfgIn, null, { mode: "save" }).errors.map((e) => e.path + ": " + e.message);
+      const rBaseline = new Set(rErrKeys(rBridged(mirror)));
+      const rSaveUntouched = (kind, key, entry, index, expect) => {
+        rCount++;
+        rCfg.draft = JSON.parse(JSON.stringify(mirror));
+        // The tab opens a map entry with its key injected as the id (index.html:5179),
+        // which is what puts the id in the ID box; a backend already carries its own.
+        const data = kind === "backends" ? entry : Object.assign({ id: key }, entry);
+        rCfg.modal = { kind, key, data: JSON.parse(JSON.stringify(data)), index: index == null ? null : index, deploys: [], models: [], exposedOn: !(data && data.exposed === false) };
+        apiR.renderCfgModal();
+        if (rFields.has("f_id")) rIdFields++;
+        apiR.cfgApplyModal();
+        const stored = kind === "backends" ? rCfg.draft.backends[index] : rCfg.draft[kind][key];
+        if (kind === "models") {
+          rModelSaves++;
+          if (bridgeAgrees(stored, entry)) rModelsMatchingConverter++;
+        }
+        const want = expect === undefined ? entry : expect;
+        if (rJson(stored) !== rJson(want)) {
+          rDiffer++;
+          if (rDiffs.length < 8) rDiffs.push(kind + "." + key + ": " + firstDiff(want, stored));
+        }
+        const fresh = rErrKeys(rBridged(rCfg.draft)).filter((e) => !rBaseline.has(e));
+        if (fresh.length) {
+          rInvalid++;
+          if (rErrs.length < 6) rErrs.push(kind + "." + key + ": " + fresh.join("; "));
+        }
+      };
+      // The exposed box is the one control whose DEFAULT is on, so BOTH directions
+      // are pinned here against the HTML the render actually emitted: an entry
+      // carrying `exposed: false` must come up UNCHECKED and an entry with the key
+      // ABSENT must come up CHECKED. Getting this backwards hides a model from
+      // consumers with no visible error anywhere.
+      const rExposedCase = (entry) => {
+        rCfg.draft = { backends: [], models: { ex: JSON.parse(JSON.stringify(entry)) }, presets: {} };
+        rCfg.modal = { kind: "models", key: "ex", data: Object.assign({ id: "ex" }, JSON.parse(JSON.stringify(entry))), index: null, deploys: [], models: [], exposedOn: entry.exposed !== false };
+        apiR.renderCfgModal();
+        const box = rFields.get("f_exposed");
+        const out = apiR.cfgModalCollect();
+        return { box: box ? box.checked : null, exposed: out && Object.prototype.hasOwnProperty.call(out, "exposed") ? out.exposed : "absent" };
+      };
+      const rHidden = rExposedCase({ deployments: [{ backend: "u7b", upstream: "up-1" }], exposed: false });
+      const rDefaulted = rExposedCase({ deployments: [{ backend: "u7b", upstream: "up-1" }] });
+      assert(
+        rHidden.box === false && rHidden.exposed === false,
+        "u6m0a) an entry carrying exposed: false renders the Exposed box UNCHECKED and collects that one key back (box " + rHidden.box + ", collected " + rJson(rHidden.exposed) + ")"
+      );
+      assert(
+        rDefaulted.box === true && rDefaulted.exposed === "absent",
+        "u6m0b) an entry with NO exposed key renders the box CHECKED and collects nothing for it, because the default IS exposed (box " + rDefaulted.box + ", collected " + rJson(rDefaulted.exposed) + ")"
+      );
+      if (renderOk && mirror) {
+        // The validator requires every referenced apiKeyEnv to exist in THIS
+        // process; that is about the machine, not about the payload, so stand the
+        // names up for the duration and take them back down.
+        const stoodUp = new Set();
+        for (const b of mirror.backends) if (b && b.apiKeyEnv && !(b.apiKeyEnv in process.env)) stoodUp.add(b.apiKeyEnv);
+        for (const n of stoodUp) process.env[n] = "u6m-placeholder";
+        for (const [id, m] of Object.entries(mirror.models)) rSaveUntouched("models", id, m, null, modelExpectation(m));
+        for (const [id, p] of Object.entries(mirror.presets)) rSaveUntouched("presets", id, p);
+        mirror.backends.forEach((b, i) => rSaveUntouched("backends", b.id, b, i));
+        for (const n of stoodUp) delete process.env[n];
+      }
+      assert(
+        rCount > 0 && rIdFields === rCount,
+        "u6m3) all " + rCount + " mirror entries rendered a real id field out of the emitted HTML (" + rIdFields + " did) - a silent no-op would pass the round-trip vacuously"
+      );
+      assert(
+        rModelSaves > 0 && rModelsMatchingConverter === rModelSaves,
+        "u6m3b) every one of the " + rModelSaves + " mirror model saves derives its deployments from the SERVER's converter output for that same entry - same rows, same order, same backupOnly, same dialect keys (" + rModelsMatchingConverter + " did) - the UI and the router must not hold two different migrations"
+      );
+      assert(
+        rDiffer === 0,
+        "u6m4) a no-op open+save of all " + rCount + " mirror entries through the REAL render path produces exactly the expected result: backends and presets byte-identical, and each old-shape model exactly its v3 conversion - no key invented, none dropped, none moved (" + rDiffer + " differ)" + (rDiffs.length ? ": " + rDiffs.join(" | ") : "")
+      );
+      assert(
+        rInvalid === 0,
+        "u6m5) every payload the real render path produces validates in save mode (" + rInvalid + " of " + rCount + " entry saves were rejected)" + (rErrs.length ? ": " + rErrs.join(" | ") : "")
+      );
+
+      // ---- Task 9: the editor round-trips the REAL mirror config --------------
+      // One model's LABEL is the only thing a user changed. Everything else has
+      // to come back as it went in - every DEPLOYMENT's dialect keys above all -
+      // the payload has to still validate, and the served-id surface must not
+      // move. The subject id and its deployment shape are asserted FIRST, so a
+      // mirror rename or a deployment-less entry fails here loudly instead of
+      // quietly testing some other id, or testing an empty list that cannot fail.
+      // The subject is picked from whatever the mirror actually carries, so the
+      // block runs against a 17-model and a 20-model mirror alike. The dialect
+      // axis cannot ride on it: the committed mirror has no deployment-level
+      // dialect key anywhere, so the fixture further down owns that axis and
+      // this pick only has to be a real entry the editor can round-trip.
+      // Served-surface comparisons must use the shape the router actually runs:
+      // the load pipeline converts an old-shape file in memory, so the mirror as
+      // written and the mirror as served are two different objects. This is the
+      // project's own converter, so the compared form is the effective config,
+      // not a hand-written approximation of it. The SUBJECT comes from that
+      // served form, because that is the shape the editor now produces.
+      const u9MirrorServed = convertLegacyConfig(mirror).config;
+      const u9Subject = Object.keys((u9MirrorServed && u9MirrorServed.models) || {}).reduce((best, id) => {
+        const n = (u9MirrorServed.models[id] && Array.isArray(u9MirrorServed.models[id].deployments) ? u9MirrorServed.models[id].deployments : []).length;
+        return n > (best.n || 0) ? { id, n } : best;
+      }, { id: null, n: 0 }).id;
+      // servedIds is the rule the Task 7 harness also extracts, through the same
+      // helper. The block pulls it again and fails loudly on its own, so the
+      // surface comparison below can never run against a rule that silently
+      // vanished from index.html.
+      const u9Needed = ["servedIds"];
+      const u9Bodies = [];
+      const u9Broken = [];
+      for (const name of u9Needed) {
+        const body = sliceFunction(htmlSource, name);
+        if (!body || !parses(body)) { u9Broken.push(name); continue; }
+        u9Bodies.push(body);
+      }
+      let u9Api = null;
+      let u9EvalError = null;
+      if (u9Broken.length === 0) {
+        try { u9Api = vm.runInContext(u9Bodies.concat(["({ servedIds })"]).join("\n"), vm.createContext({})); } catch (e) { u9EvalError = e.message; }
+      }
+      const u9Ok = u9Broken.length === 0 && !u9EvalError && !!u9Api && typeof u9Api.servedIds === "function";
+      assert(
+        u9Ok,
+        "u9a) the served-id rule was extracted from index.html (" + u9Bodies.length + "/" + u9Needed.length + ") and evaluated for the before/after comparison" +
+          (u9Broken.length ? " [NOT FOUND OR UNPARSEABLE: " + u9Broken.join(", ") + "]" : "") +
+          (u9EvalError ? " [evaluation failed: " + u9EvalError + "]" : "")
+      );
+      // Served-surface comparisons must use the shape the router actually runs:
+      // the load pipeline converts an old-shape file in memory, so the mirror as
+      // written and the mirror as served are two different objects. This is the
+      // project's own converter, so the compared form is the effective config,
+      // not a hand-written approximation of it.
+      const u9Entry = u9MirrorServed && u9MirrorServed.models ? u9MirrorServed.models[u9Subject] : null;
+      assert(
+        !!u9Entry,
+        "u9b) the round-trip subject is the served model with the most deployments ('" + u9Subject + "')" +
+          (u9Entry
+            ? " [picked from the " + Object.keys(u9MirrorServed.models).length + " model(s) this mirror carries]"
+            : u9MirrorServed && u9MirrorServed.models
+              ? " [the mirror carries " + Object.keys(u9MirrorServed.models).length + " model(s) and the selection found none - the pick is content-dependent, so it has to come from the file]"
+              : " [the config has no models object]")
+      );
+      const u9Provs = u9Entry && Array.isArray(u9Entry.deployments) ? u9Entry.deployments : null;
+      const u9Dialect = u9Provs ? u9Provs.filter((p) => p && (Array.isArray(p.dropParams) || p.params || p.paramMap)).length : 0;
+      assert(
+        !!u9Provs && u9Provs.length > 0,
+        // An empty deployment list is what makes the round-trip below vacuous, so
+        // that is what this guards. The mirror's own dialect-key count is an
+        // ANNOTATION - it is 0 on the committed config and cannot be asserted -
+        // and the dialect-key coverage is guaranteed by the fixture round-trip.
+        "u9c) the round-trip subject model carries " + (u9Provs ? u9Provs.length : 0) + " deployment(s) (an empty list would make the round-trip assertions below vacuous, which is all this guarantees; this mirror's subject holds " + u9Dialect + " deployment(s) with a dropParams/params/paramMap key, an annotation, not a check - the dialect axis is guaranteed by the fixture round-trip further down)"
+      );
+
+      if (!(u9Ok && u9Entry && u9Provs && u9Provs.length > 0)) {
+        assert(false, "u9c2) the label-only round-trip could not be exercised: the subject model or the served-id rule is missing");
+      } else {
+        const u9Label = "GLM 5.3 Flash (task 9 edit)";
+        rCfg.draft = JSON.parse(JSON.stringify(mirror));
+        rCfg.modal = { kind: "models", key: u9Subject, data: Object.assign({ id: u9Subject }, JSON.parse(JSON.stringify(u9Entry))), index: null, deploys: [], models: [], exposedOn: u9Entry.exposed !== false };
+        apiR.renderCfgModal();
+        const u9LabelField = rFields.get("f_metaLabel");
+        if (u9LabelField) u9LabelField.value = u9Label;
+        const u9Collected = apiR.cfgModalCollect();
+        apiR.cfgApplyModal();
+        const u9Stored = rCfg.draft.models[u9Subject];
+
+        // The whole entry, not just the label: a save that quietly drops a key
+        // the form does not own is the defect this pins. `u9Entry` is the SERVER's
+        // conversion of the mirror entry, and that conversion spells out
+        // `exposed: true` while the editor omits the default (R9) - so the default
+        // is removed from the expectation rather than written by the form.
+        const u9Expect = JSON.parse(JSON.stringify(u9Entry));
+        if (u9Expect.exposed === true) delete u9Expect.exposed;
+        u9Expect.meta.label = u9Label;
+        const u9Diff = firstDiff(u9Expect, u9Stored);
+        assert(
+          !!u9LabelField && u9Diff === "" && !!u9Stored && !!u9Stored.meta && u9Stored.meta.label === u9Label,
+          "u9d) the real render + collect + apply of a LABEL-ONLY edit on the mirror's '" + u9Subject + "' stores it byte-identical to its input except meta.label ('" + u9Label + "')" +
+            (u9LabelField ? "" : " [f_metaLabel was never rendered]") +
+            (u9Stored && u9Stored.meta ? "" : " [meta missing after apply]") +
+            (u9Diff === "" ? "" : " [first difference: " + u9Diff + "]")
+        );
+
+        // Every provider-level dialect key the inputs carry, across both the real
+        // mirror subject and the fixture below, compared by value in the collected
+        // object and in the stored entry. The pairing is inside the helper because
+        // the fixture can be empty and an empty list must count as nothing rather
+        // than as a clean result.
+        const u9DialectRows = [];
+        const u9KeyDiffs = [];
+        const u9DialectDiff = (subject, where, list, input) => {
+          if (!Array.isArray(list) || list.length !== input.length) {
+            u9KeyDiffs.push(subject + " " + where + ": deployment count " + (Array.isArray(list) ? list.length : "none") + " != " + input.length);
+            return;
+          }
+          input.forEach((want, i) => {
+            for (const k of ["dropParams", "params", "paramMap"]) {
+              if (want && want[k] !== undefined) u9DialectRows.push(subject + "[" + i + "]." + k);
+              if (rJson(list[i] && list[i][k]) !== rJson(want && want[k])) {
+                u9KeyDiffs.push(subject + " " + where + "[" + i + "]." + k + ": " + rJson(want && want[k]) + " -> " + rJson(list[i] && list[i][k]));
+              }
+            }
+          });
+        };
+        u9DialectDiff("mirror", "collected", u9Collected && u9Collected.deployments, u9Provs);
+        u9DialectDiff("mirror", "stored", u9Stored && u9Stored.deployments, u9Provs);
+        assert(
+          u9KeyDiffs.length === 0,
+          "u9e) every deployment-level dialect key present in the input survives the round-trip unchanged, in the collected object and in the stored entry (" + u9KeyDiffs.length + " key value(s) moved, " + u9DialectRows.length + " dialect key(s) present to check here: " + u9DialectRows.join(", ") + ")"
+        );
+
+        // The validator requires every referenced apiKeyEnv to exist in THIS
+        // process; that is about the machine, not the payload.
+        const u9StoodUp = new Set();
+        for (const b of rCfg.draft.backends || []) if (b && b.apiKeyEnv && !(b.apiKeyEnv in process.env)) u9StoodUp.add(b.apiKeyEnv);
+        for (const n of u9StoodUp) process.env[n] = "u9-placeholder";
+        let u9Verdict = null;
+        try { u9Verdict = validateConfig(rBridged(rCfg.draft), null, { mode: "save" }); } finally { for (const n of u9StoodUp) delete process.env[n]; }
+        // The draft is the whole MIRROR, so it is measured the way POST /api/config
+        // measures it - through the bridge - and against the baseline the untouched
+        // mirror already reports: 19 mirror ids are both a model and a preset, which
+        // the v3 validator refuses and no edit to one model can repair. A rejected
+        // save is therefore one that ADDS an error.
+        const u9Errors = u9Verdict ? u9Verdict.errors.map((e) => e.path + ": " + e.message).filter((e) => !rBaseline.has(e)) : null;
+        assert(
+          !!u9Errors && u9Errors.length === 0,
+          "u9f) the payload a label-only edit of the mirror subject produces adds no NEW validation error in SAVE mode, measured on the bridged draft against the untouched mirror's own baseline (" + (u9Errors ? u9Errors.length + " new error(s)" : "no verdict") + ")" +
+            (u9Errors && u9Errors.length ? ": " + u9Errors.join("; ") : "")
+        );
+
+        // The dialect axis, guaranteed by construction --------------------------
+
+        // The mirror is real data and cannot be made to carry provider-level
+        // dialect keys: the committed config has none anywhere, and a future mirror
+        // is free to drop them again. So the axis is proven on a config this test
+        // builds, through the same REAL render -> form-value -> collect -> apply
+        // path the u6 real-render mode established: providers that carry every
+        // dialect key, a row whose upstream is emptied, and a model-level
+        // `deployments` list the form has no field for, so the merge-preserve claim
+        // is exercised on data whose shape is known rather than hoped for.
+        // The before/after surface lists are taken from the LIVE mirror here,
+        // ahead of the fixture rebuilding a draft of its own.
+        const u9BeforeList = u9Api.servedIds(u9MirrorServed);
+        const u9FxModel = "u9-fx-dialect-model";
+        const u9FxBackend = "u9-fx-backend";
+        const u9FxKeyEnv = "U9_FX_KEY";
+        const u9FxTail = [
+          { backend: u9FxBackend, upstream: "u9-up-2", dropParams: ["thinking"], params: { top_p: 1 }, paramMap: { max_tokens: "max_output_tokens" } },
+          { backend: u9FxBackend, upstream: "u9-up-3", dropParams: ["temperature"] },
+        ];
+        const u9FxInput = {
+          providers: [
+            { backend: u9FxBackend, upstream: "u9-up-1", dropParams: ["thinking"], params: { reasoning_effort: "high" }, paramMap: { top_p: "top_p" } },
+            { backend: u9FxBackend, upstream: "", dropParams: ["presence_penalty"] },
+          ].concat(u9FxTail.map((p) => JSON.parse(JSON.stringify(p)))),
+          affinityPool: 1,
+          params: { temperature: 0.7 },
+          retry: { maxRetries: 2, baseMs: 500, maxMs: 4000, multiplier: 2, totalMs: 20000 },
+          meta: { label: "U9 dialect fixture", contextWindow: 200000, unweightedMeta: "keep" },
+          exposed: false,
+          deployments: [{ backend: u9FxBackend, upstream: "u9-up-1", backupOnly: true }],
+        };
+        // What the form must produce from those rows: the deployment array the
+        // server's converter derives (row 2 carries affinityPool 4 > 2, so it is
+        // the ordered fallback tail), carrying every dialect key, minus the
+        // upstream of the row whose box was left empty, plus the label.
+        const u9FxDraft = JSON.parse(JSON.stringify(mirror));
+        u9FxDraft.backends = [{ id: u9FxBackend, baseURL: "http://127.0.0.1:9", apiKeyEnv: u9FxKeyEnv, model: "u9-default-upstream" }];
+        u9FxDraft.models = {};
+        u9FxDraft.models[u9FxModel] = JSON.parse(JSON.stringify(u9FxInput));
+        u9FxDraft.presets = { "u9-fx-preset": { strategy: "affinity", models: [u9FxModel], exposed: false } };
+        // What the form must produce from those rows: the deployment array the
+        // SERVER's converter derives from the same input (pool 1 of 4, so rows 2-4
+        // are the ordered fallback tail), carrying every dialect key, minus the
+        // upstream of the row whose box was left empty, plus the label. Built from
+        // convertLegacyConfig rather than written out, so this test cannot hold a
+        // second migration policy.
+        const u9FxConverted = convertLegacyConfig({ models: { m: JSON.parse(JSON.stringify(u9FxInput)) }, presets: {} }).config.models.m;
+        const u9FxLabel = "U9 dialect fixture (label edit)";
+        const u9FxExpect = Object.assign({}, u9FxConverted, {
+          deployments: u9FxConverted.deployments.map((d) => Object.assign({}, d)),
+          meta: Object.assign({}, u9FxConverted.meta, { label: u9FxLabel }),
+        });
+        delete u9FxExpect.providers;
+        delete u9FxExpect.affinityPool;
+        // The one intended difference: the editor deletes the key of a box the
+        // operator emptied, where the converter would carry an empty string on.
+        for (const d of u9FxExpect.deployments) if (d.upstream === "") delete d.upstream;
+        process.env[u9FxKeyEnv] = "u9-fx-placeholder";
+        try {
+          rCfg.draft = u9FxDraft;
+          rCfg.modal = { kind: "models", key: u9FxModel, data: Object.assign({ id: u9FxModel }, JSON.parse(JSON.stringify(u9FxInput))), index: null, deploys: [], models: [] };
+          apiR.renderCfgModal();
+          const u9FxRowHtml = rField("f_deploylist").innerHTML;
+          const u9FxRowCount = (u9FxRowHtml.match(/data-dep-upstream='/g) || []).length;
+          const u9FxUpstreams = u9FxInput.providers.filter((p) => p.upstream).filter((p) => u9FxRowHtml.includes("value='" + p.upstream + "'")).length;
+          const u9FxLabelField = rFields.get("f_metaLabel");
+          assert(
+            u9FxRowCount === u9FxInput.providers.length && u9FxUpstreams === u9FxInput.providers.length - 1 && !!u9FxLabelField,
+            "u9x1) the dialect fixture rendered every one of its " + u9FxInput.providers.length + " deployment row(s) into the deployment list, carrying the upstreams it was given (" + u9FxRowCount + " upstream input(s) emitted, " + u9FxUpstreams + " upstream value(s) present, label field " + (u9FxLabelField ? "present" : "MISSING") + ") - a render that emitted nothing would make the round-trip below vacuous"
+          );
+          if (u9FxLabelField) u9FxLabelField.value = u9FxLabel;
+          const u9FxCollected = apiR.cfgModalCollect();
+          apiR.cfgApplyModal();
+          const u9FxStored = rCfg.draft.models[u9FxModel];
+
+          // The whole entry, not just the label. Name the dialect keys explicitly:
+          // a helper bug that returns the input object itself would otherwise pass
+          // every value comparison here, and so would one that drops a key from
+          // both sides at once. u9FxExpect is built above from the input; the one
+          // intended difference is the fixture row whose upstream was emptied (the
+          // editor drops that key), and the `let` keeps the label edit below
+          // explicit rather than folded into the literal.
+          const u9FxPending = [];
+          const u9FxCheck = (where, list) => {
+            if (!Array.isArray(list) || list.length !== u9FxInput.providers.length) {
+              u9FxPending.push(where + ": deployment count " + (Array.isArray(list) ? list.length : "none") + " != " + u9FxInput.providers.length);
+              return;
+            }
+            u9FxInput.providers.forEach((want, i) => {
+              for (const k of ["dropParams", "params", "paramMap"]) {
+                if (want[k] !== undefined && rJson(list[i] && list[i][k]) !== rJson(want[k])) {
+                  u9FxPending.push(where + "[" + i + "]." + k + ": " + rJson(want[k]) + " -> " + rJson(list[i] && list[i][k]));
+                }
+              }
+            });
+          };
+          u9FxCheck("collected", u9FxCollected && u9FxCollected.deployments);
+          u9FxCheck("stored", u9FxStored && u9FxStored.deployments);
+          assert(
+            u9FxPending.length === 0,
+            "u9y1) all " + u9FxInput.providers.length + " fixture rows keep the dialect key they were given - dropParams, params and paramMap each present on the ones that carry them - through render -> collect -> apply, collected and stored (" + u9FxPending.length + " missing or changed" + (u9FxPending.length ? ": " + u9FxPending.slice(0, 6).join(" | ") : "") + ")"
+          );
+
+          u9DialectDiff("fixture", "collected", u9FxCollected && u9FxCollected.deployments, u9FxExpect.deployments);
+          u9DialectDiff("fixture", "stored", u9FxStored && u9FxStored.deployments, u9FxExpect.deployments);
+          assert(
+            u9KeyDiffs.length === 0 && u9DialectRows.length > 0,
+            "u9y2) the fixture carries " + u9DialectRows.length + " deployment-level dialect key(s) in total and every one survives the round-trip by value (" + u9KeyDiffs.length + " moved" + (u9KeyDiffs.length ? ": " + u9KeyDiffs.slice(0, 6).join(" | ") : "") + ")"
+          );
+
+          // Key order is NOT compared here: a legacy row keeps the provider's own
+          // key order (and any key the form does not own), which is the editor's
+          // preservation behavior, while the converter re-emits the canonical
+          // order. What must match is the CONTENT of every deployment, so the
+          // comparison is made on key-sorted copies and any LOST/added is real.
+          const u9FxSorted = (v) => JSON.parse(norm(v));
+          const u9FxDiff = firstDiff(u9FxSorted(u9FxExpect), u9FxSorted(u9FxStored));
+          assert(
+            !!u9FxStored && u9FxDiff === "",
+            "u9y3) the fixture entry survives render -> collect -> apply with every deployment equal BY VALUE to the one the SERVER's converter derives from the same provider rows - the label ('" + u9FxLabel + "') and the one provider whose upstream box was left empty are the only intended differences" +
+              (u9FxDiff === "" ? "" : " [first difference: " + u9FxDiff + "]")
+          );
+          const u9FxVerdict = validateConfig(rCfg.draft, null, { mode: "save" });
+          const u9FxErrs = u9FxVerdict.errors.map((e) => e.path + ": " + e.message);
+          const u9FxBlankIn = u9FxInput.providers.map((p, i) => (p.upstream ? -1 : i)).filter((i) => i >= 0);
+          assert(
+            u9FxErrs.length === u9FxBlankIn.length &&
+              u9FxErrs.every((e, i) => e === "models." + u9FxModel + ".deployments[" + u9FxBlankIn[i] + "].upstream: upstream is required"),
+            "u9y4) the fixture payload's ONLY validation error is the one the editor's blank-upstream rule creates: a row whose box was left empty keeps its place and loses its upstream key, which SAVE mode refuses - so the editor can hand the server a payload it will reject, and the row that does it is exactly the row that was emptied (" + u9FxErrs.length + " error(s)" + (u9FxErrs.length ? ": " + u9FxErrs.join("; ") : "") + ")"
+          );
+        } finally {
+          delete process.env[u9FxKeyEnv];
+        }
+
+        // Back to the mirror draft the label-only edit produced: the served-surface
+        // assertions below are about that edit, not about the fixture. Rebuilt from
+        // the mirror rather than aliased, so the children cannot outlive a
+        // reference that is about to be replaced.
+        rCfg.draft = JSON.parse(JSON.stringify(mirror));
+        rCfg.draft.models[u9Subject].meta = Object.assign({}, rCfg.draft.models[u9Subject].meta, { label: u9Label });
+
+        const u9AfterDraft = JSON.parse(JSON.stringify(rCfg.draft));
+        u9AfterDraft.models[u9Subject].meta = Object.assign({}, u9AfterDraft.models[u9Subject].meta, { label: u9Label });
+        const u9AfterList = u9Api.servedIds(convertLegacyConfig(u9AfterDraft).config);
+        let u9FirstMove = -1;
+        for (let i = 0; i < Math.max(u9BeforeList.length, u9AfterList.length) && u9FirstMove < 0; i++) if (u9BeforeList[i] !== u9AfterList[i]) u9FirstMove = i;
+        assert(
+          u9BeforeList.length > 0 && rJson(u9BeforeList) === rJson(u9AfterList),
+          "u9g) a models-only edit leaves the served-id surface alone - the same ids in the same order before and after the edit, which is SURFACE stability only: most of these ids are presets shadowing a same-named model, so this does not show that a model entry itself survived (" + u9BeforeList.length + " -> " + u9AfterList.length + " id(s)" +
+            (u9FirstMove < 0 ? "" : ", first move at index " + u9FirstMove + ": " + rJson(u9BeforeList[u9FirstMove]) + " -> " + rJson(u9AfterList[u9FirstMove])) + ")"
+        );
+
+        // The surface as a REAL router reports it, before and after, and against
+        // the UI's own rule - the editor's view and the endpoint's must agree.
+        // `port` is the one field overridden: a child has to bind an ephemeral
+        // port, and /v1/models does not read it.
+        let u9ServedBefore = null;
+        let u9ServedAfter = null;
+        let u9ServeError = null;
+        try {
+          const u9BeforeChild = await startRouterCfg(Object.assign({}, u9MirrorServed, { port: 0 }), "");
+          try { u9ServedBefore = (await (await fetch(u9BeforeChild.base + "/v1/models")).json()).data.map((x) => x.id); } finally { u9BeforeChild.child.kill(); await rm(u9BeforeChild.dir, { recursive: true, force: true }); }
+          const u9AfterChild = await startRouterCfg(Object.assign({}, rCfg.draft, { port: 0 }), "");
+          try { u9ServedAfter = (await (await fetch(u9AfterChild.base + "/v1/models")).json()).data.map((x) => x.id); } finally { u9AfterChild.child.kill(); await rm(u9AfterChild.dir, { recursive: true, force: true }); }
+        } catch (e) {
+          u9ServeError = e.message;
+        }
+        assert(
+          !!u9ServedBefore && !!u9ServedAfter && u9ServedBefore.length > 0 && rJson(u9ServedBefore) === rJson(u9ServedAfter) && rJson(u9ServedBefore) === rJson(u9BeforeList) && rJson(u9ServedAfter) === rJson(u9AfterList),
+          "u9h) a real router's /v1/models is identical before and after the edit and matches the UI's served-id rule before and after - the endpoint's surface, which is id and order stability only: the ids are mostly presets shadowing a same-named model, so this never proves a model entry survived (" +
+            (u9ServedBefore ? u9ServedBefore.length : "none") + " -> " + (u9ServedAfter ? u9ServedAfter.length : "none") + " id(s), UI rule " + u9AfterList.length + " id(s))" +
+            (u9ServeError ? " [child failed: " + u9ServeError + "]" : "")
+        );
+      }
+      // ---- served-id pickers (Task 7) -----------------------------------------
+      // The Playground selector, the Compare checkboxes and the persisted-selection
+      // restore must all list what the router serves: exposed presets first, then
+      // exposed models, no duplicate. The lists are read back OUT of the DOM the
+      // real functions wrote - loadConfig owns the pgModel populate - and the rule
+      // is cross-checked against a real spawned router's /v1/models, so a picker
+      // that diverges from the served rule fails here rather than in a browser.
+      const pickNeeded = ["loadConfig", "populateCompareModels", "loadPlaygroundState", "pgSend"];
+      const pickBodies = [];
+      const pickBroken = [];
+      for (const name of pickNeeded) {
+        const body = sliceFunction(htmlSource, name);
+        if (!body || !parses(body)) { pickBroken.push(name); continue; }
+        pickBodies.push(body);
+      }
+      const servedBody = sliceFunction(htmlSource, "servedIds");
+      const servedOk = !!servedBody && parses(servedBody);
+      const pickOk = pickBroken.length === 0 && typeof dollarDecl === "string";
+      assert(
+        pickOk,
+        "u7a) the served-id picker harness extracted " + pickBodies.length + "/" + pickNeeded.length + " function(s) plus $ from index.html" +
+          (pickBroken.length ? " [NOT FOUND OR UNPARSEABLE: " + pickBroken.join(", ") + "]" : "") +
+          (typeof dollarDecl === "string" ? "" : " [NOT FOUND OR UNPARSEABLE: $]")
+      );
+
+      if (!pickOk) {
+        assert(false, "u7a2) the served-id picker contract could not be exercised: the harness did not come up");
+      } else {
+        const mkNode = (tag) => ({
+          tagName: String(tag || "div").toUpperCase(),
+          children: [],
+          options: [],
+          value: "",
+          checked: false,
+          disabled: false,
+          className: "",
+          textContent: "",
+          _html: "",
+          style: {},
+          scrollTop: 0,
+          scrollHeight: 0,
+          classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } },
+          appendChild(c) {
+            this.children.push(c);
+            if (this.tagName === "SELECT" && c && c.tagName === "OPTION") this.options.push(c);
+            return c;
+          },
+          get innerHTML() { return this._html; },
+          set innerHTML(v) { this._html = String(v); this.children = []; this.options = []; },
+          addEventListener() {},
+          focus() {},
+          querySelectorAll(sel) {
+            const out = [];
+            const walk = (n) => {
+              for (const c of n.children || []) {
+                if (sel === "input:checked" && c.tagName === "INPUT" && c.checked) out.push(c);
+                walk(c);
+              }
+            };
+            walk(this);
+            return out;
+          },
+        });
+        // A <select> whose value follows the browser's rule: it holds a value only
+        // while an option with that value exists, so a picker left without a
+        // matching option reads "" - the state the send path has to refuse.
+        const mkSelect = () => {
+          const el = mkNode("select");
+          let selected = null;
+          Object.defineProperty(el, "value", {
+            get: () => (selected ? selected.value : ""),
+            set: (v) => { selected = el.options.find((o) => o.value === String(v)) || null; },
+          });
+          Object.defineProperty(el, "innerHTML", {
+            get: () => el._html,
+            set: (v) => { el._html = String(v); el.children = []; el.options = []; selected = null; },
+          });
+          return el;
+        };
+        const servedRule = (c) => {
+          const out = [];
+          for (const id of Object.keys((c && c.presets) || {})) {
+            if (c.presets[id] && c.presets[id].exposed === false) continue;
+            if (!out.includes(id)) out.push(id);
+          }
+          for (const id of Object.keys((c && c.models) || {})) {
+            if (c.models[id] && c.models[id].exposed === false) continue;
+            if (!out.includes(id)) out.push(id);
+          }
+          return out;
+        };
+        const jw = (v) => JSON.stringify(v);
+
+        // Mount the real loadConfig - which builds the pgModel options, populates
+        // the compare list, then applies the persisted selection - against a fake
+        // DOM that those functions themselves create.
+        const mkPicker = async (cfg, saved) => {
+          const els = new Map();
+          const el = (id) => {
+            if (!els.has(id)) els.set(id, id === "pgModel" ? mkSelect() : mkNode("div"));
+            return els.get(id);
+          };
+          const posted = [];
+          const sandbox = {
+            console,
+            state: { cfg: null },
+            PRESET_META: {},
+            playgroundStateLoaded: false,
+            PG_STORAGE_KEY: "lmr-test-pg",
+            pg: { msgs: [], streaming: false, cacheHits: 0, cacheMisses: 0 },
+            safeGet: () => JSON.stringify(saved || {}),
+            highlightJSON: () => "",
+            renderPresets: () => {},
+            renderModels: () => {},
+            renderThread: () => {},
+            restoreDebugState: () => {},
+            setDebug: () => {},
+            setLatencyMetric: () => {},
+            setTokensMetric: () => {},
+            setCostMetric: () => {},
+            savePlaygroundState: () => {},
+            applyServerDebugMetrics: () => {},
+            poll: async () => {},
+            esc: (v) => String(v == null ? "" : v),
+            chatUrl: () => "http://127.0.0.1:9/v1/chat/completions",
+            pgAuthHeader: () => null,
+            modelUsesThinkingControl: () => false,
+            document: {
+              getElementById: (id) => el(id),
+              createElement: (t) => (t === "select" ? mkSelect() : mkNode(t)),
+              createTextNode: (t) => ({ nodeValue: t }),
+            },
+            fetch: async (url, opts) => {
+              if (opts && opts.body) posted.push({ url: String(url), body: opts.body });
+              if (String(url).includes("/api/config")) return { json: async () => cfg };
+              return { ok: true, headers: { get: () => "u7mock" }, json: async () => ({ choices: [{ message: { content: "ok" } }] }) };
+            },
+          };
+          const exports = "({ $, loadConfig, populateCompareModels, loadPlaygroundState, pgSend" + (servedOk ? ", servedIds" : "") + " })";
+          const program = [dollarDecl].concat(pickBodies, servedOk ? [servedBody] : [], [exports]).join("\n");
+          const api = vm.runInContext(program, vm.createContext(sandbox));
+          await api.loadConfig();
+          return {
+            api,
+            posted,
+            el,
+            pg: sandbox.pg,
+            select: el("pgModel"),
+            options: () => el("pgModel").options.map((o) => o.value),
+            checkedIds: () => el("pgCompareModels").querySelectorAll("input:checked").map((c) => c.value),
+          };
+        };
+
+        const pickCfg = {
+          presets: {
+            "hidden-p": { exposed: false, models: ["m1"] },
+            p1: { models: ["m1"] },
+            shared: { models: ["m2"] },
+          },
+          models: {
+            m1: {},
+            "hidden-m": { exposed: false },
+            shared: {},
+            m2: {},
+          },
+        };
+        const want = servedRule(pickCfg);
+        const A = await mkPicker(pickCfg, { model: "gone-xyz", msgs: [] });
+        const servedList = servedOk && typeof A.api.servedIds === "function" ? A.api.servedIds(pickCfg) : null;
+
+        assert(
+          servedList !== null && jw(servedList) === jw(want),
+          "u7b) servedIds(cfg) lists exposed presets then exposed models, drops duplicates, and lets a preset id win a collision (got " +
+            (servedList === null ? "[servedIds NOT FOUND IN index.html]" : jw(servedList)) + ", want " + jw(want) + ")"
+        );
+        assert(
+          jw(A.options()) === jw(want),
+          "u7c) the real Playground picker lists exactly the served ids (got " + jw(A.options()) + ", want " + jw(want) + ")"
+        );
+        assert(
+          jw(A.checkedIds()) === jw(want),
+          "u7d) the real Compare picker lists exactly the served ids (got " + jw(A.checkedIds()) + ", want " + jw(want) + ")"
+        );
+        assert(
+          A.select.value === want[0] && A.select.value !== "",
+          "u7e) restoring a selection whose model no longer exists falls back to the FIRST served id (got " + jw(A.select.value) + ", want " + jw(want[0]) + ")"
+        );
+
+        const B = await mkPicker(pickCfg, { model: "m2", msgs: [] });
+        assert(
+          B.select.value === "m2",
+          "u7f) restoring a selection that is still served keeps it, including a served model id (got " + jw(B.select.value) + ", want " + jw("m2") + ")"
+        );
+
+        // The rule is pinned against a real router, not only against a locally
+        // recomputed expectation: the same ids in the same order as /v1/models.
+        const xCfg = {
+          port: 0,
+          prefix: "/v1",
+          masterKeyEnv: null,
+          backends: [{ id: "u7b", baseURL: "http://127.0.0.1:9", apiKeyEnv: "KEY_U7", model: "up-1" }],
+          models: {
+            p1: { providers: [{ backend: "u7b", upstream: "up-1" }] },
+            m2: { providers: [{ backend: "u7b", upstream: "up-2" }] },
+          },
+          presets: { p1: { strategy: "failover", models: ["p1"] }, p2: { strategy: "failover", models: ["m2"] } },
+        };
+        // The router serves the EFFECTIVE config, and `mkPicker` injects exactly
+        // what /api/config returns. Feeding the UI harness the raw old-shape file
+        // would compare the UI's rule for a config the router no longer runs, so
+        // the injected body is the project's own converted form.
+        const xServed = convertLegacyConfig(xCfg).config;
+        const X = await mkPicker(xServed, { model: "p1", msgs: [] });
+        let servedByServer = null;
+        let servedError = null;
+        try {
+          const x = await startRouterCfg(xCfg, "KEY_U7=test-key\n");
+          try {
+            const rr = await fetch(x.base + "/v1/models");
+            servedByServer = (await rr.json()).data.map((d) => d.id);
+          } finally {
+            x.child.kill();
+          }
+        } catch (e) {
+          servedError = e.message;
+        }
+        assert(
+          !!servedByServer && servedByServer.length > 0,
+          "u7g) a real router's /v1/models list was read for the served-id cross-check" + (servedError ? " [child failed: " + servedError + "]" : "")
+        );
+        const xList = servedOk && typeof X.api.servedIds === "function" ? X.api.servedIds(xServed) : null;
+        assert(
+          xList !== null && jw(xList) === jw(servedByServer),
+          "u7h) servedIds(cfg) yields the same ids in the same order as a real router's /v1/models (got " +
+            (xList === null ? "[servedIds NOT FOUND IN index.html]" : jw(xList)) + ", server " + jw(servedByServer) + ")"
+        );
+        assert(
+          jw(X.options()) === jw(servedByServer),
+          "u7i) the Playground picker lists exactly what a real router serves, in the same order (got " + jw(X.options()) + ", server " + jw(servedByServer) + ")"
+        );
+
+        // `xCfg` has no `exposed: false` anywhere, so the two assertions above pass
+        // even for a rule that ignores exposure entirely. This sibling config hides
+        // one preset and one model, and the assertion is two-sided: the hidden ids
+        // must be ABSENT from the endpoint (or the comparison below is vacuous) and
+        // the UI's rule must still match the endpoint id for id.
+        const xHiddenCfg = {
+          port: 0,
+          masterKeyEnv: null,
+          backends: [{ id: "u7b", baseURL: "http://127.0.0.1:9", apiKeyEnv: "KEY_U7", model: "up-1" }],
+          models: {
+            hvisible: { deployments: [{ backend: "u7b", upstream: "up-1" }] },
+            hhidden: { deployments: [{ backend: "u7b", upstream: "up-2" }], exposed: false },
+          },
+          presets: {
+            hshown: { strategy: "fallback", models: ["hvisible"] },
+            hhiddenpreset: { strategy: "fallback", models: ["hvisible"], exposed: false },
+          },
+        };
+        const H = await mkPicker(xHiddenCfg, { model: "hshown", msgs: [] });
+        let hiddenServed = null;
+        let hiddenError = null;
+        try {
+          const h = await startRouterCfg(xHiddenCfg, "KEY_U7=test-key\n");
+          try {
+            hiddenServed = (await (await fetch(h.base + "/v1/models")).json()).data.map((d) => d.id);
+          } finally {
+            h.child.kill();
+          }
+        } catch (e) {
+          hiddenError = e.message;
+        }
+        const hiddenList = servedOk && typeof H.api.servedIds === "function" ? H.api.servedIds(xHiddenCfg) : null;
+        assert(
+          !!hiddenServed && hiddenServed.includes("hshown") && hiddenServed.includes("hvisible") && !hiddenServed.includes("hhiddenpreset") && !hiddenServed.includes("hhidden"),
+          "u7h2) the exposure fixture really hides something: a real router serves the exposed preset and model and neither id marked exposed: false (" + (hiddenServed ? jw(hiddenServed) : "no list") + ")" + (hiddenError ? " [child failed: " + hiddenError + "]" : "")
+        );
+        assert(
+          hiddenList !== null && jw(hiddenList) === jw(hiddenServed),
+          "u7h3) servedIds(cfg) matches a real router's /v1/models for a config that DOES hide a preset and a model, so the UI's served rule is the endpoint's rule including its exposure filter (got " +
+            (hiddenList === null ? "[servedIds NOT FOUND IN index.html]" : jw(hiddenList)) + ", server " + jw(hiddenServed) + ")"
+        );
+
+        // With nothing served the picker cannot hold a value at all, so the send
+        // path must refuse instead of posting a request the router can only reject.
+        const C = await mkPicker({ presets: {}, models: {} }, { model: "gone-xyz", msgs: [] });
+        C.el("pgInput").value = "hello";
+        C.el("pgStream").checked = false;
+        await C.api.pgSend();
+        assert(
+          C.posted.length === 0 && C.pg.msgs.length === 1 && C.pg.msgs[0].error === true,
+          "u7j) the send path refuses to post an empty model id (posted " + C.posted.length + ", msgs " + jw(C.pg.msgs.map((m) => m.content)) + ")"
+        );
+
+        A.pg.msgs.length = 0;
+        A.el("pgInput").value = "hello";
+        A.el("pgStream").checked = false;
+        await A.api.pgSend();
+        const aSent = A.posted.filter((p) => !p.url.includes("/api/config"));
+        assert(
+          aSent.length === 1 && JSON.parse(aSent[0].body).model === want[0],
+          "u7k) a served model is still posted with its own id, so the empty-id guard is not a dead send path (posted " + aSent.length + ")"
+        );
+      }
+
+
+      // ---- post-save and post-env-write refresh (Task 8) ----------------------
+      // Two pieces of state the page kept from an earlier render: the config viewer
+      // (written only by the dashboard loader) and the backend modal's "Key env"
+      // select (built once by cfgField and re-rendered by nothing). Both claims are
+      // measured through the REAL success paths - cfgSave, envAdd, envSaveEdit -
+      // against a stubbed fetch, with the fake DOM's options parsed out of the HTML
+      // those functions actually emit, so a render/refresh divergence cannot hide
+      // behind a hand-fed form.
+      const u8Needed = [
+        "cfgDeepCopy", "cfgRawParseError", "cfgCurrentObject", "loadRawConfig", "applyRawPayload",
+        "refreshConfigFromDisk", "cfgPost", "cfgSave", "cfgEnvNames", "applyEnvPayload", "loadEnvVars",
+        "envAddProblem", "envPost", "envErrText", "envFlagsAuth", "envAdd", "envSaveEdit", "envRemove",
+        "cfgField", "renderConfig", "cfgTableHead", "cfgRowActions", "cfgInjectIcons", "cfgSetCount",
+        "renderCfgBackends",
+      ];
+      const u8New = ["renderEnvPickers", "refreshCfgEnvNames"];
+      const u8Bodies = [];
+      const u8Broken = [];
+      const u8NewBroken = [];
+      for (const name of u8Needed) {
+        const body = sliceFunction(htmlSource, name);
+        if (!body || !parses(body)) { u8Broken.push(name); continue; }
+        u8Bodies.push(body);
+      }
+      for (const name of u8New) {
+        const body = sliceFunction(htmlSource, name);
+        if (!body || !parses(body)) { u8NewBroken.push(name); continue; }
+        u8Bodies.push(body);
+      }
+      if (!dollarDecl || !parses(dollarDecl)) u8Broken.push("$");
+      if (!rEsc || !parses(rEsc)) u8Broken.push("esc");
+
+      // A fake DOM fed by the emitted HTML, with a <select> that follows the
+      // browser's rules: the option carrying `selected` wins, otherwise the first.
+      const u8Dom = new Map();
+      const u8Node = () => ({
+        value: "", checked: false, disabled: false, hidden: false, className: "", textContent: "",
+        style: {}, dataset: {}, children: [],
+        classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } },
+        appendChild(c) { this.children.push(c); return c; },
+        addEventListener() {}, focus() {}, select() {},
+        querySelectorAll() { return []; },
+        get innerHTML() { return this._html || ""; },
+        set innerHTML(v) { this._html = String(v); },
+      });
+      const u8Select = () => {
+        const el = u8Node();
+        let opts = [];
+        let picked = null;
+        Object.defineProperty(el, "innerHTML", {
+          get: () => el._html || "",
+          set: (html) => {
+            el._html = String(html);
+            opts = Array.from(String(html).matchAll(/<option value='([^']*)'([^>]*)>([\s\S]*?)<\/option>/g)).map((m) => ({
+              value: rUnesc(m[1]),
+              selected: /(^|\s)selected(\s|$)/.test(m[2]),
+              label: rUnesc(m[3]),
+            }));
+            picked = opts.find((o) => o.selected) || opts[0] || null;
+          },
+        });
+        Object.defineProperty(el, "value", {
+          get: () => (picked ? picked.value : ""),
+          set: (v) => { picked = opts.find((o) => o.value === String(v)) || null; },
+        });
+        el.optionValues = () => opts.map((o) => o.value);
+        return el;
+      };
+      const u8El = (id) => {
+        if (!u8Dom.has(id)) u8Dom.set(id, id === "f_apiKeyEnv" ? u8Select() : u8Node());
+        return u8Dom.get(id);
+      };
+
+      // The server mock: /api/env serves a name list that gains whatever was just
+      // written, and /api/config/raw serves the file the last save stored - with a
+      // field the server added itself, so "the viewer shows the current draft" is
+      // distinguishable from "the viewer shows the object the page posted".
+      let u8Served = [];
+      let u8Raw = null;
+      const u8Fetched = [];
+      const u8Fetch = async (url, opts) => {
+        const u = String(url);
+        const method = (opts && opts.method) || "GET";
+        u8Fetched.push(method + " " + u);
+        if (u === "/api/env" && method === "GET") {
+          return { status: 200, ok: true, json: async () => ({ vars: u8Served.map((n) => ({ name: n, live: true, editable: true })), revision: "env-rev-1" }) };
+        }
+        if (u === "/api/env" && method === "POST") {
+          const body = JSON.parse(opts.body);
+          if (!u8Served.includes(body.name)) u8Served = u8Served.concat([body.name]);
+          return { status: 200, ok: true, json: async () => ({ action: "written", live: true, applied: true }) };
+        }
+        if (u.startsWith("/api/env?name=") && method === "DELETE") {
+          const gone = decodeURIComponent(u.slice("/api/env?name=".length));
+          u8Served = u8Served.filter((n) => n !== gone);
+          return { status: 200, ok: true, json: async () => ({ removed: gone, live: true }) };
+        }
+        if (u === "/api/config" && method === "POST") {
+          const sent = JSON.parse(opts.body).config;
+          u8Raw = Object.assign({}, u8Raw, { config: Object.assign({}, sent, { u8ServerNormalized: true }), revision: "rev-2" });
+          return { status: 200, ok: true, json: async () => ({ warnings: [], revision: "rev-2" }) };
+        }
+        if (u === "/api/config/raw") return { status: 200, ok: true, json: async () => u8Raw };
+        return { status: 404, ok: false, json: async () => ({}) };
+      };
+
+      const u8Cfg = { draft: null, disk: null, modal: null, mode: "forms", dirty: false, loaded: false, text: null, revision: null, envNames: [], snapshots: [], errors: [], warnings: [] };
+      const u8Env = { vars: [], revision: null, restartRequired: false, loaded: false, issue: null, revealed: {}, editing: null, draftValue: "", busy: {}, copied: null, status: {} };
+      const u8Calls = { renderEnv: 0, hl: 0 };
+      const u8HlArgs = [];
+      const u8Sandbox = {
+        cfg: u8Cfg,
+        env: u8Env,
+        console,
+        confirm: () => true,
+        renderCfgModels: () => {},
+        renderCfgPresets: () => {},
+        renderCfgSettings: () => {},
+        renderCfgSnapshots: () => {},
+        renderEnv: () => { u8Calls.renderEnv++; },
+        showAuthBanner: () => {},
+        hideAuthBanner: () => {},
+        keysApiAuth: () => null,
+        highlightJSON: (o) => { u8Calls.hl++; u8HlArgs.push(o); return "HL:" + JSON.stringify(o); },
+        ICONS: { warn: "", check: "", clock: "" },
+        fetch: u8Fetch,
+        document: { getElementById: u8El, querySelectorAll: () => [], querySelector: () => null, createElement: () => u8Node() },
+      };
+      const u8Exports = ["$", "esc", "cfgSave", "cfgDeepCopy", "cfgEnvNames", "cfgField", "loadEnvVars", "envAdd", "envSaveEdit", "envRemove", "renderConfig", "renderCfgBackends", "refreshConfigFromDisk"].concat(u8NewBroken.length ? [] : u8New);
+      let api8 = null;
+      let u8EvalError = null;
+      if (u8Broken.length === 0) {
+        const program = [dollarDecl, rEsc].concat(u8Bodies, ["({ " + u8Exports.join(", ") + " })"]).join("\n");
+        try { api8 = vm.runInContext(program, vm.createContext(u8Sandbox)); } catch (e) { u8EvalError = e.message; }
+      }
+      const u8Found = u8Needed.length - u8Broken.filter((n) => u8Needed.includes(n)).length;
+      const u8Ok = u8Broken.length === 0 && !u8EvalError && !!api8 && typeof api8.cfgSave === "function" && typeof api8.envAdd === "function" && typeof api8.envSaveEdit === "function" && typeof api8.envRemove === "function" && typeof api8.renderConfig === "function";
+      assert(
+        u8Ok,
+        "u8a) the post-save refresh harness extracted " + u8Found + "/" + u8Needed.length + " function(s) plus $ and esc and evaluated them in a vm context" +
+          (u8Broken.length ? " [NOT FOUND OR UNPARSEABLE: " + u8Broken.join(", ") + "]" : "") +
+          (u8EvalError ? " [evaluation failed: " + u8EvalError + "]" : "")
+      );
+      assert(
+        u8NewBroken.length === 0,
+        "u8b) the refresh helpers exist in index.html and were extracted [NOT FOUND OR UNPARSEABLE: " + u8NewBroken.join(", ") + "]"
+      );
+
+      if (!u8Ok) {
+        assert(false, "u8a2) the post-save refresh contract could not be exercised: the harness did not come up");
+      } else {
+        const jw8 = (v) => JSON.stringify(v);
+        const u8ViewerCfg = () => ({ port: 8787, backends: [{ id: "go", baseURL: "http://go", apiKeyEnv: "KEY_GO" }], models: { "u8-marker-model": { providers: [{ backend: "go", upstream: "up-1" }] } }, presets: {} });
+        // Stage the picker the way the modal does: the REAL cfgField builds the
+        // options out of cfgEnvNames() and marks the entry's current value.
+        const u8StagePicker = (value) => {
+          u8El("f_apiKeyEnv").innerHTML = api8.cfgField("Key env (NAME, not the key)", "f_apiKeyEnv", {
+            type: "select",
+            value,
+            options: [{ value: "", label: "(choose an environment variable)" }].concat(api8.cfgEnvNames().map((n) => ({ value: n, label: n }))),
+          });
+          return u8El("f_apiKeyEnv");
+        };
+        const u8CanRefresh = typeof api8.renderEnvPickers === "function" && typeof api8.refreshCfgEnvNames === "function";
+
+        // (1) A successful save must leave the config viewer showing the config that
+        // is now on disk, not the file the page loaded at startup.
+        const firstDraft = u8ViewerCfg();
+        u8Cfg.loaded = true;
+        u8Cfg.mode = "forms";
+        u8Cfg.dirty = true;
+        u8Cfg.draft = JSON.parse(JSON.stringify(firstDraft));
+        u8Cfg.revision = "rev-1";
+        u8Raw = { config: JSON.parse(JSON.stringify(firstDraft)), revision: "rev-1", envNames: ["KEY_GO"], snapshots: [] };
+        u8El("configView").innerHTML = "STALE-VIEWER";
+        u8Calls.hl = 0;
+        u8HlArgs.length = 0;
+        await api8.cfgSave();
+        const viewHTML = u8El("configView").innerHTML;
+        assert(
+          viewHTML !== "STALE-VIEWER" && /u8-marker-model/.test(viewHTML) && /u8ServerNormalized/.test(viewHTML) && u8Calls.hl === 1 && jw8(u8HlArgs[0]) === jw8(u8Cfg.draft),
+          "u8c) a successful save rewrites the config viewer from the config just written (viewer " + jw8(viewHTML.slice(0, 90)) + ", highlighter calls " + u8Calls.hl + ")" +
+            (u8Calls.hl === 1 && jw8(u8HlArgs[0]) !== jw8(u8Cfg.draft) ? " [highlighted a different object than cfg.draft]" : "")
+        );
+
+        // (2) A successful env write must add the new name to the backend "Key env"
+        // picker that cfgField built once, and keep the open form's selection.
+        u8Served = ["KEY_GO", "KEY_CC"];
+        u8Cfg.envNames = ["KEY_GO"];
+        u8Cfg.draft = u8ViewerCfg();
+        const u8Sel = u8StagePicker("KEY_GO");
+        const u8Before = u8Sel.optionValues();
+        u8El("cfgBackendsTable").innerHTML = "STALE-BACKENDS-TABLE";
+        u8El("envAddName").value = "U8_ADDED_KEY";
+        u8El("envAddValue").value = "u8-secret-value";
+        u8Env.revision = "env-rev-1";
+        await api8.envAdd();
+        const u8After = u8Sel.optionValues();
+        assert(
+          u8After.includes("U8_ADDED_KEY") && u8After.includes("KEY_CC") && u8After.includes("KEY_GO") && u8Sel.value === "KEY_GO",
+          "u8d) a successful env add puts the new name in the open backend Key env picker without a reload and keeps the selection (before " + jw8(u8Before) + ", after " + jw8(u8After) + ", selection " + jw8(u8Sel.value) + ")"
+        );
+        assert(
+          u8El("cfgBackendsTable").innerHTML !== "STALE-BACKENDS-TABLE",
+          "u8e) the env refresh re-renders the backends table too (its 'not set in this environment' badge reads the same list) (got " + jw8(u8El("cfgBackendsTable").innerHTML.slice(0, 60)) + ")"
+        );
+
+        // (3) The other env success path (inline row save) must refresh identically.
+        u8Served = ["KEY_GO", "KEY_CC"];
+        u8Cfg.envNames = ["KEY_GO"];
+        u8StagePicker("KEY_GO");
+        u8Env.draftValue = "u8-rotated-value";
+        await api8.envSaveEdit("KEY_GO");
+        const u8AfterEdit = u8El("f_apiKeyEnv").optionValues();
+        assert(
+          u8AfterEdit.includes("KEY_CC") && u8El("f_apiKeyEnv").value === "KEY_GO",
+          "u8f) a successful inline env edit refreshes the same picker and keeps the selection (after " + jw8(u8AfterEdit) + ", selection " + jw8(u8El("f_apiKeyEnv").value) + ")"
+        );
+
+        // (4) A name the open form still holds but the served list has dropped must
+        // survive the re-render as an extra option instead of being reset to "".
+        u8Cfg.draft = u8ViewerCfg();
+        u8Cfg.envNames = ["KEY_GO", "KEY_ORPHAN"];
+        u8StagePicker("KEY_ORPHAN");
+        assert(
+          u8El("f_apiKeyEnv").value === "KEY_ORPHAN",
+          "u8g0) harness self-check: the staged Key env picker holds KEY_ORPHAN before the refresh"
+        );
+        u8Served = ["KEY_GO"];
+        if (u8CanRefresh) await api8.refreshCfgEnvNames();
+        const u8OrphanOpts = u8El("f_apiKeyEnv").optionValues();
+        assert(
+          u8CanRefresh && u8OrphanOpts.includes("KEY_ORPHAN") && u8El("f_apiKeyEnv").value === "KEY_ORPHAN",
+          "u8g) a stored env name the served list no longer carries stays as a selected extra option (options " + jw8(u8OrphanOpts) + ", selection " + jw8(u8El("f_apiKeyEnv").value) + ")" +
+            (u8CanRefresh ? "" : " [renderEnvPickers/refreshCfgEnvNames NOT FOUND IN index.html]")
+        );
+
+        // (5) The refresh calls renderConfig(), so pin that it cannot reach into an
+        // open modal or the draft: that would be a new way to lose typed input.
+        u8Cfg.draft = u8ViewerCfg();
+        u8Cfg.modal = { kind: "backends", key: null, data: { id: "u8-new", baseURL: "http://x", apiKeyEnv: "KEY_GO" }, index: null, deploys: [], models: [] };
+        const draftBefore = jw8(u8Cfg.draft);
+        const modalBefore = jw8(u8Cfg.modal);
+        u8El("cfgModalBody").innerHTML = "<input id='f_id' value='u8-typed-by-user'>";
+        u8Served = ["KEY_GO", "KEY_CC"];
+        if (u8CanRefresh) await api8.refreshCfgEnvNames();
+        assert(
+          u8CanRefresh &&
+            jw8(u8Cfg.draft) === draftBefore &&
+            jw8(u8Cfg.modal) === modalBefore &&
+            /u8-typed-by-user/.test(u8El("cfgModalBody").innerHTML) &&
+            u8El("f_apiKeyEnv").optionValues().includes("KEY_CC"),
+          "u8h) the env refresh updates the picker while leaving an open modal body and the unsaved draft untouched (draft changed " + (jw8(u8Cfg.draft) !== draftBefore) + ", modal changed " + (jw8(u8Cfg.modal) !== modalBefore) + ", options " + jw8(u8El("f_apiKeyEnv").optionValues()) + ")"
+        );
+
+        // (6) A removal changes the name set exactly as much as an add does, so it
+        // is the same contract: the removed name leaves the picker, and the open
+        // form's selection stays where it was.
+        u8Cfg.draft = u8ViewerCfg();
+        u8Cfg.envNames = ["KEY_GO", "KEY_CC", "U8_DOOMED"];
+        u8Served = ["KEY_GO", "KEY_CC", "U8_DOOMED"];
+        const u8RemSel = u8StagePicker("KEY_GO");
+        const u8RemBefore = u8RemSel.optionValues();
+        await api8.envRemove("U8_DOOMED");
+        const u8RemAfter = u8RemSel.optionValues();
+        assert(
+          u8RemBefore.includes("U8_DOOMED") && !u8Served.includes("U8_DOOMED") && !u8RemAfter.includes("U8_DOOMED") && u8RemAfter.includes("KEY_CC") && u8RemSel.value === "KEY_GO",
+          "u8i) a successful env removal drops the name from the open Key env picker and keeps the selection (before " + jw8(u8RemBefore) + ", after " + jw8(u8RemAfter) + ", selection " + jw8(u8RemSel.value) + ", served " + jw8(u8Served) + ")"
+        );
+      }
+    }
+  }
+
+  // zPair1) A v3 entry names a PHYSICAL deployment, so two upstreams on ONE account are two
+  //   candidates. Collapsing them to the account (the legacy dedup) would make pair-scoped
+  //   cooling unreachable and hide the second upstream from every request that ever runs.
+  {
+    const cfgP = {
+      backends: [{ id: "pA", baseURL: "http://x" }],
+      models: {
+        mPair: { deployments: [{ backend: "pA", upstream: "u1" }, { backend: "pA", upstream: "u2" }] },
+        mLegacy: { providers: [{ backend: "pA", upstream: "u1" }, { backend: "pA", upstream: "u2" }] },
+      },
+      presets: {
+        pPair: { strategy: "failover", models: ["mPair"] },
+        pLegacy: { strategy: "failover", models: ["mLegacy"] },
+      },
+    };
+    const cPair = SRV.candidates(cfgP, "pPair", "s1");
+    const pairs = cPair.ordered.map((a) => a.backend + "/" + a.upstream).sort();
+    assert(
+      pairs.length === 2 && pairs[0] === "pA/u1" && pairs[1] === "pA/u2",
+      "zPair1a) both deployments of one account are distinct v3 candidates (got " + JSON.stringify(cPair.ordered) + ")"
+    );
+    const cLeg = SRV.candidates(cfgP, "pLegacy", "s1");
+    assert(
+      cLeg.ordered.length === 1 && cLeg.ordered[0].upstream === "u1",
+      "zPair1b) a legacy entry keeps backend-only dedup, first occurrence wins (got " + JSON.stringify(cLeg.ordered) + ")"
+    );
+  }
+
+  // zPair2) Recovery is keyed by the physical pair, so two names for one deployment share it:
+  //   the same route key is the whole basis of "an alias cannot cool a sibling name".
+  {
+    const cfgS = {
+      backends: [{ id: "sA", baseURL: "http://x" }],
+      models: { mS1: { deployments: [{ backend: "sA", upstream: "uS" }] }, mS2: { deployments: [{ backend: "sA", upstream: "uS" }] } },
+      presets: { pS1: { strategy: "failover", models: ["mS1"] }, pS2: { strategy: "failover", models: ["mS2"] } },
+    };
+    const a1 = SRV.candidates(cfgS, "pS1", "s9").ordered[0];
+    const a2 = SRV.candidates(cfgS, "pS2", "s9").ordered[0];
+    assert(
+      SRV.routeKey(a1) === SRV.routeKey(a2) && SRV.routeKey(a1) === JSON.stringify(["sA", "uS"]),
+      "zPair2) two names for one deployment share one physical route key (" + SRV.routeKey(a1) + " vs " + SRV.routeKey(a2) + ")"
+    );
+  }
+
+  // zBackup1) A backupOnly deployment is never the hash primary for a FRESH session: it is the
+  //   ordered tail, behind the weighted heads, for every session key.
+  {
+    const cfgB = {
+      backends: [{ id: "bA", baseURL: "http://x" }, { id: "bB", baseURL: "http://x" }],
+      models: { mB: { deployments: [{ backend: "bA", upstream: "uP" }, { backend: "bB", upstream: "uB", backupOnly: true }] } },
+      presets: { pB: { strategy: "failover", models: ["mB"] } },
+    };
+    let bad = null;
+    for (let i = 0; i < 12; i++) {
+      const c = SRV.candidates(cfgB, "pB", "fresh-" + i);
+      if (c.ordered.length !== 2 || c.ordered[0].upstream !== "uP" || c.ordered[1].upstream !== "uB") { bad = c.ordered; break; }
+    }
+    assert(
+      bad === null,
+      "zBackup1) a fresh session keeps the backupOnly deployment in the tail (got " + JSON.stringify(bad) + ")"
+    );
+  }
+
+  // zAcct1) A 5xx retires its ACCOUNT for the remainder of the request - the account's other
+  //   deployments share a dead endpoint, so they are not probed in turn. It must NOT be a
+  //   global judgement: the sibling route stays healthy for every other request (v3 spec T5).
+  {
+    let deadHits = 0;
+    let liveHits = 0;
+    const srvAcct = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      const b = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+      if (b.model === "uAcctDead") {
+        deadHits++;
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "endpoint on fire" } }));
+        return;
+      }
+      liveHits++;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: "m", object: "chat.completion", choices: [{ message: { role: "assistant", content: "ok:acct" } }] }));
+    });
+    const portAcct = await listen(srvAcct);
+    const cfgAcct = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "acctA", baseURL: `http://${HOST}:${portAcct}`, apiKeyEnv: "KEY_ACCT" }],
+      models: { mAcct: { deployments: [{ backend: "acctA", upstream: "uAcctDead" }, { backend: "acctA", upstream: "uAcctLive" }] } },
+      presets: { pAcct: { strategy: "failover", models: ["mAcct"] } },
+      backoff: { ...BO, serverBaseMs: 5000, serverMaxMs: 9000 },
+    };
+    // The hash decides which deployment leads, so the leading one is CHOSEN rather than assumed.
+    const pick = (upstream, tag) => {
+      for (let i = 0; i < 400; i++) {
+        const key = tag + "-" + i;
+        const c = SRV.candidates(cfgAcct, "pAcct", key);
+        if (c && c.ordered[0] && c.ordered[0].upstream === upstream) return key;
+      }
+      return null;
+    };
+    const sDead = pick("uAcctDead", "acct-dead");
+    const sLive = pick("uAcctLive", "acct-live");
+    const hAcct = await startRouterCfg(cfgAcct, "KEY_ACCT=k\n");
+    const call = (session) => fetch(hAcct.base + "/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer local-master", "x-session-affinity": session },
+      body: JSON.stringify({ model: "pAcct", messages: [{ role: "user", content: "ping" }] }),
+      signal: AbortSignal.timeout(15000),
+    });
+    try {
+      assert(sDead !== null && sLive !== null, "zAcct1pre) both deployments are reachable as a hash primary (" + sDead + ", " + sLive + ")");
+      const first = await call(sDead);
+      await first.text();
+      const rows = ((await (await api(hAcct.base, "/health", { method: "GET" })).json()).routes || []).filter((r) => r.backend === "acctA");
+      const cooling = rows.filter((r) => r.state === "cooling").map((r) => r.upstream);
+      assert(
+        first.status === 503 && deadHits === 1 && liveHits === 0 && cooling.length === 1 && cooling[0] === "uAcctDead",
+        "zAcct1) a 5xx retires that account for the rest of the request only (status=" + first.status + ", dead=" + deadHits + ", sibling=" + liveHits + ", cooling=" + JSON.stringify(cooling) + ")"
+      );
+      const second = await call(sLive);
+      const secondText = await second.text();
+      assert(
+        second.status === 200 && liveHits === 1 && deadHits === 1 && secondText.includes("ok:acct"),
+        "zAcct1b) the skipped sibling stays globally healthy for other requests (status=" + second.status + ", dead=" + deadHits + ", sibling=" + liveHits + ")"
+      );
+    } finally {
+      hAcct.child.kill();
+      srvAcct.close();
+    }
+  }
+
+  // zDialect1) Two deployments of ONE account may carry different dialect settings, and each
+  //   attempt must use ITS OWN: the pair is the candidate, so the second is reachable at all,
+  //   and dropParams/paramMap are read per deployment rather than from the first one.
+  {
+    const bodies = [];
+    const srvDial = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      const b = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+      bodies.push(b);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: b.model, object: "chat.completion", choices: [{ message: { role: "assistant", content: "ok:dial" } }] }));
+    });
+    const portDial = await listen(srvDial);
+    const cfgDial = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "dialA", baseURL: `http://${HOST}:${portDial}`, apiKeyEnv: "KEY_DIAL" }],
+      models: {
+        mDial: {
+          deployments: [
+            { backend: "dialA", upstream: "uPlain" },
+            { backend: "dialA", upstream: "uDialect", dropParams: ["temperature"], paramMap: { top_p: "top_k" } },
+          ],
+        },
+      },
+      presets: { pDial: { strategy: "failover", models: ["mDial"] } },
+      backoff: { ...BO },
+    };
+    const pick = (upstream) => {
+      for (let i = 0; i < 400; i++) {
+        const key = "dial-" + i;
+        const c = SRV.candidates(cfgDial, "pDial", key);
+        if (c && c.ordered[0] && c.ordered[0].upstream === upstream) return key;
+      }
+      return null;
+    };
+    const sPlain = pick("uPlain");
+    const sDialect = pick("uDialect");
+    const hDial = await startRouterCfg(cfgDial, "KEY_DIAL=k\n");
+    const call = (session) => fetch(hDial.base + "/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer local-master", "x-session-affinity": session },
+      body: JSON.stringify({ model: "pDial", messages: [{ role: "user", content: "ping" }], temperature: 0.5, top_p: 0.9 }),
+      signal: AbortSignal.timeout(15000),
+    });
+    try {
+      assert(sPlain !== null && sDialect !== null, "zDialect1pre) both deployments of the account are selectable (" + sPlain + ", " + sDialect + ")");
+      await (await call(sPlain)).text();
+      await (await call(sDialect)).text();
+      const plain = bodies.find((b) => b.model === "uPlain");
+      const dialect = bodies.find((b) => b.model === "uDialect");
+      assert(
+        !!plain && !!dialect && plain.temperature === 0.5 && plain.top_p === 0.9 && !("top_k" in plain)
+          && !("temperature" in dialect) && dialect.top_k === 0.9 && !("top_p" in dialect),
+        "zDialect1) each deployment keeps its own dialect (plain=" + JSON.stringify(plain && { t: plain.temperature, tp: plain.top_p, tk: plain.top_k }) + ", dialect=" + JSON.stringify(dialect && { t: dialect.temperature, tp: dialect.top_p, tk: dialect.top_k }) + ")"
+      );
+    } finally {
+      hDial.child.kill();
+      srvDial.close();
+    }
+  }
+
+  // zAliasPhys1) Recovery is keyed by the physical pair, so two names for one deployment share
+  //   it: a failure charged through one alias refuses the other alias' request too, and the
+  //   health projection holds ONE row carrying both names.
+  {
+    let hits = 0;
+    const srvAlias = http.createServer(async (req, res) => {
+      for await (const _ of req) { /* drain */ }
+      hits++;
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "alias outage" } }));
+    });
+    const portAlias = await listen(srvAlias);
+    const cfgAlias = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "aliasA", baseURL: `http://${HOST}:${portAlias}`, apiKeyEnv: "KEY_ALIAS" }],
+      models: {
+        mAlias1: { deployments: [{ backend: "aliasA", upstream: "uAlias" }] },
+        mAlias2: { deployments: [{ backend: "aliasA", upstream: "uAlias" }] },
+      },
+      presets: {
+        pAlias1: { strategy: "failover", models: ["mAlias1"] },
+        pAlias2: { strategy: "failover", models: ["mAlias2"] },
+      },
+      backoff: { ...BO, serverBaseMs: 5000, serverMaxMs: 9000 },
+    };
+    const hAlias = await startRouterCfg(cfgAlias, "KEY_ALIAS=k\n");
+    const call = (preset, session) => fetch(hAlias.base + "/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer local-master", "x-session-affinity": session },
+      body: JSON.stringify({ model: preset, messages: [{ role: "user", content: "ping" }] }),
+      signal: AbortSignal.timeout(15000),
+    });
+    try {
+      const first = await call("pAlias1", "alias-s1");
+      await first.text();
+      const rows = ((await (await api(hAlias.base, "/health", { method: "GET" })).json()).routes || []).filter((r) => r.backend === "aliasA");
+      // A DIFFERENT session for the second alias: session-scoped exclusions cannot be what stops it.
+      const second = await call("pAlias2", "alias-s2");
+      await second.text();
+      assert(
+        first.status === 503 && second.status === 503 && hits === 1 && rows.length === 1 && (rows[0].models || []).length === 2,
+        "zAliasPhys1) a cooled physical route refuses both names that resolve to it (first=" + first.status + ", second=" + second.status + ", hits=" + hits + ", rows=" + rows.length + ", models=" + JSON.stringify(rows[0] && rows[0].models) + ")"
+      );
+    } finally {
+      hAlias.child.kill();
+      srvAlias.close();
+    }
+  }
+
+  // zPinBackup1) A session that has SUCCEEDED on a backupOnly deployment keeps preferring it:
+  //   backupOnly rules out the hash primary, not a published recovery pin. The control request
+  //   with a fresh session proves the primary was healthy again (so the pin, not a cooldown,
+  //   is what steered the pinned session).
+  {
+    let primHits = 0;
+    let backupHits = 0;
+    const srvPin = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      const b = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+      if (b.model === "uPinPrimary") {
+        primHits++;
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "primary outage" } }));
+        return;
+      }
+      backupHits++;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: "m", object: "chat.completion", choices: [{ message: { role: "assistant", content: "ok:backup" } }] }));
+    });
+    const portPin = await listen(srvPin);
+    const cfgPin = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "pinA", baseURL: `http://${HOST}:${portPin}`, apiKeyEnv: "KEY_PIN" },
+        { id: "pinB", baseURL: `http://${HOST}:${portPin}`, apiKeyEnv: "KEY_PIN" },
+      ],
+      models: {
+        mPin: { deployments: [{ backend: "pinA", upstream: "uPinPrimary" }, { backend: "pinB", upstream: "uPinBackup", backupOnly: true }] },
+      },
+      presets: { pPin: { strategy: "failover", models: ["mPin"] } },
+      backoff: { ...BO, serverBaseMs: 60, serverMaxMs: 150 },
+    };
+    const hPin = await startRouterCfg(cfgPin, "KEY_PIN=k\n");
+    const call = (session) => fetch(hPin.base + "/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer local-master", "x-session-affinity": session },
+      body: JSON.stringify({ model: "pPin", messages: [{ role: "user", content: "ping" }] }),
+      signal: AbortSignal.timeout(15000),
+    });
+    try {
+      const first = await call("pin-s1");
+      const firstText = await first.text();
+      // The primary failed, the account was retired for the request, and the backup served it:
+      // that success is the pin this session now holds.
+      assert(
+        first.status === 200 && firstText.includes("ok:backup") && primHits === 1 && backupHits === 1,
+        "zPinBackup1pre) the backupOnly deployment serves after the primary fails (status=" + first.status + ", primary=" + primHits + ", backup=" + backupHits + ")"
+      );
+      // The primary must become eligible again WITHOUT an operator action: /admin/reset-health
+      // deliberately drops every learned pin (an operator health decision outranks a session's
+      // preference), so the test waits for the cooldown to lapse on its own instead - readiness
+      // by observation, not by sleeping.
+      let primRow = null;
+      for (let i = 0; i < 200; i++) {
+        const hh = await (await api(hPin.base, "/health", { method: "GET" })).json();
+        primRow = (hh.routes || []).find((r) => r.backend === "pinA");
+        if (primRow && primRow.retryInMs <= 0) break;
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      assert(!!primRow && primRow.retryInMs <= 0, "zPinBackup1pre2) the cooled primary becomes eligible again on its own (retryInMs=" + (primRow && primRow.retryInMs) + ")");
+      const pinned = await call("pin-s1");
+      const pinnedText = await pinned.text();
+      assert(
+        pinned.status === 200 && pinnedText.includes("ok:backup") && primHits === 1 && backupHits === 2,
+        "zPinBackup1) an established recovery pin keeps preferring the backup deployment (status=" + pinned.status + ", primary=" + primHits + ", backup=" + backupHits + ")"
+      );
+      const fresh = await call("pin-s2");
+      await fresh.text();
+      // The fresh session reaches the primary (and is failed over by its 500), while the pinned
+      // session never touched it: the DIFFERENCE between the two calls is the pin, not a cooldown.
+      assert(
+        primHits === 2 && backupHits === 3,
+        "zPinBackup1b) a fresh session probes the recovered primary again, so the pin - not a cooldown - steered the pinned session (primary=" + primHits + ", backup=" + backupHits + ")"
+      );
+    } finally {
+      hPin.child.kill();
+      srvPin.close();
+    }
+  }
+
+
 
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);

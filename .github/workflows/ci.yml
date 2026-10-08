@@ -4,11 +4,34 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+# A superseded run is dead weight: cancel it so the newest commit owns the queue.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read-only pipeline, so ask for nothing more than the checkout.
+permissions:
+  contents: read
 
 jobs:
+  # S1-S5 and S7: the checks that need no child router. They run once, on the
+  # oldest supported Node, because none of them depends on the Node version.
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Static checks (S1-S5, S7)
+        run: node scripts/ci/check.mjs static
+
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         node-version: [22, 24, 25]
     steps:
@@ -18,8 +41,8 @@ jobs:
           node-version: ${{ matrix.node-version }}
       - name: Syntax check
         run: node --check server.mjs && node --check test.mjs
-      - name: Run test suite
-        run: node test.mjs
+      - name: Suite contract (S6)
+        run: node scripts/ci/check.mjs suite
 
   secret-scan:
     runs-on: ubuntu-latest

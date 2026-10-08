@@ -2331,6 +2331,23 @@ async function poll() {
 
 let playgroundStateLoaded = false;
 
+// The model ids this router serves to clients, in the same set and order as
+// /v1/models: exposed presets first, then exposed models, each id once (a preset
+// id wins a collision with a model id). The pickers list exactly this, so the
+// Playground can only request what a client could.
+function servedIds(cfg) {
+  const out = [];
+  for (const id of Object.keys((cfg && cfg.presets) || {})) {
+    if (cfg.presets[id] && cfg.presets[id].exposed === false) continue;
+    if (!out.includes(id)) out.push(id);
+  }
+  for (const id of Object.keys((cfg && cfg.models) || {})) {
+    if (cfg.models[id] && cfg.models[id].exposed === false) continue;
+    if (!out.includes(id)) out.push(id);
+  }
+  return out;
+}
+
 async function loadConfig() {
   try {
     const r = await fetch("/api/config");
@@ -2363,7 +2380,7 @@ async function loadConfig() {
   const sel = $("pgModel");
   const prev = sel.value;
   sel.innerHTML = "";
-  const models = state.cfg && state.cfg.presets ? Object.keys(state.cfg.presets) : [];
+  const models = servedIds(state.cfg);
   for (const m of models) {
     const opt = document.createElement("option");
     opt.value = m;
@@ -3373,9 +3390,11 @@ function loadPlaygroundState() {
     if (saved.model) {
       const sel = $("pgModel");
       if (sel) {
-        let found = false;
-        for (const opt of sel.options) { if (opt.value === saved.model) { found = true; break; } }
-        if (found) sel.value = saved.model;
+        // A selection the config no longer serves must fall back to the first
+        // served id: leaving the picker unselected would post an empty model.
+        const models = servedIds(state.cfg);
+        if (models.includes(saved.model)) sel.value = saved.model;
+        else sel.value = models[0] || "";
       }
     }
     if (saved.stream != null) $("pgStream").checked = !!saved.stream;
@@ -3573,6 +3592,13 @@ async function pgSend() {
   const text = input.value.trim();
   if (!text || pg.streaming) return;
   const model = $("pgModel").value;
+  if (!model) {
+    // An empty id has nothing to route to, so refuse it here rather than posting
+    // a request the router can only answer with a 404.
+    pg.msgs.push({ role: "assistant", content: "Pick a model before sending.", error: true });
+    renderThread();
+    return;
+  }
   const stream = $("pgStream").checked;
   const session = $("pgSession").value.trim();
   const tempRaw = parseFloat($("pgTemp").value);
@@ -3807,7 +3833,7 @@ function populateCompareModels() {
   if (!host) return;
   const prev = new Set(Array.from(host.querySelectorAll("input:checked")).map((cb) => cb.value));
   host.innerHTML = "";
-  const models = state.cfg && state.cfg.presets ? Object.keys(state.cfg.presets) : [];
+  const models = servedIds(state.cfg);
   for (const m of models) {
     const lbl = document.createElement("label");
     lbl.className = "check";
@@ -4202,6 +4228,10 @@ async function cfgSave() {
     cfg.warnings = (payload && payload.warnings) || [];
     cfg.errors = [];
     await refreshConfigFromDisk(true);
+    // The dashboard only writes the viewer on load, so without this the panel
+    // keeps showing the file the page started with.
+    const cv = $("configView");
+    if (cv) cv.innerHTML = cfg.draft ? highlightJSON(cfg.draft) : "Config unavailable.";
   } catch (e) {
     cfg.errors = [{ path: "", message: "Save failed: " + e.message }];
     renderConfig();
@@ -4383,39 +4413,50 @@ function renderCfgBackends() {
   cfgInjectIcons($("cfgBackendsTable"));
 }
 
+// The pre-v3 `providers` array is still read (an unconverted file can reach the
+// editor through /api/config/raw), but `providers` WINS when both keys are
+// present, which is the rule the server's converter already applies: reading the
+// other one would show a list the router is not honouring.
+function deploymentListOf(entry) {
+  if (!entry || typeof entry !== "object") return [];
+  if (Array.isArray(entry.providers)) return entry.providers;
+  return Array.isArray(entry.deployments) ? entry.deployments : [];
+}
+
 function renderCfgModels() {
   const backendIds = new Set((cfg.draft.backends || []).map((b) => b && b.id).filter(Boolean));
   const entries = Object.entries(cfg.draft.models || {});
   const rows = entries.map(([id, m]) => {
-    const provs = Array.isArray(m.providers) ? m.providers : [];
-    const pills = provs.length
-      ? "<div class='cfg-pills'>" + provs.map((p) => {
-          const dangling = !backendIds.has(p.backend);
-          return "<span class='cfg-pill" + (dangling ? " bad" : "") + "'>" + esc(p.backend) + "<span class='arrow'>&rarr;</span><b>" + esc(p.upstream || "?") + "</b></span>";
+    const deps = deploymentListOf(m);
+    const pills = deps.length
+      ? "<div class='cfg-pills'>" + deps.map((d) => {
+          const dangling = !backendIds.has(d.backend);
+          return "<span class='cfg-pill" + (dangling ? " bad" : "") + "'>" + esc(d.backend) + "<span class='arrow'>&rarr;</span><b>" + esc(d.upstream || "?") + "</b>" + (d.backupOnly ? " <span class='sub'>backup</span>" : "") + "</span>";
         }).join("") + "</div>"
-      : "<span class='cfg-badge bad'>" + ICONS.warn + "no providers</span>";
+      : "<span class='cfg-badge bad'>" + ICONS.warn + "no deployments</span>";
     const price = m.meta && m.meta.pricing ? m.meta.pricing : null;
     const fmtP = (v) => (v == null ? "?" : "$" + v);
     const priceCell = price
       ? "<span class='cfg-mono'>" + esc(fmtP(price.inputPerM)) + "</span> <span class='cfg-sub'>in</span><div class='cfg-td-sub'>" + esc(fmtP(price.outputPerM)) + " out</div>"
       : "<span class='cfg-sub'>-</span>";
-    const label = m.meta && m.meta.label ? "<div class='cfg-td-sub'>" + esc(m.meta.label) + "</div>" : "";
-    const pool = m.affinityPool == null ? 1 : m.affinityPool;
-    const poolWarn = provs.length && pool > provs.length;
+    const label = m.meta && m.meta.label ? "<div class='cfg-td-sub'>" + esc(m.meta.label) + "</div>" : (m.exposed === false ? "<div class='cfg-td-sub' style='color:var(--amber)'>hidden from /v1/models</div>" : "");
+    const primaries = deps.filter((d) => !d.backupOnly).length;
+    const backups = deps.length - primaries;
     return (
       "<tr>" +
       "<td><div class='cfg-td-name'>" + esc(id) + "</div>" + label + "</td>" +
       "<td>" + pills + "</td>" +
-      "<td>" + (poolWarn
-        ? "<span class='cfg-badge warn'>" + ICONS.warn + pool + " of " + provs.length + "</span>"
-        : "<span class='cfg-mono'>" + pool + " of " + provs.length + "</span>") + "</td>" +
+      "<td>" + (deps.length && !primaries
+        ? "<span class='cfg-badge warn'>" + ICONS.warn + "backup only</span>"
+        : "<span class='cfg-mono'>" + primaries + " primary" + (backups ? " + " + backups + " backup" : "") + "</span>") + "</td>" +
+      "<td>" + (m.exposed === false ? "<span class='cfg-badge neutral'>hidden</span>" : "<span class='cfg-mono'>served</span>") + "</td>" +
       "<td>" + priceCell + "</td>" +
       cfgRowActions("models", id) +
       "</tr>"
     );
   });
-  $("cfgModelsTable").innerHTML = cfgTableHead(["Model", "Providers", "Affinity pool", "Price / M", "Actions"]) +
-    "<tbody>" + (rows.length ? rows.join("") : "<tr><td colspan='5' class='cfg-empty'>No models configured.</td></tr>") + "</tbody>";
+  $("cfgModelsTable").innerHTML = cfgTableHead(["Model", "Deployments", "Primaries", "Exposure", "Price / M", "Actions"]) +
+    "<tbody>" + (rows.length ? rows.join("") : "<tr><td colspan='6' class='cfg-empty'>No models configured.</td></tr>") + "</tbody>";
   cfgSetCount("cfgCountModels", entries.length);
   cfgInjectIcons($("cfgModelsTable"));
 }
@@ -4558,6 +4599,37 @@ function applyEnvPayload(p) {
   // Values never outlive the render that fetched them.
   env.revealed = {};
   env.copied = null;
+}
+
+// The backend modal's Key env <select> is built by cfgField when the modal opens
+// and nothing re-rendered it since, so a variable written from the env editor did
+// not show up until a page reload. This is the single re-render path for it.
+function renderEnvPickers() {
+  const names = cfgEnvNames();
+  const sel = $("f_apiKeyEnv");
+  if (sel) {
+    const cur = sel.value;
+    // A name the open form already holds but the served list has dropped stays as
+    // an option: resetting the pick would silently change what gets saved.
+    const opts = ["<option value=''>(choose an environment variable)</option>"].concat(
+      (names.includes(cur) || !cur ? names : names.concat([cur])).map((n) => "<option value='" + esc(n) + "'" + (n === cur ? " selected" : "") + ">" + esc(n) + "</option>")
+    );
+    sel.innerHTML = opts.join("");
+  }
+  // The table's "not set in this environment" badge reads the same list.
+  if (cfg.draft) renderCfgBackends();
+}
+
+// Re-read the env NAME list so a variable just written appears in the Key env
+// picker without a page reload. Best-effort: a refresh that fails must not
+// change the outcome the write already reported.
+async function refreshCfgEnvNames() {
+  try {
+    const r = await fetch("/api/env", { headers: keysApiAuth() || {}, cache: "no-store" });
+    const p = await r.json();
+    const names = Array.isArray(p.vars) ? p.vars.map((v) => v.name).filter(Boolean) : null;
+    if (names) { cfg.envNames = names; renderConfig(); renderEnvPickers(); }
+  } catch { /* the picker keeps the options it already has */ }
 }
 
 async function envPost(path, body) {
@@ -4713,6 +4785,7 @@ async function envAdd() {
   $("envAddName").value = "";
   $("envAddValue").value = "";
   await loadEnvVars({ keepIssue: true });
+  await refreshCfgEnvNames();
   const applied = payload && payload.applied;
   const live = payload && payload.live;
   env.issue = {
@@ -4819,6 +4892,7 @@ async function envSaveEdit(name) {
   env.editing = null;
   env.draftValue = "";
   await loadEnvVars({ keepIssue: true });
+  await refreshCfgEnvNames();
   env.status[name] = live ? "Value updated and live in the running process." : "Value updated; it takes effect on the next process start.";
   renderEnv();
 }
@@ -4846,6 +4920,7 @@ async function envRemove(name) {
     return;
   }
   await loadEnvVars({ keepIssue: true });
+  await refreshCfgEnvNames();
   env.issue = { kind: "ok", text: name + " removed from the managed secrets store." };
   renderEnv();
 }
@@ -4919,7 +4994,7 @@ function renderCfgSnapshots() {
 // diverges from what the router actually accepts.
 
 function cfgOpenModal(kind, key, data, index) {
-  cfg.modal = { kind, key, data: cfgDeepCopy(data), index: index == null ? null : index, provs: [], models: [] };
+  cfg.modal = { kind, key, data: cfgDeepCopy(data), index: index == null ? null : index, deploys: [], models: [], exposedOn: !(data && data.exposed === false) };
   $("cfgModalIssues").innerHTML = "";
   $("cfgModalBg").style.display = "flex";
   renderCfgModal();
@@ -4938,9 +5013,13 @@ function cfgField(label, id, opts) {
   const value = o.value == null ? "" : o.value;
   const sub = o.sub ? "<span class='sub'>" + esc(o.sub) + "</span>" : "";
   if (type === "textarea") {
+    // An absent value renders as an EMPTY box. The coercion above turns null into
+    // "", and JSON-encoding that "" would print the two characters `""` - a value
+    // with no input behind it, which collect then parses back as the empty string.
+    const text = o.textValue != null ? o.textValue : o.value == null ? "" : cfgJsonText(o.value);
     return (
       "<div class='cfg-field'><label for='" + id + "'><b>" + esc(label) + "</b></label>" +
-      "<textarea id='" + id + "' spellcheck='false' placeholder='" + esc(o.placeholder || "") + "'>" + esc(o.textValue == null ? cfgJsonText(value) : o.textValue) + "</textarea>" +
+      "<textarea id='" + id + "' spellcheck='false' placeholder='" + esc(o.placeholder || "") + "'>" + esc(text) + "</textarea>" +
       sub + "</div>"
     );
   }
@@ -4990,10 +5069,9 @@ function renderCfgModal() {
     $("cfgModalTitle").textContent = isNew ? "Add model" : "Edit model: " + key;
     body.innerHTML =
       cfgField("Model ID", "f_id", { value: data.id, sub: "The logical id clients request (unless a preset shadows it)." }) +
-      "<div class='cfg-field'><label><b>Providers</b></label><div id='f_provlist'></div>" +
-      "<button type='button' id='f_addprov' data-icon='plus' style='align-self:flex-start'>Add provider</button>" +
-      "<span class='sub'>Tried in this order, with session affinity inside the pool.</span></div>" +
-      cfgField("Affinity pool", "f_affinityPool", { type: "number", value: data.affinityPool == null ? 1 : data.affinityPool, sub: "How many providers session-affinity hashes over; 1 = declared order. Clamps to the provider count." }) +
+      "<div class='cfg-field'><label><b>Deployments</b></label><div id='f_deploylist'></div>" +
+      "<button type='button' id='f_adddeploy' data-icon='plus' style='align-self:flex-start'>Add deployment</button>" +
+      "<span class='sub'>One per account this model is served by. Session affinity picks among the primaries; backup-only rows are tried after they are exhausted, in this order.</span></div>" +
       "<div class='cfg-grid2'>" +
       cfgField("Label", "f_metaLabel", { value: data.meta && data.meta.label }) +
       cfgField("Context window (tokens)", "f_metaCtx", { type: "number", value: data.meta && data.meta.contextWindow }) +
@@ -5005,35 +5083,69 @@ function renderCfgModal() {
       "</div>" +
       cfgField("Off-peak pricing (JSON, optional)", "f_offPeak", { type: "textarea", value: data.meta && data.meta.pricing && data.meta.pricing.offPeak, sub: "For models with discounted off-peak rates, e.g. {\"inputPerM\":0.14,\"outputPerM\":0.28}." }) +
       cfgField("Extra params (JSON, optional)", "f_params", { type: "textarea", value: data.params }) +
-      cfgField("Retry (JSON, optional)", "f_retry", { type: "textarea", value: data.retry, sub: "Per-provider transient retry: maxRetries, baseMs, maxMs, multiplier, totalMs." });
-    cfg.modal.provs = (Array.isArray(data.providers) ? data.providers : []).map((p) => ({ backend: p.backend || "", upstream: p.upstream || "" }));
-    renderProvList();
+      cfgField("Retry (JSON, optional)", "f_retry", { type: "textarea", value: data.retry, sub: "Per-deployment transient retry: maxRetries, baseMs, maxMs, multiplier, totalMs." }) +
+      cfgField("Exposed to clients", "f_exposed", { type: "checkbox", value: data.exposed !== false, sub: "Unchecked keeps the model routable but hides it from /v1/models and the pickers." });
+    // A row listed from a legacy `providers` entry is shown the way the server's
+    // converter will store it: `affinityPool` N of M marks the rows past N as the
+    // ordered backup tail (server.mjs:1571). Without this the form would show ten
+    // primaries, and the first save would silently un-mark the backups the pool
+    // had declared.
+    const legacyRows = Array.isArray(data.providers);
+    const pool = typeof data.affinityPool === "number" ? data.affinityPool : null;
+    cfg.modal.deploys = deploymentListOf(data).map((d, i) => ({
+      backend: d && d.backend ? d.backend : "",
+      upstream: d && d.upstream ? d.upstream : "",
+      weight: d && d.weight != null ? d.weight : null,
+      backupOnly: d && d.backupOnly === true ? true : !!(legacyRows && pool != null && i >= pool),
+      legacy: legacyRows,
+      params: d && d.params,
+      dropParams: d && d.dropParams,
+      paramMap: d && d.paramMap,
+      // The rendered text of each dialect box is the baseline a blank box is
+      // compared against on collect: an untouched box repeats it and must not
+      // edit the key, an emptied one is an explicit clear.
+      orig: {
+        params: cfgJsonText(d && d.params),
+        dropParams: cfgJsonText(d && d.dropParams),
+        paramMap: cfgJsonText(d && d.paramMap),
+      },
+      prev: d,
+    }));
+    renderDeployList();
+    // The checkbox the render just emitted is the state collect reads back, so the
+    // modal carries it rather than re-probing a box the harness may not have.
+    cfg.modal.exposedOn = data.exposed !== false;
   } else if (kind === "presets") {
     $("cfgModalTitle").textContent = isNew ? "Add preset" : "Edit preset: " + key;
     body.innerHTML =
       cfgField("Preset ID", "f_id", { value: data.id, sub: "This is the id clients pass as `model`." }) +
       cfgField("Strategy", "f_strategy", {
         type: "select",
-        value: data.strategy || "affinity",
+        value: data.strategy || "fallback",
         options: [
-          { value: "affinity", label: "affinity - session-sticky spreading (default)" },
-          { value: "failover", label: "failover - strict declared order" },
-          { value: "weighted", label: "weighted - weighted-random primary" },
+          { value: "fallback", label: "fallback - declared order (v3)" },
+          { value: "affinity", label: "affinity - session-sticky spreading (legacy)" },
+          { value: "failover", label: "failover - strict declared order (legacy)" },
+          { value: "weighted", label: "weighted - weighted-random primary (legacy)" },
         ],
       }) +
       "<div class='cfg-field'><label><b>Models</b></label><div id='f_modellist'></div>" +
       "<div class='cfg-rowline'><div class='cfg-field'><select id='f_pickmodel' aria-label='Model or preset to add'></select></div>" +
       "<button type='button' id='f_addmodel' data-icon='plus'>Add</button></div>" +
       "<span class='sub'>May list models or other presets (tier nesting); the top-level strategy governs.</span></div>" +
-      cfgField("Affinity pool (optional)", "f_affinityPool", { type: "number", value: data.affinityPool == null ? "" : data.affinityPool }) +
       cfgField("Label", "f_metaLabel", { value: data.meta && data.meta.label }) +
       cfgField("Tier", "f_metaTier", { value: data.meta && data.meta.tier, sub: "UI grouping only, e.g. fast / balanced / strong." }) +
-      cfgField("When to use", "f_metaWhen", { type: "textarea", value: data.meta && data.meta.whenToUse }) +
+      // Prose, not JSON: textValue keeps the box from being JSON-quoted, which
+      // would show the field wearing quotes and then save those quotes as part of
+      // the value - a fresh pair on every save.
+      cfgField("When to use", "f_metaWhen", { type: "textarea", textValue: (data.meta && data.meta.whenToUse) || "" }) +
+      cfgField("Exposed to clients", "f_exposed", { type: "checkbox", value: data.exposed !== false, sub: "Unchecked keeps the preset routable but hides it from /v1/models and the pickers." }) +
       cfgField("Extra params (JSON, optional)", "f_params", { type: "textarea", value: data.params });
     cfg.modal.models = (Array.isArray(data.models) ? data.models : []).map((e) =>
       typeof e === "string" ? { model: e, weight: null } : { model: (e && e.model) || "", weight: (e && e.weight) == null ? null : e.weight }
     );
     renderPresetModelList();
+    cfg.modal.exposedOn = data.exposed !== false;
   } else if (kind === "settings") {
     $("cfgModalTitle").textContent = "Edit " + key;
     const hint = {
@@ -5051,25 +5163,33 @@ function renderCfgModal() {
   }
 }
 
-function renderProvList() {
-  const host = $("f_provlist");
+function renderDeployList() {
+  const host = $("f_deploylist");
   if (!host) return;
   const backendIds = (cfg.draft.backends || []).map((b) => b && b.id).filter(Boolean);
-  host.innerHTML = cfg.modal.provs.length
-    ? cfg.modal.provs
+  host.innerHTML = cfg.modal.deploys.length
+    ? cfg.modal.deploys
         .map(
-          (p, i) =>
+          (d, i) =>
             "<div class='cfg-rowline'>" +
-            "<div class='cfg-field'><select data-prov-backend='" + i + "' aria-label='Backend'>" +
-            backendIds.map((b) => "<option value='" + esc(b) + "'" + (b === p.backend ? " selected" : "") + ">" + esc(b) + "</option>").join("") +
-            (backendIds.includes(p.backend) ? "" : "<option value='" + esc(p.backend) + "' selected>" + esc(p.backend || "(none)") + " (missing)</option>") +
+            "<div class='cfg-field'><select id='f_d" + i + "_backend' data-dep-backend='" + i + "' aria-label='Backend'>" +
+            backendIds.map((b) => "<option value='" + esc(b) + "'" + (b === d.backend ? " selected" : "") + ">" + esc(b) + "</option>").join("") +
+            (backendIds.includes(d.backend) ? "" : "<option value='" + esc(d.backend) + "' selected>" + esc(d.backend || "(none)") + " (missing)</option>") +
             "</select></div>" +
-            "<div class='cfg-field'><input data-prov-upstream='" + i + "' value='" + esc(p.upstream) + "' placeholder='upstream model id' spellcheck='false' aria-label='Upstream'></div>" +
-            "<button type='button' class='danger' data-prov-del='" + i + "'>Remove</button>" +
+            "<div class='cfg-field'><input id='f_d" + i + "_upstream' data-dep-upstream='" + i + "' value='" + esc(d.upstream) + "' placeholder='upstream model id' spellcheck='false' aria-label='Upstream'></div>" +
+            "<div class='cfg-field' style='max-width:110px'><input id='f_d" + i + "_weight' data-dep-weight='" + i + "' type='number' min='1' step='1' value='" + (d.weight == null ? "" : esc(d.weight)) + "' placeholder='1' aria-label='Weight'></div>" +
+            "<div class='cfg-field'><label for='f_d" + i + "_backupOnly' style='display:flex;align-items:center;gap:6px;color:var(--text)'>" +
+            "<input type='checkbox' id='f_d" + i + "_backupOnly' data-dep-backuponly='" + i + "' style='width:auto' " + (d.backupOnly ? "checked" : "") + "> <b>backup only</b></label></div>" +
+            "<button type='button' class='danger' data-dep-del='" + i + "'>Remove</button>" +
+            "</div>" +
+            "<div class='cfg-rowline'>" +
+            "<div class='cfg-field'><label for='f_d" + i + "_params'><b>params</b></label><textarea id='f_d" + i + "_params' data-dep-json='" + i + ":params' spellcheck='false' placeholder='{}'>" + esc(d.orig.params) + "</textarea></div>" +
+            "<div class='cfg-field'><label for='f_d" + i + "_dropParams'><b>dropParams</b></label><textarea id='f_d" + i + "_dropParams' data-dep-json='" + i + ":dropParams' spellcheck='false'>" + esc(d.orig.dropParams) + "</textarea></div>" +
+            "<div class='cfg-field'><label for='f_d" + i + "_paramMap'><b>paramMap</b></label><textarea id='f_d" + i + "_paramMap' data-dep-json='" + i + ":paramMap' spellcheck='false'>" + esc(d.orig.paramMap) + "</textarea></div>" +
             "</div>"
         )
         .join("")
-    : "<p class='cfg-sub'>No providers. A model with no providers routes nowhere.</p>";
+    : "<p class='cfg-sub'>No deployments. A model with no deployments routes nowhere.</p>";
 }
 
 function renderPresetModelList() {
@@ -5104,62 +5224,161 @@ function cfgModalCollect() {
   const num = (id) => { const s = String(val(id)).trim(); return s === "" ? undefined : Number(s); };
   const bool = (id) => { const el = $(id); return el ? el.checked : false; };
 
+  // The modal edits a SUBSET of an entry's keys, so every branch starts from the
+  // entry as it stands and touches only its own fields: a key with no field here
+  // (a dialect key, a v3 shape, anything the form does not know yet) survives a
+  // save, and a box the user emptied removes its key instead of keeping the value
+  // that is no longer on screen.
+  const prevEntry = (bucket) => {
+    const src = (cfg.draft || {})[bucket];
+    const raw = Array.isArray(src)
+      ? (cfg.modal.index == null ? null : src[cfg.modal.index])
+      : (cfg.modal.key == null ? null : src && src[cfg.modal.key]);
+    return raw && typeof raw === "object" && !Array.isArray(raw) ? cfgDeepCopy(raw) : {};
+  };
+  const setText = (o, key, id) => { const v = String(val(id)).trim(); if (v) o[key] = v; else delete o[key]; };
+  const setNum = (o, key, id) => { const n = num(id); if (n !== undefined && !Number.isNaN(n)) o[key] = n; else delete o[key]; };
+  const setJson = (o, key, id) => { const raw = String(val(id)).trim(); if (!raw) { delete o[key]; return; } const v = cfgParseMaybeJson(raw); if (v !== undefined) o[key] = v; else delete o[key]; };
+  // A deployment's dialect box is pre-filled with what the entry already holds,
+  // so a box still holding that text is untouched and a blank one is an explicit
+  // clear - the same rule the scalar helpers apply, spelled out because the
+  // comparison is against the RENDERED text rather than an empty string. A row
+  // with no rendered baseline at all (nothing to compare a blank box against) is
+  // NOT a clear: the key survives rather than being deleted by an absent box.
+  const setDeployJson = (o, key, id, origText) => {
+    if (origText == null) return;
+    const raw = String(val(id)).trim();
+    const base = String(origText).trim();
+    if (raw && raw === base) return;
+    if (!raw) { delete o[key]; return; }
+    const v = cfgParseMaybeJson(raw);
+    if (v !== undefined) o[key] = v; else delete o[key];
+  };
+  // A form value that still matches the entry it was rendered from is not a
+  // change, so the key is left EXACTLY as it was - which is what makes a no-op
+  // save a genuine no-op. Only a value the operator actually typed is written,
+  // and a value equal to the default (weight 1, backupOnly false) is omitted
+  // rather than spelled out: the server reads those defaults back identically,
+  // and writing them would hand every deployment an explicit `weight: 1` the
+  // operator never typed on the first save after this ships.
+  const setWeight = (o, orig, id) => {
+    const raw = String(val(id)).trim();
+    const w = raw === "" ? 1 : Math.floor(Number(raw));
+    if (!Number.isFinite(w) || w < 1) { delete o.weight; return; }
+    if (w === orig) return;
+    if (w === 1) delete o.weight; else o.weight = w;
+  };
+  const setBackupOnly = (o, orig, id) => {
+    const on = bool(id);
+    if (on === !!orig) return;
+    if (on) o.backupOnly = true; else delete o.backupOnly;
+  };
+
   if (kind === "backends") {
-    const b = {};
-    if (val("f_id").trim()) b.id = val("f_id").trim();
-    if (val("f_baseURL").trim()) b.baseURL = val("f_baseURL").trim();
-    if (val("f_apiKeyEnv").trim()) b.apiKeyEnv = val("f_apiKeyEnv").trim();
-    const t = num("f_timeoutMs");
-    if (t !== undefined && !Number.isNaN(t)) b.timeoutMs = t;
+    const b = prevEntry("backends");
+    setText(b, "id", "f_id");
+    setText(b, "baseURL", "f_baseURL");
+    setText(b, "apiKeyEnv", "f_apiKeyEnv");
+    setNum(b, "timeoutMs", "f_timeoutMs");
     if (bool("f_translateDeveloperRole")) b.translateDeveloperRole = true;
-    if (val("f_model").trim()) b.model = val("f_model").trim();
-    const params = cfgParseMaybeJson(val("f_params"));
-    if (params !== undefined) b.params = params;
+    else delete b.translateDeveloperRole;
+    setText(b, "model", "f_model");
+    setJson(b, "params", "f_params");
     return b;
   }
+  // The exposure box is the one control whose DEFAULT is "on", so it cannot be
+  // read with truthiness: `exposed: true` IS the default and is omitted, while an
+  // absent key means exposed (never "hidden"). `cfg.modal.exposedOn` is the state
+  // the render derived and the modal's own change handler updates, which is what
+  // collect reads - a hand-fed harness exercises collect without a render, and a
+  // DOM probe cannot tell "never rendered" from "rendered unchecked".
+  const exposedOn = () => cfg.modal.exposedOn !== false;
   if (kind === "models") {
-    const m = {};
-    if (val("f_id").trim()) m.id = val("f_id").trim();
-    m.providers = (cfg.modal.provs || [])
-      .filter((p) => p.backend)
-      .map((p) => (p.upstream ? { backend: p.backend, upstream: p.upstream } : { backend: p.backend }));
-    const ap = num("f_affinityPool");
-    if (ap !== undefined && !Number.isNaN(ap)) m.affinityPool = ap;
-    const meta = {};
-    if (val("f_metaLabel").trim()) meta.label = val("f_metaLabel").trim();
-    const ctx = num("f_metaCtx");
-    if (ctx !== undefined && !Number.isNaN(ctx)) meta.contextWindow = ctx;
-    const pricing = {};
-    const pin = num("f_priceIn"), pout = num("f_priceOut"), pcache = num("f_priceCache");
-    if (pin !== undefined && !Number.isNaN(pin)) pricing.inputPerM = pin;
-    if (pout !== undefined && !Number.isNaN(pout)) pricing.outputPerM = pout;
-    if (pcache !== undefined && !Number.isNaN(pcache)) pricing.cacheHitInputPerM = pcache;
-    const off = cfgParseMaybeJson(val("f_offPeak"));
-    if (off !== undefined) pricing.offPeak = off;
+    const m = prevEntry("models");
+    setText(m, "id", "f_id");
+    // Deployments replace `providers` outright, and the legacy key is REMOVED
+    // even when the input carried one: a model with both keys is read by the
+    // server's converter as `providers`-wins, so keeping it would silently
+    // discard every edit made here.
+    delete m.providers;
+    m.deployments = (cfg.modal.deploys || [])
+      .map((d, i) => ({ d, i }))
+      // A row with no backend names no account to send to, so it is dropped
+      // rather than stored half-formed. The form-field index is the ORIGINAL
+      // position, which is what the rendered ids carry.
+      .filter((r) => r.d.backend)
+      .map((r) => {
+        const d = r.d;
+        // The previous object is the base in both shapes, so every key the form
+        // does not own survives where it was. A LEGACY row (one listed from a
+        // `providers` entry) additionally has its derived v3 keys materialized
+        // here: the two helpers below skip a box that still matches the state the
+        // form rendered, and for a legacy row that state is new, so the weight, the
+        // backup flag and the three dialect keys would otherwise be dropped the
+        // first time an old-shape model is saved.
+        const from = d.prev && typeof d.prev === "object" ? d.prev : null;
+        const out = from ? cfgDeepCopy(from) : {};
+        out.backend = d.backend;
+        if (d.upstream) out.upstream = d.upstream;
+        else delete out.upstream;
+        if (d.legacy) {
+          const lw = d.weight == null ? 1 : Math.floor(Number(d.weight));
+          if (Number.isFinite(lw) && lw > 1) out.weight = lw;
+          if (d.backupOnly) out.backupOnly = true;
+          for (const k of ["params", "dropParams", "paramMap"]) if (d[k] !== undefined && out[k] === undefined) out[k] = cfgDeepCopy(d[k]);
+        }
+        setWeight(out, d.weight, "f_d" + r.i + "_weight");
+        setBackupOnly(out, d.backupOnly, "f_d" + r.i + "_backupOnly");
+        setDeployJson(out, "params", "f_d" + r.i + "_params", d.orig && d.orig.params);
+        setDeployJson(out, "dropParams", "f_d" + r.i + "_dropParams", d.orig && d.orig.dropParams);
+        setDeployJson(out, "paramMap", "f_d" + r.i + "_paramMap", d.orig && d.orig.paramMap);
+        return out;
+      });
+    // `affinityPool` is gone from v3 and has no field here, so nothing writes it
+    // and the copy of the previous entry must not carry it forward either.
+    delete m.affinityPool;
+    if (exposedOn()) delete m.exposed;
+    else m.exposed = false;
+    const meta = Object.assign({}, m.meta && typeof m.meta === "object" && !Array.isArray(m.meta) ? m.meta : {});
+    const pricing = Object.assign({}, meta.pricing && typeof meta.pricing === "object" && !Array.isArray(meta.pricing) ? meta.pricing : {});
+    setText(meta, "label", "f_metaLabel");
+    setNum(meta, "contextWindow", "f_metaCtx");
+    setNum(pricing, "inputPerM", "f_priceIn");
+    setNum(pricing, "outputPerM", "f_priceOut");
+    setNum(pricing, "cacheHitInputPerM", "f_priceCache");
+    setJson(pricing, "offPeak", "f_offPeak");
     if (Object.keys(pricing).length) meta.pricing = pricing;
+    else delete meta.pricing;
     if (Object.keys(meta).length) m.meta = meta;
-    const params = cfgParseMaybeJson(val("f_params"));
-    if (params !== undefined) m.params = params;
-    const retry = cfgParseMaybeJson(val("f_retry"));
-    if (retry !== undefined) m.retry = retry;
+    else delete m.meta;
+    setJson(m, "params", "f_params");
+    setJson(m, "retry", "f_retry");
     return m;
   }
   if (kind === "presets") {
-    const p = {};
-    if (val("f_id").trim()) p.id = val("f_id").trim();
-    p.strategy = val("f_strategy") || "affinity";
+    const p = prevEntry("presets");
+    setText(p, "id", "f_id");
+    p.strategy = val("f_strategy") || "fallback";
     p.models = (cfg.modal.models || [])
       .filter((e) => e.model)
-      .map((e) => (e.weight == null || e.weight === "" ? e.model : { model: e.model, weight: Number(e.weight) }));
-    const ap = num("f_affinityPool");
-    if (ap !== undefined && !Number.isNaN(ap)) p.affinityPool = ap;
-    const meta = {};
-    if (val("f_metaLabel").trim()) meta.label = val("f_metaLabel").trim();
-    if (val("f_metaTier").trim()) meta.tier = val("f_metaTier").trim();
-    if (val("f_metaWhen").trim()) meta.whenToUse = val("f_metaWhen").trim();
+      .map((e) => {
+        // A blank or unparseable weight is an absence, not 0 and not NaN: the row
+        // stays a bare id reference.
+        const w = String(e.weight == null ? "" : e.weight).trim();
+        return !w || !Number.isFinite(Number(w)) ? e.model : { model: e.model, weight: Number(w) };
+      });
+    // `affinityPool` is gone from v3 and has no field here, so nothing writes it
+    // and the copy of the previous entry must not carry it forward either.
+    delete p.affinityPool;
+    if (exposedOn()) delete p.exposed;
+    else p.exposed = false;
+    const meta = Object.assign({}, p.meta && typeof p.meta === "object" && !Array.isArray(p.meta) ? p.meta : {});
+    setText(meta, "label", "f_metaLabel");
+    setText(meta, "tier", "f_metaTier");
+    setText(meta, "whenToUse", "f_metaWhen");
     if (Object.keys(meta).length) p.meta = meta;
-    const params = cfgParseMaybeJson(val("f_params"));
-    if (params !== undefined) p.params = params;
+    else delete p.meta;
+    setJson(p, "params", "f_params");
     return p;
   }
   return null;
@@ -5180,6 +5399,16 @@ function cfgApplyModal() {
   const obj = cfgModalCollect();
   const isNew = key === null;
   const newId = obj.id;
+  if (!newId) {
+    // An id is how the entry is addressed, so an emptied one has nothing to store
+    // under and every field the user did touch would be thrown away. Say so and
+    // keep the modal open instead of offering a rename to "undefined".
+    const what = kind === "backends" ? "Backend" : kind === "models" ? "Model" : "Preset";
+    const issues = $("cfgModalIssues");
+    issues.className = "cfg-issues error";
+    issues.innerHTML = ICONS.warn + "<div><b>" + what + " id is required.</b> Give it one, or Cancel to leave the entry as it was.</div>";
+    return;
+  }
   let rewrite = true;
   if (!isNew && newId !== key) {
     const refs = countRefsTo(kind, key);
@@ -5192,11 +5421,15 @@ function cfgApplyModal() {
   cfgMutate((d) => {
     if (kind === "backends") {
       const idx = isNew ? d.backends.length : index;
-      delete obj.id;
+      // backends is an array, so the id IS the element's identity: it stays on the
+      // stored object. The maps below carry it in the KEY and drop the field.
       if (isNew) d.backends.push(obj);
       else d.backends[idx] = obj;
       if (!isNew && rewrite && key !== newId) {
         for (const m of Object.values(d.models || {})) {
+          // Both shapes: an old-shape entry the editor has not saved yet still
+          // addresses its accounts through `providers`.
+          for (const dep of (m && m.deployments) || []) if (dep && dep.backend === key) dep.backend = newId;
           for (const pr of (m && m.providers) || []) if (pr.backend === key) pr.backend = newId;
         }
       }
@@ -5227,7 +5460,10 @@ function countRefsTo(kind, id) {
   const d = cfg.draft || {};
   let n = 0;
   if (kind === "backends") {
-    for (const m of Object.values(d.models || {})) for (const p of (m && m.providers) || []) if (p.backend === id) n++;
+    for (const m of Object.values(d.models || {})) {
+      for (const dep of (m && m.deployments) || []) if (dep && dep.backend === id) n++;
+      for (const pr of (m && m.providers) || []) if (pr.backend === id) n++;
+    }
   } else {
     for (const p of Object.values(d.presets || {})) {
       for (const e of (p && p.models) || []) if ((typeof e === "string" ? e : e && e.model) === id) n++;
@@ -5241,7 +5477,7 @@ function cfgDeleteEntry(kind, keyOrIndex) {
     const b = (cfg.draft.backends || [])[keyOrIndex];
     if (!b) return;
     const refs = countRefsTo("backends", b.id);
-    if (!confirm("Delete backend '" + b.id + "'?" + (refs ? "\n\n" + refs + " provider reference(s) will be left dangling and will fail validation." : ""))) return;
+    if (!confirm("Delete backend '" + b.id + "'?" + (refs ? "\n\n" + refs + " deployment reference(s) will be left dangling and will fail validation." : ""))) return;
     cfgMutate((d) => { d.backends.splice(keyOrIndex, 1); });
     return;
   }
@@ -5364,19 +5600,19 @@ $("view-config").addEventListener("click", (ev) => {
     }
   }
 });
-// Provider / preset-model row interactions inside the modal.
+// Deployment / preset-model row interactions inside the modal.
 $("cfgModalBody").addEventListener("click", (ev) => {
-  const addProv = ev.target.closest("#f_addprov");
-  if (addProv) {
+  const addDeploy = ev.target.closest("#f_adddeploy");
+  if (addDeploy) {
     const ids = (cfg.draft.backends || []).map((b) => b && b.id).filter(Boolean);
-    cfg.modal.provs.push({ backend: ids[0] || "", upstream: "" });
-    renderProvList();
+    cfg.modal.deploys.push({ backend: ids[0] || "", upstream: "", weight: null, backupOnly: false, orig: { params: "", dropParams: "", paramMap: "" } });
+    renderDeployList();
     return;
   }
-  const delProv = ev.target.closest("[data-prov-del]");
-  if (delProv) {
-    cfg.modal.provs.splice(Number(delProv.dataset.provDel), 1);
-    renderProvList();
+  const delDeploy = ev.target.closest("[data-dep-del]");
+  if (delDeploy) {
+    cfg.modal.deploys.splice(Number(delDeploy.dataset.depDel), 1);
+    renderDeployList();
     return;
   }
   const addModel = ev.target.closest("#f_addmodel");
@@ -5395,10 +5631,22 @@ $("cfgModalBody").addEventListener("click", (ev) => {
   }
 });
 $("cfgModalBody").addEventListener("input", (ev) => {
-  const pb = ev.target.closest("[data-prov-backend]");
-  if (pb) { cfg.modal.provs[Number(pb.dataset.provBackend)].backend = pb.value; return; }
-  const pu = ev.target.closest("[data-prov-upstream]");
-  if (pu) { cfg.modal.provs[Number(pu.dataset.provUpstream)].upstream = pu.value; return; }
+  const db = ev.target.closest("[data-dep-backend]");
+  if (db) { cfg.modal.deploys[Number(db.dataset.depBackend)].backend = db.value; return; }
+  const du = ev.target.closest("[data-dep-upstream]");
+  if (du) { cfg.modal.deploys[Number(du.dataset.depUpstream)].upstream = du.value; return; }
+  const dw = ev.target.closest("[data-dep-weight]");
+  if (dw) {
+    const v = dw.value.trim();
+    cfg.modal.deploys[Number(dw.dataset.depWeight)].weight = v === "" ? null : Number(v);
+    return;
+  }
+  const dj = ev.target.closest("[data-dep-json]");
+  if (dj) {
+    const [i, key] = String(dj.dataset.depJson).split(":");
+    cfg.modal.deploys[Number(i)][key] = dj.value;
+    return;
+  }
   const pm = ev.target.closest("[data-pm-weight]");
   if (pm) {
     const v = pm.value.trim();
@@ -5406,8 +5654,11 @@ $("cfgModalBody").addEventListener("input", (ev) => {
   }
 });
 $("cfgModalBody").addEventListener("change", (ev) => {
-  const pb = ev.target.closest("[data-prov-backend]");
-  if (pb) cfg.modal.provs[Number(pb.dataset.provBackend)].backend = pb.value;
+  const db = ev.target.closest("[data-dep-backend]");
+  if (db) cfg.modal.deploys[Number(db.dataset.depBackend)].backend = db.value;
+  const dc = ev.target.closest("[data-dep-backuponly]");
+  if (dc) cfg.modal.deploys[Number(dc.dataset.depBackuponly)].backupOnly = dc.checked;
+  if (ev.target.closest("#f_exposed")) cfg.modal.exposedOn = ev.target.checked === true;
 });
 
 // Guard against a lost draft on navigation away from a dirty editor.
