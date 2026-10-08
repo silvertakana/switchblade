@@ -4333,7 +4333,7 @@ async function main() {
       ],
       models: { mA: { providers: [{ backend: "ra", upstream: "u1" }, { backend: "rc", upstream: "u3" }], affinityPool: 1 } },
       presets: { pA: { strategy: "affinity", models: ["mA"] } },
-      backoff: { ...BO, serverBaseMs: 150, serverMaxMs: 3000 },
+      backoff: { ...BO, serverBaseMs: 400, serverMaxMs: 6000 },
     };
     const hRel = await startRouterCfg(cfgRel, "KEY_RA=k\nKEY_RC=k\n");
     const routeRows = async () => (await (await api(hRel.base, "/health", { method: "GET" })).json()).routes || [];
@@ -4345,11 +4345,15 @@ async function main() {
         row1 && row1.state === "cooling" && row1.fails === 1 && row1.models.includes("mA") && row1.retryInMs > 0,
         "zRel1a) /health lists the cooling route with its logical model and retry time (" + JSON.stringify(row1) + ")"
       );
-      await new Promise((r) => setTimeout(r, 250)); // let the 150ms cooldown lapse
+      // The margin has to outlast the FIRST cooldown (400ms) by enough that a slow round trip
+      // cannot also outlast the second one (800ms) before /health is read - at 150/250ms this
+      // test failed roughly one run in three on a loaded Windows box, which reads as a
+      // regression rather than the scheduling race it is.
+      await new Promise((r) => setTimeout(r, 650)); // let the 400ms cooldown lapse
       await pA(); // a probe: fails again, so the streak must grow rather than restart
       const row2 = (await routeRows()).find((x) => x.backend === "ra" && x.upstream === "u1");
       assert(
-        row2 && row2.fails === 2 && row2.retryInMs > 150,
+        row2 && row2.fails === 2 && row2.retryInMs > 400,
         "zRel1b) the failure streak survives timer expiry (fails=" + (row2 && row2.fails) + ", retryInMs=" + (row2 && row2.retryInMs) + ")"
       );
       // Reload with the ra/u1 provider removed: that route is pruned.
