@@ -2868,6 +2868,10 @@ async function main() {
   //   and because the caller already holds part of the response the router must NOT
   //   replay it on the model\u2019s next provider.
   {
+    // Event-held cut: the MOCK does not decide when to die, the test does, so the cut is
+    // ordered after the first chunk is provably in the caller's hands (no timing sleep).
+    let releaseCut = null;
+    const cutGate = new Promise((r) => { releaseCut = r; });
     const srvCut = http.createServer(async (req, res) => {
       const chunks = [];
       for await (const c of req) chunks.push(c);
@@ -2875,7 +2879,8 @@ async function main() {
       if (body.includes(String.fromCharCode(34) + "stream" + String.fromCharCode(34) + ":true")) {
         res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
         res.write("data: " + JSON.stringify({ id: "m", choices: [{ delta: { content: "first-chunk" } }] }) + "\n\n");
-        setTimeout(() => res.destroy(), 20);
+        await cutGate;
+        res.destroy();
         return;
       }
       res.writeHead(200, { "content-type": "application/json" });
@@ -2924,18 +2929,88 @@ async function main() {
           const { done, value } = await reader.read();
           if (done) break;
           text += dec.decode(value, { stream: true });
+          if (releaseCut && text.includes("first-chunk")) { releaseCut(); releaseCut = null; }
         }
       } catch (e) { readErr = String(e && e.message); }
       const after = await api(hRc.base, "/v1/chat/completions", { body: { model: "pD", messages: [] } });
       const afterBody = await after.json();
+      // The cut must be CHARGED to the route. A one-way "the caller left" latch would excuse it
+      // as a cancellation and charge nothing, which is how a genuinely dying relay keeps getting
+      // picked: the route has to be the thing that cools.
+      const hhR = await (await api(hRc.base, "/health", { method: "GET" })).json();
+      const cutRow = (hhR.routes || []).find((x) => x.backend === "oa" && x.upstream === "uR");
       assert(
         text.includes("first-chunk") && !text.includes("ok:uR2") &&
-          after.status === 200 && afterBody.choices && afterBody.choices[0].message.content === "ok:uD",
-        "zStage2) a relay cut after delivered chunks cools only that route, never replays it on the next provider, and leaves the account serving (delivered=" + text.includes("first-chunk") + ", replayed=" + text.includes("ok:uR2") + ", siblingStatus=" + after.status + ", readErr=" + readErr + ")"
+          after.status === 200 && afterBody.choices && afterBody.choices[0].message.content === "ok:uD" &&
+          !!cutRow && cutRow.state === "cooling",
+        "zStage2) a relay cut after delivered chunks cools only that route, never replays it on the next provider, and leaves the account serving (delivered=" + text.includes("first-chunk") + ", replayed=" + text.includes("ok:uR2") + ", siblingStatus=" + after.status + ", readErr=" + readErr + ", routeState=" + (cutRow ? cutRow.state : "none") + ")"
       );
     } finally {
       hRc.child.kill(); srvCut.close(); srvAlt.close();
       await rm(hRc.dir, { recursive: true, force: true });
+    }
+  }
+
+  // zCancel1) A caller who leaves BEFORE any headers is the case nothing observed: the router
+  //   kept waiting on an upstream request for a client that was already gone, and when that
+  //   upstream finally failed the failure was charged to a healthy provider. The upstream
+  //   request must be released at the socket, and no failover attempted, because there is
+  //   nobody left to serve. Held on events, not sleeps: the test waits until the upstream
+  //   provably holds the request before walking away.
+  {
+    let aGot = null;
+    const aGotRequest = new Promise((r) => { aGot = r; });
+    let aClosed = null;
+    const aClosedUpstream = new Promise((r) => { aClosed = r; });
+    let bHits = 0;
+    const srvA = http.createServer((req, res) => {
+      aGot();
+      res.on("close", () => aClosed());
+      req.on("aborted", () => aClosed());
+      // never respond: the router is waiting for headers when the caller walks away
+    });
+    const srvB = http.createServer(async (req, res) => {
+      bHits++;
+      for await (const c of req) { /* drain */ }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: "m", object: "chat.completion", choices: [{ message: { role: "assistant", content: "ok:cb" } }] }));
+    });
+    const portA = await listen(srvA);
+    const portB = await listen(srvB);
+    const cfgCn = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "ca", baseURL: `http://${HOST}:${portA}`, apiKeyEnv: "KEY_CA" },
+        { id: "cb", baseURL: `http://${HOST}:${portB}`, apiKeyEnv: "KEY_CB" },
+      ],
+      models: { mCn: { providers: [{ backend: "ca", upstream: "ua" }, { backend: "cb", upstream: "ub" }], affinityPool: 1 } },
+      presets: { pCn: { strategy: "affinity", models: ["mCn"] } },
+      backoff: { ...BO, serverBaseMs: 60000, serverMaxMs: 300000 },
+    };
+    const hCn = await startRouterCfg(cfgCn, "KEY_CA=k\nKEY_CB=k\n");
+    try {
+      const ac = new AbortController();
+      const inflight = fetch(hCn.base + "/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer local-master" },
+        body: JSON.stringify({ model: "pCn", messages: [] }),
+        signal: ac.signal,
+      });
+      inflight.catch(() => {}); // the caller's own abort rejects; that is the point
+      await aGotRequest;        // the upstream provably holds the request
+      ac.abort();               // now the caller walks away, before any header
+      let upstreamReleased = false;
+      await Promise.race([aClosedUpstream.then(() => { upstreamReleased = true; }), new Promise((r) => setTimeout(r, 5000))]);
+      const hh = await (await api(hCn.base, "/health", { method: "GET" })).json();
+      const acct = hh.backends.find((x) => x.id === "ca");
+      const rows = (hh.routes || []).filter((x) => x.backend === "ca");
+      assert(
+        upstreamReleased && bHits === 0 && acct && acct.state === "healthy" && rows.length === 0,
+        "zCancel1) a caller who leaves before any headers releases the upstream request, fails over nowhere, and charges no health (upstreamReleased=" + upstreamReleased + ", bHits=" + bHits + ", state=" + (acct ? acct.state : "?") + ", routes=" + JSON.stringify(rows) + ")"
+      );
+    } finally {
+      hCn.child.kill(); srvA.close(); srvB.close();
+      await rm(hCn.dir, { recursive: true, force: true });
     }
   }
 

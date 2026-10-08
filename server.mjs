@@ -2582,7 +2582,7 @@ function buildPayload(body, cfg, preset, model, provider, backend) {
 
 // ---- request forwarding ----------------------------------------------------
 
-async function forward(req, cfg, backend, payload, incomingHeaders, stream, sessionKey) {
+async function forward(req, cfg, backend, payload, incomingHeaders, stream, sessionKey, callerSignal) {
   const key = process.env[backend.apiKeyEnv];
   const upstream = backend.baseURL.replace(/\/$/, "") + "/chat/completions";
 
@@ -2629,13 +2629,16 @@ async function forward(req, cfg, backend, payload, incomingHeaders, stream, sess
   const connectTimeoutMs = backend.connectTimeoutMs ?? backend.timeoutMs ?? cfg.connectTimeoutMs ?? cfg.timeoutMs ?? 45000;
   const connectController = new AbortController();
   const connectTimer = setTimeout(() => connectController.abort(), connectTimeoutMs);
+  // The caller's own cancellation joins the header timeout, so work for a caller who has
+  // already gone stops at the socket instead of running on behind them.
+  const requestSignal = callerSignal ? AbortSignal.any([connectController.signal, callerSignal]) : connectController.signal;
   let upstreamRes;
   try {
     upstreamRes = await fetch(upstream, {
       method: "POST",
       headers: outHeaders,
       body: payloadText,
-      signal: connectController.signal,
+      signal: requestSignal,
     });
   } catch (e) {
     clearTimeout(connectTimer);
@@ -2647,7 +2650,11 @@ async function forward(req, cfg, backend, payload, incomingHeaders, stream, sess
     // route on that account, so charging one route would make each sibling rediscover the same
     // dead endpoint in turn. The HTTP status is 0 for both, so the number cannot carry this.
     const err = newError(0, String(e && e.message));
-    err.stage = connectController.signal.aborted ? "header_timeout" : "connect";
+    // A caller who left is not evidence about the provider at all, so it gets its own stage
+    // rather than being folded into "the endpoint is unreachable".
+    err.stage = callerSignal && callerSignal.aborted
+      ? "caller_aborted"
+      : connectController.signal.aborted ? "header_timeout" : "connect";
     return { err };
   }
   clearTimeout(connectTimer); // headers arrived: the wall clock no longer applies to the body
@@ -2829,10 +2836,29 @@ async function handleChat(req, res, cfg, bodyText) {
   // provider rejected the request unexplained when that is literally what
   // happened. If an earlier provider failed WITH an explanation (a 500, say) and
   // only the last one was opaque, the universal claim would mislabel the request.
+  let callerGone = false;
   let failedAttempts = 0;
   let opaqueFailures = 0;
   const captureDetail = bodyText.length <= DETAIL_MAX_BODY_BYTES; // size guard: skip huge payloads
   const detailT = Date.now();
+  // Request-lifetime cancellation. The caller can vanish at ANY moment, including while the
+  // router is still waiting for upstream headers, and nothing above this line observes it.
+  // Without this the upstream request runs to completion for nobody and its failure is charged
+  // to the provider, so a client that abandons requests cools providers that are healthy.
+  const callerAbort = new AbortController();
+  const onCallerGone = () => {
+    if (res.writableEnded) return; // a FINISHED response closing is not an abandonment
+    callerGone = true;
+    callerAbort.abort();
+  };
+  // Both watchers are one-shot on PER-REQUEST emitters, so they cannot accumulate on a
+  // keep-alive connection: close fires on every response and consumes the second one.
+  req.once("aborted", onCallerGone);
+  res.once("close", onCallerGone);
+  const disposeCallerWatch = () => {
+    req.off("aborted", onCallerGone);
+    res.off("close", onCallerGone);
+  };
   for (let poolIndex = 0; poolIndex < pool.length; poolIndex++) {
     const attempt = pool[poolIndex];
     if (priorBackend && priorBackend !== attempt.backend) fallbackCount++;
@@ -2905,7 +2931,7 @@ async function handleChat(req, res, cfg, bodyText) {
       if (bookRoute) bookRoute.dispatchSeq = attempt.dispatchSeq;
       const bookAccount = health.get(attempt.backend);
       if (bookAccount) bookAccount.dispatchSeq = attempt.dispatchSeq;
-      result = await forward(req, cfg, backend, payload, req.headers, stream, sessionKey);
+      result = await forward(req, cfg, backend, payload, req.headers, stream, sessionKey, callerAbort.signal);
       if (result.err && isRetryableError(result.err.status, result.err.body) && retries < maxRetries && !hasEligibleAlternative()) {
         const retryCount = retries + 1;
         const waitMs = Math.min(retryBaseMs * retryMult ** (retryCount - 1), retryMaxMs);
@@ -2936,15 +2962,18 @@ async function handleChat(req, res, cfg, bodyText) {
     if (result.err) {
       lastErr = result.err;
       const errKind = classify(result.err.status, result.err.body, result.err.errorBodyState);
+      // A caller who left before any header is not a provider failure: the attempt is charged
+      // nothing, and with nobody left to serve there is no failover to attempt either.
+      const callerAborted = result.err.stage === "caller_aborted";
       failedAttempts++;
       if (errKind === "upstream_rejection") opaqueFailures++;
-      noteAttemptFailure(cfg, attempt, exclScope, result.err.status, result.err.body, result.err.errorBodyState, result.err.stage || null);
-      const scope = cooldownScopeOf(attempt, errKind);
+      if (!callerAborted) noteAttemptFailure(cfg, attempt, exclScope, result.err.status, result.err.body, result.err.errorBodyState, result.err.stage || null);
+      const scope = callerAborted ? { cooldownScope: null, nextAvailableAt: null } : cooldownScopeOf(attempt, errKind);
       attemptsSummary.push(attemptOutcome({
         attempt,
         status: result.err.status,
         kind: errKind,
-        decision: errKind === "client" ? "client_error" : "failover",
+        decision: callerAborted ? "client_cancelled" : errKind === "client" ? "client_error" : "failover",
         latencyMs: Date.now() - attemptStarted,
         errorBodyState: result.err.errorBodyState || null,
         errorBodyBytes: result.err.errorBodyBytes ?? 0,
@@ -2958,7 +2987,7 @@ async function handleChat(req, res, cfg, bodyText) {
       // unexplained rejection proves nothing about the payload, so it falls
       // through to the next provider instead.
       releaseAttempt(lease);
-      if (errKind === "client") break;
+      if (callerAborted || errKind === "client") break;
       continue;
     }
     // The upstream answered, but a status line is not a success yet: mark healthy
@@ -3085,6 +3114,7 @@ async function handleChat(req, res, cfg, bodyText) {
       ...capAttemptsSummary(attemptsSummary),
     });
     releaseAttempt(lease);
+    disposeCallerWatch();
     return;
   }
 
@@ -3103,7 +3133,8 @@ async function handleChat(req, res, cfg, bodyText) {
   const failEntry = applyCost(newHistoryEntry({ t: detailT, callId, model: modelId, backend: lastTried ? lastTried.backend : "none", stream, status: finalStatus, latencyMs, session: sessionKey, routedModel: c.ordered[0] ? c.ordered[0].model : null, selectionReason, fallbackCount, cacheMayBeCold: fallbackCount > 0, ...capAttemptsSummary(attemptsSummary), errorKind: lastKind }), cfg);
   recordHistory(failEntry);
   recordAnalytics(failEntry);
-  if (!explainedClient) fireAlert(cfg, "request_exhausted", { callId, model: modelId, error: lastErr ? String(lastErr.body || lastErr.status) : "all providers unavailable" });
+  // A caller who left is not provider exhaustion, so it must not raise the operator alert.
+  if (!explainedClient && !callerGone) fireAlert(cfg, "request_exhausted", { callId, model: modelId, error: lastErr ? String(lastErr.body || lastErr.status) : "all providers unavailable" });
   recordStats({ backend: lastTried ? lastTried.backend : "none", model: modelId, status: finalStatus, latencyMs });
   // A detail record exists whenever at least one attempt ran (recorded per
   // attempt above); finalize it unconditionally.
@@ -3165,6 +3196,7 @@ async function handleChat(req, res, cfg, bodyText) {
     cfg,
     req,
   });
+  disposeCallerWatch();
   return writeError(res, newError(finalStatus, errBody));
 }
 
@@ -3628,12 +3660,18 @@ async function relay(res, upstreamRes, stream, backendId, started, callId, idleT
   let hasContent = false;
   let hasReasoning = false;
   let hasToolCalls = false;
-  // A caller that hung up mid-relay is not an upstream outage, so cancellation is
-  // tracked distinctly. 'close' also fires after a normal end, where writableEnded
-  // is already true, so only an unfinished response counts as a cancellation.
+  // What ended this relay, recorded as a CAUSE rather than a one-way latch. A one-way
+  // "the caller left" latch is wrong: pipeline() destroys the downstream when the UPSTREAM
+  // fails, which fires the very same close a caller hang-up does, so a genuine relay cut
+  // would be excused as a cancellation and charge no health at all.
   let clientCancelled = false;
+  let cause = null;
+  const note = (c) => { if (cause === null) cause = c; };
+  const force = (c) => { cause = c; };
+  // 'close' also fires after a normal end, where writableEnded is already true, so only an
+  // unfinished response is even a candidate for "the caller left".
   const onClientClose = () => {
-    if (!res.writableEnded) clientCancelled = true;
+    if (!res.writableEnded) note("client");
   };
   res.on("close", onClientClose);
   const cap = (s) => (typeof s === "string" ? (s.length > 200 ? s.slice(0, 200) + "…" : s) : s);
@@ -3652,9 +3690,26 @@ async function relay(res, upstreamRes, stream, backendId, started, callId, idleT
       // arrive for idleTimeoutMs. Alive streams (any chunk within the bound)
       // run to completion regardless of total duration.
       const idle = makeIdleWatchdog(idleTimeoutMs);
+      // Declared HERE, not inside the try: a catch block is a SIBLING scope, so a binding
+      // created inside the try is not visible in the catch at all. Reading it there throws a
+      // ReferenceError, and that error would be swallowed as the relay's own failure.
+      let sourceError = null;
+      // The upstream body failing counts as the CAUSE only if the caller has not already gone.
+      // Destroying the downstream tears the SOURCE down too, and that teardown error is a
+      // consequence of the caller leaving, never evidence that the upstream failed.
+      let upstreamFailedFirst = false;
+      const onSourceError = (e) => {
+        sourceError = e;
+        if (cause === null) upstreamFailedFirst = true;
+      };
       try {
+        // Naming the source lets the cause be decided from the UPSTREAM side before teardown:
+        // pipeline() destroys the downstream too, so a cause inferred afterwards would blame
+        // the caller for the upstream's failure.
+        const source = Readable.fromWeb(upstreamRes.body, { signal: idle.controller.signal });
+        source.on("error", onSourceError);
         await pipeline(
-          Readable.fromWeb(upstreamRes.body, { signal: idle.controller.signal }),
+          source,
           idle.reset,
           usageTransform(collector),
           pv,
@@ -3662,14 +3717,17 @@ async function relay(res, upstreamRes, stream, backendId, started, callId, idleT
           res
         );
       } catch (e) {
-        // Distinguish a stall-watchdog cut from an upstream/network drop so
-        // the history row + timestamped log attribute the right cause.
-        if (idle.controller.signal.aborted) clientCancelled = false;
-        relayError = clientCancelled
-          ? "client cancelled the request"
-          : idle.controller.signal.aborted
-            ? `upstream idle timeout (no data for ${idleTimeoutMs}ms)`
-            : String(e && e.message);
+        // Precedence: the stall watchdog, then the upstream body, then the caller. Deciding
+        // from the source side first is what keeps an upstream cut from being written off as
+        // a caller who left (zStage2 pins that cut, zSess5 pins the real cancellation).
+        if (idle.controller.signal.aborted) force("idle");
+        else if (upstreamFailedFirst) force("upstream");
+        else note("client");
+        relayError = cause === "idle"
+          ? `upstream idle timeout (no data for ${idleTimeoutMs}ms)`
+          : cause === "client"
+            ? "client cancelled the request"
+            : String((sourceError && sourceError.message) || (e && e.message));
         throw e; // let the outer catch close the response + log once
       }
       genMs = Date.now() - genStart;
@@ -3734,13 +3792,11 @@ async function relay(res, upstreamRes, stream, backendId, started, callId, idleT
         res.end(buf);
         genMs = Math.max(0, Date.now() - started - ttftMs);
       } catch (e) {
-        // Non-stream body stall/cut (readBodyWithIdle cancels on idle) or
-        // body read error: attribute the cause and let the outer catch log.
-        relayError = clientCancelled
-          ? "client cancelled the request"
-          : /idle timeout/.test(String(e && e.message))
-            ? `upstream idle timeout (no data for ${idleTimeoutMs}ms)`
-            : String(e && e.message);
+        // Non-stream body stall/cut (readBodyWithIdle cancels on idle) or body read error.
+        // The READ failing is the upstream failing, so it outranks a downstream close.
+        if (/idle timeout/.test(String(e && e.message))) force("idle");
+        else force("upstream");
+        relayError = cause === "idle" ? `upstream idle timeout (no data for ${idleTimeoutMs}ms)` : String(e && e.message);
         throw e;
       }
     }
@@ -3751,8 +3807,10 @@ async function relay(res, upstreamRes, stream, backendId, started, callId, idleT
     // close cleanly. elapsedMs = wall time from request start; idleAborted =
     // the stall watchdog fired vs an upstream/network drop.
     const idleAborted = relayError && /idle timeout/.test(relayError);
-    if (idleAborted) clientCancelled = false; // the upstream stalled; the caller did not leave
-    if (!clientCancelled) writeRelayLog({
+    if (idleAborted) force("idle"); // the upstream stalled; the caller did not leave
+    // Headers never went out and the response is already destroyed: the caller is gone.
+    if (cause === null && !res.writableEnded && res.destroyed) note("client");
+    if (cause !== "client") writeRelayLog({
       level: "relay-error",
       time: new Date().toISOString(),
       callId: callId || null,
@@ -3771,6 +3829,7 @@ async function relay(res, upstreamRes, stream, backendId, started, callId, idleT
     }
   }
   res.off("close", onClientClose);
+  clientCancelled = cause === "client";
   // A clean, usable completion is content, reasoning or a tool call actually
   // parsed out of the upstream body - not merely a 200 status line.
   const usable = !relayError && !clientCancelled && (hasContent || hasReasoning || hasToolCalls);
