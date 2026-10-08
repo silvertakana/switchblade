@@ -3076,6 +3076,25 @@ function buildPayload(body, cfg, preset, model, deployment, backend) {
 
 // ---- request forwarding ----------------------------------------------------
 
+// The session header we send upstream must be non-empty: OpenCode Go answers a
+// blank/absent x-opencode-session with 400 MissingSessionID, which the router
+// then classifies as a non-retryable client error and charges to the request.
+// The rule is explicit rather than a bare || chain because an empty or
+// whitespace-only header is falsy but PRESENT, and a blank sessionKey would
+// fall through the chain unchanged. Fall back to the router's resolved session
+// key, then the same 'no-session' literal the resolver uses.
+function sessionHeaderFor(incomingHeaders, sessionKey) {
+  const raw = incomingHeaders && incomingHeaders["x-opencode-session"];
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (trimmed) return trimmed;
+  } else if (raw) {
+    return String(raw);
+  }
+  const key = typeof sessionKey === "string" ? sessionKey.trim() : sessionKey;
+  return key || "no-session";
+}
+
 async function forward(req, cfg, backend, payload, incomingHeaders, stream, sessionKey, callerSignal) {
   const key = process.env[backend.apiKeyEnv];
   const upstream = backend.baseURL.replace(/\/$/, "") + "/chat/completions";
@@ -3089,7 +3108,7 @@ async function forward(req, cfg, backend, payload, incomingHeaders, stream, sess
     // monitoring. Prefer the client's own session header, else reuse the
     // router's resolved session key (x-session-affinity -> x-session-id ->
     // user -> no-session) so per-conversation routing/caching still works.
-    "x-opencode-session": incomingHeaders["x-opencode-session"] || sessionKey || "no-session",
+    "x-opencode-session": sessionHeaderFor(incomingHeaders, sessionKey),
     "user-agent": "switchblade/1.0",
   };
   // Forward prompt-cache headers verbatim.
@@ -5349,4 +5368,4 @@ if (isMain) {
 }
 
 export { claimAttempt, releaseAttempt, ineligibility, health, ROUTES };
-export { backoffFor, noteAccountOutage, markSuccess, ACCOUNT_OUTAGE_ROUTES, classify, readUpstreamError, terminalChatError, redactSecrets, capAttemptsSummary, attemptOutcome, candidates, touchSessionPreference, evictSessionPreferences, SESSION_PREFS, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost, writeConfigAtomic, routeKey, routeBackoffMs, authScopeOf, sessionPreferenceKey, beginSessionRequest, orderSessionProviders, rememberProvider, sessionPreferenceStats, clearSessionPreferences, validateConfig, convertLegacyConfig };
+export { backoffFor, sessionHeaderFor, noteAccountOutage, markSuccess, ACCOUNT_OUTAGE_ROUTES, classify, readUpstreamError, terminalChatError, redactSecrets, capAttemptsSummary, attemptOutcome, candidates, touchSessionPreference, evictSessionPreferences, SESSION_PREFS, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost, writeConfigAtomic, routeKey, routeBackoffMs, authScopeOf, sessionPreferenceKey, beginSessionRequest, orderSessionProviders, rememberProvider, sessionPreferenceStats, clearSessionPreferences, validateConfig, convertLegacyConfig };

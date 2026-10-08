@@ -5888,9 +5888,10 @@ async function main() {
     // zM3) error counting + cache denominators: an exhausted 5xx flow bumps
     //      kpis.errors/errorRate; a signal request sets cacheHitRate 0.4 and a
     //      signal-less request (no usage at all) must NOT corrupt it. A 5xx is used
-    //      because its backoff is genuinely configurable (see backoffFor: the 429
-    //      class reads "rateBaseMs" while configs set "rateLimitBaseMs", so a 429
-    //      would pin for the 30s default and this fixture could not wait it out).
+    //      because its backoff is genuinely configurable: backoffFor honours BOTH
+    //      the documented rateLimit* names and the legacy rate* aliases, and BO
+    //      below sets rateLimit* to 50ms, so a 429 would cool for 50ms and this
+    //      fixture could wait it out.
     {
       let callsM3 = 0;
       const srvM3 = http.createServer(async (req, res) => {
@@ -5950,9 +5951,9 @@ async function main() {
         port: 0, prefix: "/v1", masterKeyEnv: null,
         backends: [{ id: "zb", baseURL: `http://${HOST}:${portM4}`, apiKeyEnv: "KEY_ZB" }],
         models: { "mf": { providers: [{ backend: "zb", upstream: "u" }] } },
-        // rateBaseMs/rateMaxMs are the keys backoffFor actually reads (the
-        // suite-wide BO's rateLimit* names are silently ignored - a pre-existing
-        // mismatch) so the cool here really is short and the lazy expiry is
+        // rateBaseMs/rateMaxMs (the legacy aliases, also honoured by backoffFor)
+        // are used here deliberately so the full request path exercises the alias
+        // branch end-to-end; either spelling is short, so the lazy expiry is
         // observable within the test.
         backoff: { rateBaseMs: 50, rateMaxMs: 200, serverBaseMs: 50, serverMaxMs: 200, authBaseMs: 50, authMaxMs: 200, weeklyDefaultMs: 1000 },
       };
@@ -6062,6 +6063,12 @@ async function main() {
         await api(baseM7, "/v1/chat/completions", { body: { model: "mf", messages: [] }, headers: { "x-opencode-session": "client-oc" } });
         rec = srvM7.hits[srvM7.hits.length - 1];
         assert(rec.ocSession === "client-oc", "zM7d) client x-opencode-session header passes through (got " + rec.ocSession + ")");
+        await api(baseM7, "/v1/chat/completions", { body: { model: "mf", messages: [] }, headers: { "x-session-affinity": "sess-X", "x-opencode-session": "" } });
+        rec = srvM7.hits[srvM7.hits.length - 1];
+        assert(rec.ocSession === "sess-X", "zM7e) blank client x-opencode-session is replaced by the session key, never forwarded blank (got " + JSON.stringify(rec.ocSession) + ")");
+        await api(baseM7, "/v1/chat/completions", { body: { model: "mf", messages: [] }, headers: { "x-opencode-session": "   " } });
+        rec = srvM7.hits[srvM7.hits.length - 1];
+        assert(rec.ocSession === "no-session", "zM7f) whitespace-only client x-opencode-session falls back to no-session (got " + JSON.stringify(rec.ocSession) + ")");
       } finally {
         childM7.kill();
         srvM7.srv.close();
@@ -7787,6 +7794,35 @@ async function main() {
       );
     }
   }
+  // ---- forwarding: x-opencode-session is never blank ------------------------
+  // OpenCode Go answers a blank x-opencode-session with 400 MissingSessionID,
+  // which the router classifies as a non-retryable client error and charges to
+  // the request. An empty or whitespace-only client header must be REPLACED,
+  // and a blank resolved session key must not leak through as a blank header -
+  // the guard is enforced here, not left to the falsiness of a || chain (an
+  // empty string and a single space are both things a client can send).
+  {
+    const shCases = [
+      ["recSession1", { "x-opencode-session": "" }, "sess-A", "sess-A"],
+      ["recSession2", { "x-opencode-session": "   " }, "sess-A", "sess-A"],
+      ["recSession3", { "x-opencode-session": "" }, "", "no-session"],
+      ["recSession4", { "x-opencode-session": "   " }, "", "no-session"],
+      ["recSession5", { "x-opencode-session": "client-oc" }, "sess-A", "client-oc"],
+      ["recSession6", { "x-opencode-session": "  padded-key  " }, "sess-A", "padded-key"],
+      ["recSession7", {}, "sess-A", "sess-A"],
+      ["recSession8", {}, "", "no-session"],
+      ["recSession9", { "x-opencode-session": "no-session" }, "", "no-session"],
+    ];
+    for (const [id, headers, sessionKey, want] of shCases) {
+      const got = SRV.sessionHeaderFor(headers, sessionKey);
+      assert(
+        got === want,
+        id + ") sessionHeaderFor(" + JSON.stringify(headers) + ", " + JSON.stringify(sessionKey) + ") must be " + JSON.stringify(want) +
+          " - a blank x-opencode-session (empty or whitespace) must be replaced, and the session-key fallback must itself be non-blank; got " + JSON.stringify(got)
+      );
+    }
+  }
+
   // ---- config editor: merge-preserve contract (index.html) -------------------
   // index.html ships its UI as one inline <script>, and the config editor's
   // collect/apply pair are top-level declarations - so they are extracted BY NAME
