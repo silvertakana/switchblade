@@ -3014,6 +3014,188 @@ async function main() {
     }
   }
 
+  // zAdmit1) Probe admission is owned by the LEASE, not by "I hold some probe somewhere".
+  //   A lease may dispatch through the probes IT holds at the generation it claimed; any
+  //   other probe - another request's, or a newer one on the same row - still blocks it.
+  {
+    const att = { model: "mAdm", backend: "adm-oa", upstream: "adm-u1", dispatchSeq: null };
+    const rk = SRV.routeKey(att);
+    const now = Date.now();
+    const prevH = SRV.health.get("adm-oa");
+    const prevR = SRV.ROUTES.get(rk);
+    const row = (generation, probeInFlight) => ({ generation, fails: 2, nextAvailableAt: now - 1000, probeInFlight, lastErrorKind: "server", lastStatus: 503, lastError: null });
+    try {
+      SRV.health.set("adm-oa", { state: "cooling", nextAvailableAt: now - 1000, fails: 2, backoffMs: 0, generation: 900, probeInFlight: true, lastError: null });
+      SRV.ROUTES.set(rk, row(901, true));
+      const mine = { routeKey: rk, backend: "adm-oa", routeGeneration: 901, routeClaim: true, accountGeneration: 900, accountClaim: true };
+      const whyMine = SRV.ineligibility(att, "scope-adm", now, mine);
+      assert(
+        whyMine === null,
+        "zAdmit1a) a lease is admitted through the probes it holds at the generation it claimed (why=" + whyMine + ")"
+      );
+      // The same rows, a NEWER probe: ownership is gone, so the stale lease must be blocked.
+      SRV.health.set("adm-oa", { state: "cooling", nextAvailableAt: now - 1000, fails: 2, backoffMs: 0, generation: 950, probeInFlight: true, lastError: null });
+      const whyStale = SRV.ineligibility(att, "scope-adm", now, mine);
+      assert(
+        whyStale === "probe_in_flight",
+        "zAdmit1b) a probe newer than the one the lease claimed still blocks it (why=" + whyStale + ")"
+      );
+      // The plan's explicit requirement: owning the ROUTE probe is not permission to enter a
+      // cooling account that some OTHER request is already probing.
+      SRV.health.set("adm-oa", { state: "cooling", nextAvailableAt: now - 1000, fails: 2, backoffMs: 0, generation: 900, probeInFlight: true, lastError: null });
+      SRV.ROUTES.set(rk, row(901, true));
+      const routeOnly = { routeKey: rk, backend: "adm-oa", routeGeneration: 901, routeClaim: true, accountGeneration: null, accountClaim: false };
+      const whyRouteOnly = SRV.ineligibility(att, "scope-adm", now, routeOnly);
+      assert(
+        whyRouteOnly === "probe_in_flight",
+        "zAdmit1c) a foreign ACCOUNT probe blocks an attempt that owns only the ROUTE probe (why=" + whyRouteOnly + ")"
+      );
+      // The same rule the other way round: owning the ACCOUNT probe is not permission to enter
+      // a route another request is already probing.
+      SRV.health.set("adm-oa", { state: "healthy", nextAvailableAt: 0, fails: 0, backoffMs: 0, generation: 900, probeInFlight: false, lastError: null });
+      SRV.ROUTES.set(rk, row(901, true));
+      const accountOnly = { routeKey: rk, backend: "adm-oa", routeGeneration: null, routeClaim: false, accountGeneration: 900, accountClaim: true };
+      const whyAccountOnly = SRV.ineligibility(att, "scope-adm", now, accountOnly);
+      assert(
+        whyAccountOnly === "probe_in_flight",
+        "zAdmit1d) a foreign ROUTE probe blocks an attempt that owns only the ACCOUNT probe (why=" + whyAccountOnly + ")"
+      );
+      // Ownership is bound to the generation that was claimed: a lease whose route booking has
+      // been superseded must not carry a request into a probe that is no longer its own.
+      const staleRoute = { routeKey: rk, backend: "adm-oa", routeGeneration: 900, routeClaim: true, accountGeneration: null, accountClaim: false };
+      const whyStaleRoute = SRV.ineligibility(att, "scope-adm", now, staleRoute);
+      assert(
+        whyStaleRoute === "probe_in_flight",
+        "zAdmit1e) a lease whose claimed route generation is stale is still blocked (why=" + whyStaleRoute + ")"
+      );
+    } finally {
+      if (prevH === undefined) SRV.health.delete("adm-oa"); else SRV.health.set("adm-oa", prevH);
+      if (prevR === undefined) SRV.ROUTES.delete(rk); else SRV.ROUTES.set(rk, prevR);
+    }
+  }
+
+  // zAdmit2) The lease lifecycle: a refused route claim hands the account probe back, a stale
+  //   release leaves newer state alone, and a lease can only ever be released ONCE.
+  {
+    const att = () => ({ model: "mAdm", backend: "adm-oa", upstream: "adm-u1", dispatchSeq: null });
+    const rk = SRV.routeKey(att());
+    const now = Date.now();
+    const prevH = SRV.health.get("adm-oa");
+    const prevR = SRV.ROUTES.get(rk);
+    try {
+      // Partial claim: the account probe is taken, then the route probe is refused. Leaving
+      // the account probe set would lock the account out of recovery for good.
+      SRV.health.set("adm-oa", { state: "cooling", nextAvailableAt: now - 1000, fails: 2, backoffMs: 0, generation: 900, probeInFlight: false, lastError: null });
+      SRV.ROUTES.set(rk, { generation: 901, fails: 2, nextAvailableAt: now - 1000, probeInFlight: true, lastErrorKind: "server", lastStatus: 503, lastError: null });
+      const refused = SRV.claimAttempt(att(), now);
+      assert(
+        refused === null && SRV.health.get("adm-oa").probeInFlight === false,
+        "zAdmit2a) a refused route claim rolls the account claim back (token=" + JSON.stringify(refused) + ", accountProbe=" + SRV.health.get("adm-oa").probeInFlight + ")"
+      );
+      // A release whose generation no longer matches must not clear the newer probe.
+      SRV.ROUTES.set(rk, { generation: 902, fails: 2, nextAvailableAt: now - 1000, probeInFlight: true, lastErrorKind: "server", lastStatus: 503, lastError: null });
+      const staleToken = { routeKey: rk, backend: "adm-oa", routeGeneration: 901, routeClaim: true, accountGeneration: null, accountClaim: false };
+      SRV.releaseAttempt(staleToken);
+      assert(
+        SRV.ROUTES.get(rk).probeInFlight === true,
+        "zAdmit2b) a generation-stale release does not free a probe it no longer owns (probeInFlight=" + SRV.ROUTES.get(rk).probeInFlight + ")"
+      );
+      // Claiming a probe does NOT move the row generation, so generation checking alone cannot
+      // make release idempotent: a repeated release of the same token would free the probe that
+      // a SECOND request has since claimed, putting two probes on one route.
+      SRV.ROUTES.set(rk, { generation: 903, fails: 2, nextAvailableAt: now - 1000, probeInFlight: true, lastErrorKind: "server", lastStatus: 503, lastError: null });
+      const token = { routeKey: rk, backend: "adm-oa", routeGeneration: 903, routeClaim: true, accountGeneration: null, accountClaim: false };
+      SRV.releaseAttempt(token);
+      const freedByOwner = SRV.ROUTES.get(rk).probeInFlight === false;
+      SRV.ROUTES.get(rk).probeInFlight = true; // a later request claims the probe, same generation
+      SRV.releaseAttempt(token);             // the same token releases a second time
+      assert(
+        freedByOwner && SRV.ROUTES.get(rk).probeInFlight === true,
+        "zAdmit2c) releasing the same lease twice leaves a later claim’s probe alone (freedByOwner=" + freedByOwner + ", afterSecond=" + SRV.ROUTES.get(rk).probeInFlight + ")"
+      );
+    } finally {
+      if (prevH === undefined) SRV.health.delete("adm-oa"); else SRV.health.set("adm-oa", prevH);
+      if (prevR === undefined) SRV.ROUTES.delete(rk); else SRV.ROUTES.set(rk, prevR);
+    }
+  }
+
+  // zAdmit3) One probe at a time, held on events rather than on timing. Two DIFFERENT sessions
+  //   are used so session affinity or a published pin cannot be what keeps the second request
+  //   away: while the first request is inside the route probe, the second must be refused and
+  //   must never reach the upstream at all.
+  {
+    let hits = 0;
+    let releaseHang = null;
+    const hangGate = new Promise((r) => { releaseHang = r; });
+    let probeArrived = null;
+    const probeInFlight = new Promise((r) => { probeArrived = r; });
+    const srvAdm = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      const body = Buffer.concat(chunks).toString("utf8");
+      hits++;
+      if (body.includes("priming-outage")) {
+        // The priming request is what CREATES the route cooldown the probe then recovers.
+        res.writeHead(503, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "priming outage" } }));
+        return;
+      }
+      probeArrived();
+      await hangGate; // hold the probe open until the test says so
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: "m", object: "chat.completion", choices: [{ message: { role: "assistant", content: "ok:adm" } }] }));
+    });
+    const portAdm = await listen(srvAdm);
+    const cfgAdm = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "adm2", baseURL: `http://${HOST}:${portAdm}`, apiKeyEnv: "KEY_ADM2" }],
+      models: { mAdm2: { providers: [{ backend: "adm2", upstream: "uAdm" }], affinityPool: 1 } },
+      presets: { pAdm2: { strategy: "affinity", models: ["mAdm2"] } },
+      backoff: { ...BO, serverBaseMs: 40, serverMaxMs: 120 },
+    };
+    const hAdm = await startRouterCfg(cfgAdm, "KEY_ADM2=k\n");
+    const call = (session, text) => fetch(hAdm.base + "/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer local-master", "x-session-affinity": session },
+      body: JSON.stringify({ model: "pAdm2", messages: [{ role: "user", content: text }] }),
+      signal: AbortSignal.timeout(15000),
+    });
+    try {
+      const primed = await call("admPrime", "priming-outage");
+      await primed.text();
+      // Readiness by observation, not by sleeping: wait until the recorded cooldown has elapsed.
+      let row = null;
+      for (let i = 0; i < 200; i++) {
+        const hh = await (await api(hAdm.base, "/health", { method: "GET" })).json();
+        row = (hh.routes || []).find((x) => x.backend === "adm2");
+        if (row && row.fails > 0 && row.retryInMs <= 0) break;
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      const probe = call("admA", "hold it open");
+      probe.catch(() => {});
+      // Event-held, but BOUNDED: a mutant that refuses the probe must fail this assertion
+      // rather than leave the suite waiting on upstream traffic that never happens.
+      const probeLanded = await Promise.race([
+        probeInFlight.then(() => true),
+        new Promise((r) => setTimeout(() => r(false), 10000)),
+      ]);
+      const refused = await call("admB", "someone else wants in");
+      const refusedStatus = refused.status;
+      await refused.text();
+      const hitsAtRefusal = hits;
+      releaseHang();
+      const probeStatus = probeLanded ? (await probe).status : 0;
+      assert(
+        probeLanded && row !== null && row.fails > 0 && probeStatus === 200 && refusedStatus === 503 && hitsAtRefusal === 2,
+        "zAdmit3) while one request holds the route probe, another session is refused without touching the upstream (probeLanded=" + probeLanded + ", row=" + JSON.stringify(row) + ", probeStatus=" + probeStatus + ", refusedStatus=" + refusedStatus + ", hits=" + hitsAtRefusal + ")"
+      );
+    } finally {
+      releaseHang && releaseHang();
+      hAdm.child.kill(); srvAdm.close();
+      await rm(hAdm.dir, { recursive: true, force: true });
+    }
+  }
+
   // zOutage1) Distinct-route escalation is EVIDENCE-FENCED. A success retires the
   //   account's outage evidence only when it is current: a slow response that started
   //   before a later failure proves nothing about the state that failure recorded, and

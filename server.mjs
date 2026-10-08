@@ -824,8 +824,20 @@ function excludeRouteForSession(exclScope, attempt) {
   return key;
 }
 
-// Why a candidate cannot be tried right now, or null when it can.
-function ineligibility(attempt, exclScope, now) {
+// A probe the LEASE ITSELF holds, at the generation it claimed, is not a blocker: the
+// dispatch IS that probe. Anything else is - another request's probe, or a newer probe that
+// replaced the row this lease claimed. Holding one kind of probe is never permission for the
+// other: owning a route probe does not admit a request into an account that a different
+// request is already probing.
+function leaseHolds(lease, kind, row) {
+  if (!lease) return false;
+  if (kind === "account") return !!lease.accountClaim && (row.generation ?? null) === lease.accountGeneration;
+  return !!lease.routeClaim && row.generation === lease.routeGeneration;
+}
+
+// Why a candidate cannot be tried right now, or null when it can. `lease` exempts only the
+// probes this dispatch already owns; callers with no lease get the strict answer.
+function ineligibility(attempt, exclScope, now, lease = null) {
   const h = health.get(attempt.backend);
   if (h && h.state === "cooling") {
     if (!isUsableCurrently(attempt.backend, now)) {
@@ -834,12 +846,12 @@ function ineligibility(attempt, exclScope, now) {
     // The timer elapsed but the recovery is unproven: exactly one probe at a time,
     // so a still-broken account is discovered by one request rather than by every
     // request at once.
-    if ((h.fails || 0) > 0 && h.probeInFlight) return "probe_in_flight";
+    if ((h.fails || 0) > 0 && h.probeInFlight && !leaseHolds(lease, "account", h)) return "probe_in_flight";
   }
   const r = ROUTES.get(routeKey(attempt));
   if (r && (r.fails || 0) > 0) {
     if (r.nextAvailableAt > now) return "route_cooling";
-    if (r.probeInFlight) return "probe_in_flight";
+    if (r.probeInFlight && !leaseHolds(lease, "route", r)) return "probe_in_flight";
   }
   if (isSessionExcluded(exclScope, attempt, now)) return "session_excluded";
   return null;
@@ -935,7 +947,12 @@ function claimAttempt(attempt, now) {
 // Frees only what this token still owns. A probe that already settled moved the
 // generation on (and cleared the flag itself), so that newer state is left alone.
 function releaseAttempt(token) {
-  if (!token) return;
+  // Released at most ONCE. Generation checking alone is not enough to make this idempotent:
+  // claiming a probe does not move a row's generation, so a repeated release of the same
+  // token would still match and would free the probe a LATER request has since claimed,
+  // putting two probes on one route.
+  if (!token || token.released) return;
+  token.released = true;
   const r = ROUTES.get(token.routeKey);
   if (token.routeClaim && r && r.generation === token.routeGeneration) r.probeInFlight = false;
   const h = health.get(token.backend);
@@ -2876,12 +2893,12 @@ async function handleChat(req, res, cfg, bodyText) {
     // Eligibility is re-read HERE, at the moment of dispatch, not only when the candidate
     // list was built: an earlier candidate's network work, or another request, can cool this
     // route in between, and dispatching into a live cooldown is the bypass that keeps a
-    // session on a provider that keeps failing (review 2026-10-08, finding 1). The
-    // `probe_in_flight` reported here is normally the lease taken a line above, so only a
-    // probe some OTHER request holds is a reason to skip.
-    const blockedAtDispatch = ineligibility(attempt, exclScope, Date.now());
-    const ownProbe = blockedAtDispatch === "probe_in_flight" && (lease.routeClaim || lease.accountClaim);
-    if (blockedAtDispatch && !ownProbe) {
+    // session on a provider that keeps failing (review 2026-10-08, finding 1). The lease is
+    // passed in so the check exempts EXACTLY the probes this dispatch holds at the generation
+    // it claimed: the old coarse "owns some probe" exemption let an attempt holding only a
+    // route probe walk into an account another request was already probing.
+    const blockedAtDispatch = ineligibility(attempt, exclScope, Date.now(), lease);
+    if (blockedAtDispatch) {
       releaseAttempt(lease);
       continue;
     }
@@ -2915,13 +2932,14 @@ async function handleChat(req, res, cfg, bodyText) {
       return false;
     };
     while (true) {
-      // A cooldown that landed during the backoff stops the retry -- unless it is the
-      // cooldown our OWN failure just recorded, which is exactly what a configured
-      // transient retry exists to wait out (review finding 1: a retry was dispatched after
-      // a manual cool).
+      // A cooldown that landed during the backoff stops the retry, with NO exemption for a
+      // cooldown this attempt recorded itself: a retry is a fresh dispatch, and dispatching
+      // into a live cooldown is the bypass that keeps a session on a provider that keeps
+      // failing (review finding 1). The lease still exempts the probe this attempt holds,
+      // which is the only thing a retry legitimately carries.
       if (retries > 0) {
-        const why = ineligibility(attempt, exclScope, Date.now());
-        if (why && !(why === "route_cooling" && ownsRouteSettlement(attempt))) break;
+        const why = ineligibility(attempt, exclScope, Date.now(), lease);
+        if (why) break;
       }
       // Book before EVERY dispatch, first try and retry alike: our own failure moves the
       // row's generation past this attempt's booking, and the retry must still be able to
@@ -4659,4 +4677,5 @@ if (isMain) {
   });
 }
 
+export { claimAttempt, releaseAttempt, ineligibility, health, ROUTES };
 export { backoffFor, noteAccountOutage, markSuccess, ACCOUNT_OUTAGE_ROUTES, classify, readUpstreamError, terminalChatError, redactSecrets, capAttemptsSummary, attemptOutcome, candidates, touchSessionPreference, evictSessionPreferences, SESSION_PREFS, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost, writeConfigAtomic, routeKey, routeBackoffMs, authScopeOf, sessionPreferenceKey, beginSessionRequest, orderSessionProviders, rememberProvider, sessionPreferenceStats, clearSessionPreferences };
