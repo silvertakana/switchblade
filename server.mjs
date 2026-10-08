@@ -325,6 +325,30 @@ const KNOWN_DEPLOYMENT_KEYS = new Set([
   "backend", "upstream", "weight", "backupOnly", "params", "dropParams", "paramMap",
 ]);
 
+// Read one error path ("models.x.retry", "backends[0].apiKeyEnv") out of a document.
+function valueAtPath(root, path) {
+  if (!path || !root || typeof root !== "object") return undefined;
+  const parts = String(path).replace(/\[(\d+)\]/g, ".$1").split(".").filter((s) => s !== "");
+  let cur = root;
+  for (const p of parts) {
+    if (cur === null || typeof cur !== "object") return undefined;
+    cur = cur[p];
+  }
+  return cur;
+}
+
+// A pre-v3 value that the document ALREADY has, unchanged, cannot be a reason to refuse
+// the write: the live config carries empty-string params and retry, and an operator has to
+// be able to save - or reload - a file they did not change. `current` is what the caller
+// is comparing against, and it is the right document in every case: the running config at
+// reload, the file on disk at save and restore, and nothing at boot (where the loader
+// tolerates these values anyway). The exemption is deliberately narrow - two named fields,
+// and only when the other side holds the same empty string - so editing or moving the value
+// is still refused and no unrelated error can be silenced. The CI config check reads one
+// file as both sides, which would make it blind here, but an empty string is a NOTICE-class
+// finding there (only a root or backends error is fatal), so its verdict cannot change.
+const GRANDFATHERED_LEGACY_KEYS = /(\.retry|\.params)$/;
+
 // Validate a candidate config. Returns { errors, warnings }; a non-empty
 // errors array means the save is refused and the file is left untouched.
 function validateConfig(candidate, current, opts) {
@@ -336,10 +360,22 @@ function validateConfig(candidate, current, opts) {
   // save-time strictness; the load path opts in explicitly to tolerant
   // handling of a config that is already on disk.
   const mode = (opts && opts.mode) || "save";
+  const finish = () => {
+    if (current && typeof current === "object" && current !== candidate) {
+      for (let i = errors.length - 1; i >= 0; i--) {
+        const e = errors[i];
+        if (!GRANDFATHERED_LEGACY_KEYS.test(e.path || "")) continue;
+        if (valueAtPath(candidate, e.path) !== "" || valueAtPath(current, e.path) !== "") continue;
+        warnings.push({ path: e.path, message: e.message + " (unchanged from the config already in force; the legacy value is kept exactly as it is)" });
+        errors.splice(i, 1);
+      }
+    }
+    return { errors, warnings };
+  };
 
   if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
     err("", "config must be a JSON object");
-    return { errors, warnings };
+    return finish();
   }
   for (const key of RESTART_ONLY_KEYS) {
     if (key in candidate && current && candidate[key] !== current[key]) {
@@ -349,7 +385,7 @@ function validateConfig(candidate, current, opts) {
   for (const key of ["backends", "models", "presets"]) {
     if (!(key in candidate)) err(key, `'${key}' is required at the top level`);
   }
-  if (errors.length) return { errors, warnings };
+  if (errors.length) return finish();
 
   // Shape detection: a config is validated under v3 rules as soon as ANY model
   // carries `deployments` - a key no pre-v3 config has. Detection is
@@ -582,7 +618,7 @@ function validateConfig(candidate, current, opts) {
     if (!known.has(key)) warn(key, "unrecognized top-level key; the router ignores it");
   }
 
-  return { errors, warnings };
+  return finish();
 }
 
 function mask(key) {
@@ -3008,6 +3044,11 @@ function buildPayload(body, cfg, preset, model, deployment, backend) {
   Object.assign(out, backend.params || {});
   Object.assign(out, deployment.params || {});
   Object.assign(out, model.params || {});
+  // A pre-v3 config keeps the documented merge order, whose preset layer sits between
+  // the model and the request. The v3 contract has no preset-level params layer at all,
+  // so this applies only to a model that is still a provider list (v3 models keep
+  // `deployments` in the normalized form).
+  if (preset && preset.params && !model.deployments) Object.assign(out, preset.params);
   delete out.model; // reserved in config layers
   Object.assign(out, body); // request body wins
   out.model = deployment.upstream; // always
@@ -4502,24 +4543,23 @@ function requireAuth(cfg, req) {
 // ---- server ---------------------------------------------------------------
 
 let cfg = null;
+// The RAW document whose normalized form is running. The reload path compares a
+// candidate against THIS, not against `cfg`: normalization repairs and drops values
+// (an empty-string retry is deleted outright), so the running object cannot answer
+// "is this value unchanged from what the operator wrote?".
+let rawInForce = null;
 
-// An old-shape file is one whose models still carry the pre-v3 `providers`
-// array. `models` must itself be a plain object: a malformed one is the
-// validator's to name, not the converter's to walk.
-function isOldShape(raw) {
-  const models = raw && typeof raw === "object" && !Array.isArray(raw) ? raw.models : null;
-  if (!models || typeof models !== "object" || Array.isArray(models)) return false;
-  return Object.values(models).some((m) => m && typeof m === "object" && Array.isArray(m.providers));
-}
-
-const BRIDGE_WARNING_PREFIX = "bridge: ";
-
-// The ONE bridge from a pre-v3 document to the config the router runs, shared by
-// every entry point that can be handed an old-shape document: boot, hot-reload,
-// a save from the Config tab, and a snapshot restore. Three inline copies of
-// this policy is the failure mode it exists to prevent - a save that converts
-// differently from a load is a config whose on-disk meaning depends on how it
-// arrived.
+// The ONE place that decides what the router RUNS and what the validator JUDGES,
+// shared by every entry point that can be handed a document: boot, hot-reload, a
+// save from the Config tab, and a snapshot restore. Three inline copies of this
+// policy is the failure mode it exists to prevent - a save judged differently
+// from a load is a config whose meaning depends on how it arrived.
+//
+// It no longer CONVERTS. A pre-v3 document is run and stored exactly as written:
+// the runtime synthesizes both shapes on its own (normalizeConfig), so migrating
+// a file is an operator decision, never a side effect of loading or saving it.
+// convertLegacyConfig stays exported as the pure converter such a migration
+// would use, and the validator is given a canonicalized COPY instead.
 //
 // The container restore is part of the policy, not an option: the converter
 // SYNTHESIZES `models`/`presets` to work on them, so a truncated file would come
@@ -4535,19 +4575,66 @@ const BRIDGE_WARNING_PREFIX = "bridge: ";
 // save/restore refuse with 400 - so the shared half must not pick one for them.
 const MISSING_TOP_CONTAINERS = ["models", "presets"];
 
+// The validator judges ONE shape, so it is handed a canonicalized copy: the two
+// pre-three-layer forms are mapped onto the three-layer ones and NOTHING else is
+// touched. No value is dropped or repaired on the way in - an unknown backend, a
+// provider with no upstream the runtime could resolve, a legacy empty-string param -
+// because a sanitizing converter in front of the validator is exactly how a bad
+// reference reaches the disk unjudged.
+function structuralViewForValidation(rawInput) {
+  if (!rawInput || typeof rawInput !== "object" || Array.isArray(rawInput)) return rawInput;
+  const copy = JSON.parse(JSON.stringify(rawInput));
+  const backends = Array.isArray(copy.backends) ? copy.backends : [];
+  const backendById = new Map(backends.filter((b) => b && b.id).map((b) => [b.id, b]));
+  const models = copy.models && typeof copy.models === "object" && !Array.isArray(copy.models) ? copy.models : null;
+  // Detected exactly as the validator detects it (see the shape detection below):
+  // config-wide, on the presence of `deployments` anywhere. A document that has not
+  // started migrating is judged under its OWN rules, which is the contract the live
+  // pre-v3 config satisfies today.
+  const v3Document = Boolean(models) && Object.values(models).some((m) => m && typeof m === "object" && m.deployments !== undefined);
+  for (const m of models ? Object.values(models) : []) {
+    if (!m || typeof m !== "object" || Array.isArray(m)) continue;
+    // Era 1: `backends: ["id", ...]` predates the per-provider `providers` array.
+    if (!m.providers && Array.isArray(m.backends)) {
+      m.providers = m.backends.map((b) => (typeof b === "string" ? { backend: b } : b));
+      delete m.backends;
+    }
+    // A `providers` model is routable as it stands, so it is left alone - unless the
+    // document also carries a v3 model, which puts the whole file under v3 rules. That
+    // missing shape is completed here so the file validates as the one shape it runs,
+    // and an upstream the runtime cannot resolve is left MISSING rather than invented,
+    // so the validator names that provider by path.
+    if (v3Document && !m.deployments && Array.isArray(m.providers)) {
+      m.deployments = m.providers.map((pr) => {
+        if (!pr || typeof pr !== "object") return pr;
+        const out = Object.assign({}, pr);
+        if (!out.upstream) {
+          const b = backendById.get(out.backend);
+          if (b && b.model) out.upstream = b.model;
+        }
+        return out;
+      });
+      delete m.providers;
+    }
+  }
+  const presets = copy.presets && typeof copy.presets === "object" && !Array.isArray(copy.presets) ? copy.presets : null;
+  for (const p of presets ? Object.values(presets) : []) {
+    // Era 2: a preset listed `members` before it listed `models`.
+    if (p && typeof p === "object" && !Array.isArray(p) && !p.models && Array.isArray(p.members)) {
+      p.models = p.members;
+      delete p.members;
+    }
+  }
+  return copy;
+}
+
 function bridgeToEffectiveConfig(rawInput) {
   const missingContainers = MISSING_TOP_CONTAINERS.filter((k) => !(rawInput && typeof rawInput === "object" && k in rawInput));
-  if (!isOldShape(rawInput)) {
-    return { effective: rawInput, warnings: [], missingContainers, conversionError: null };
-  }
-  let converted;
-  try {
-    converted = convertLegacyConfig(rawInput);
-  } catch (e) {
-    return { effective: rawInput, warnings: [], missingContainers, conversionError: e };
-  }
-  for (const k of missingContainers) delete converted.config[k];
-  return { effective: converted.config, warnings: converted.warnings, missingContainers, conversionError: null };
+  const subject = structuralViewForValidation(rawInput);
+  // A container the document LACKED is not added for the validator either: a truncated
+  // file has to be reported, not judged as the completed document this view would be.
+  for (const k of missingContainers) if (subject && typeof subject === "object" && !Array.isArray(subject)) delete subject[k];
+  return { effective: rawInput, subject, missingContainers };
 }
 
 async function loadConfig() {
@@ -4559,21 +4646,15 @@ async function loadConfig() {
   // makes the RESTART_ONLY checks vacuous there; load mode is what makes a
   // dangling preset reference a warning on this path (save still refuses it).
   //
-  // The SUBJECT is the effective config: an old-shape file is converted in
-  // memory first, so the validator judges the shape the router will actually
-  // run. Validating the raw input instead would report one shape error per
-  // model for a file that converts cleanly.
+  // The SUBJECT is the canonicalized copy, never the object the router runs: an
+  // old-shape file is judged by its three-layer equivalent so one shape error is
+  // not reported per model, while the file itself stays exactly as written.
   const bridge = bridgeToEffectiveConfig(parsed);
-  if (bridge.conversionError) {
-    // The loader cannot interpret this file. At reload the previous config
-    // stays running; at boot there is nothing to fall back to, and continuing
-    // would run the router with no config at all.
-    if (!cfg) throw new Error("config conversion failed: " + bridge.conversionError.message);
-    console.error(`[${new Date().toISOString()}] config reload rejected: conversion failed: ${bridge.conversionError.message}`);
-    return cfg;
-  }
-  for (const w of bridge.warnings) console.warn(`[${new Date().toISOString()}] config warning: ${BRIDGE_WARNING_PREFIX}${w}`);
   const effective = bridge.effective;
+  // Captured BEFORE normalizeConfig mutates the document in place: the exemption has to
+  // compare against what the FILE says, and normalization drops exactly the legacy values
+  // it exists to tolerate. Adopted only if this load is the one that takes effect.
+  const rawSnapshot = JSON.parse(JSON.stringify(parsed));
   // The abort is deliberately narrow, because the validator's error set is the
   // SAVE-side contract and is stricter than what this loader tolerates: it
   // repairs a non-object `retry` (the live production config carries
@@ -4586,7 +4667,7 @@ async function loadConfig() {
   // keeps booting. Everything else is logged and the router starts. At reload,
   // where a config is already running, ANY error-class finding rejects the
   // write and the previous config is kept.
-  const verdict = validateConfig(effective, cfg, { mode: "load" });
+  const verdict = validateConfig(bridge.subject, rawInForce, { mode: "load" });
   if (verdict.errors.length) {
     const detail = verdict.errors.map((e) => (e.path || "(root)") + ": " + e.message).join("; ");
     if (cfg) {
@@ -4608,6 +4689,7 @@ async function loadConfig() {
   normalizeConfig(effective);
   // Reconcile: keep health registry keyed by backend id on reload.
   const prevIds = new Set(cfg ? (cfg.backends || []).filter((b) => b && typeof b === "object").map((b) => b.id) : []);
+  rawInForce = rawSnapshot;
   cfg = effective;
   if (cfg.masterKeyEnv && !process.env[cfg.masterKeyEnv]) {
     console.error(
@@ -4778,24 +4860,14 @@ function server() {
         return writeError(res, newError(500, JSON.stringify({ error: { message: `cannot read the current config: ${e.message}`, type: "router_error" } })));
       }
 
-      // Convert to the form that will be WRITTEN before anything judges it, so
-      // every check below and the write itself read the same object. Validating
-      // or writing the pre-conversion candidate while the converted object went
-      // to disk would be a bypass: a `providers` payload the v3 branch rejects
-      // would pass the check that ran on the legacy shape and still land on disk.
+      // What is WRITTEN is the payload the operator sent, in the shape they sent it:
+      // a save never migrates a document. What is JUDGED is the canonicalized copy,
+      // so every check below still runs against the shape the router will run.
       const bridge = bridgeToEffectiveConfig(candidate);
-      if (bridge.conversionError) {
-        res.writeHead(400, { "content-type": "application/json" });
-        return res.end(JSON.stringify({ ok: false, errors: [{ path: "", message: bridge.conversionError.message }], warnings: [] }));
-      }
       const toSave = bridge.effective;
-      // The bridge's own warnings ride the same channel as the validator's
-      // (R6): a save that repairs the payload is a change the operator did not
-      // ask for and cannot see otherwise.
-      const bridgeWarnings = bridge.warnings.map((message) => ({ path: "(bridge)", message }));
 
-      const verdict = validateConfig(toSave, current);
-      const warnings = bridgeWarnings.concat(verdict.warnings);
+      const verdict = validateConfig(bridge.subject, current);
+      const warnings = verdict.warnings.slice();
       if (verdict.errors.length) {
         res.writeHead(400, { "content-type": "application/json" });
         return res.end(JSON.stringify({ ok: false, errors: verdict.errors, warnings }));
@@ -4833,9 +4905,6 @@ function server() {
       } catch (e) {
         return writeError(res, newError(500, JSON.stringify({ error: { message: `failed to write config: ${e.message}`, type: "router_error" } })));
       }
-      for (const w of bridgeWarnings) {
-        console.warn(`[${new Date().toISOString()}] config save warning: ${BRIDGE_WARNING_PREFIX}${w.message}`);
-      }
       for (const w of verdict.warnings) {
         console.warn(`[${new Date().toISOString()}] config save warning: ${w.path}: ${w.message}`);
       }
@@ -4868,27 +4937,19 @@ function server() {
       // action, so a bad snapshot is refused with its field paths instead of
       // being silently loaded.
       //
-      // The snapshot is converted BEFORE it is judged, exactly as a save is: a
-      // snapshot taken before the bridge is an old-shape document, and writing
-      // it back verbatim would put `providers` on the live file again and let
-      // the v3 branch reject the router's own config on the next reload.
+      // A snapshot is restored in the shape it was taken in, exactly as a save keeps
+      // the shape it was sent in: restoring a pre-v3 snapshot must not migrate the live
+      // file, and the snapshot is judged as the config it would become.
       const bridge = bridgeToEffectiveConfig(restored);
-      if (bridge.conversionError) {
-        res.writeHead(400, { "content-type": "application/json" });
-        return res.end(
-          JSON.stringify({ ok: false, errors: [{ path: "", message: bridge.conversionError.message }], warnings: [], restored: name })
-        );
-      }
       const toRestore = bridge.effective;
-      const bridgeWarnings = bridge.warnings.map((message) => ({ path: "(bridge)", message }));
       let currentRaw;
       try {
         currentRaw = readRawConfig();
       } catch (e) {
         return writeError(res, newError(500, JSON.stringify({ error: { message: `cannot read the current config: ${e.message}`, type: "router_error" } })));
       }
-      const verdict = validateConfig(toRestore, currentRaw);
-      const warnings = bridgeWarnings.concat(verdict.warnings);
+      const verdict = validateConfig(bridge.subject, currentRaw);
+      const warnings = verdict.warnings.slice();
       if (verdict.errors.length) {
         res.writeHead(400, { "content-type": "application/json" });
         return res.end(JSON.stringify({ ok: false, errors: verdict.errors, warnings }));
