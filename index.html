@@ -4838,7 +4838,7 @@ function renderCfgModal() {
     const hint = {
       pricing: "{\n  \"offPeakMultiplier\": 0.5,\n  \"peakWindows\": [{ \"days\": [1,2,3,4,5], \"startHour\": 0, \"endHour\": 8 }]\n}",
       missCapture: "{\n  \"enabled\": true,\n  \"maxMissPct\": 50,\n  \"minMissTokens\": 1000,\n  \"file\": \"router-misses.jsonl\",\n  \"maxFileBytes\": 25000000\n}",
-      alerts: "{\n  \"ntfy\": { \"baseUrl\": \"https://ntfy.sh\", \"topic\": \"...\", \"minMissPct\": 50, \"minMissTokens\": 20000, \"cooldownMs\": 600000 }\n}",
+      alerts: "{\n  \"ntfy\": { \"baseUrl\": \"https://ntfy.sh\", \"topic\": \"...\", \"minMissPct\": 50, \"minMissTokens\": 20000, \"minBreaks\": 5, \"windowMs\": 1800000, \"cooldownMs\": 600000 }\n}",
       backoff: "{\n  \"rateLimitBaseMs\": 30000,\n  \"rateLimitMaxMs\": 600000,\n  \"serverBaseMs\": 30000,\n  \"serverMaxMs\": 300000,\n  \"authBaseMs\": 60000,\n  \"authMaxMs\": 1800000,\n  \"weeklyDefaultMs\": 604800000\n}",
     };
     body.innerHTML = cfgField("JSON", "f_block", {
