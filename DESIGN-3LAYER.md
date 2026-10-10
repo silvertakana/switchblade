@@ -252,11 +252,24 @@ missing, the router's behavior is byte-identical to before.
   bad-miss night recoverable (low cache-hit percentage = an EARLY cache break).
 - `alerts.ntfy` (object): `baseUrl` (default `https://ntfy.sh`), `topic`
   (required), `minMissPct` (default 50) / `minMissTokens` (default 20000) for
-  the `cache_miss` alert threshold, `cooldownMs` (default 600000, per-kind), and
-  optional `events` map to disable specific kinds (`{"cache_miss": false}`).
+  the `cache_miss` alert threshold, `minBreaks` (default 5) / `windowMs`
+  (default 1800000 = 30 min) for the repeat rule below, `cooldownMs` (default
+  600000, per-kind), and optional `events` map to disable specific kinds
+  (`{"cache_miss": false}`).
   Kinds: `cache_miss`, `weekly_limit`, `all_cooling`, `request_exhausted`,
   `relay_cut`. Alerts are fire-and-forget (never block the request path), never
   carry secrets, and are throttled by the per-kind cooldown.
+- `cache_miss` is a PATTERN alert, not a per-request one. A new conversation
+  always opens on a cold cache, so a lone big miss is the EXPECTED shape of a
+  fresh session and must not page the operator on every one of them. It fires
+  only once `minBreaks` qualifying misses land on the SAME backend inside
+  `windowMs`; the run resets when the alert fires, so the next one needs a
+  fresh run of breaks, and the message carries the run size (`x5 in 30m `).
+  `minBreaks: 1` restores the old fire-on-the-first-miss behavior. Counting is
+  per backend on purpose: the alert names one backend, so a run spread across
+  backends is not "this backend is breaking". A suppressed alert (per-kind
+  cooldown, or `events.cache_miss: false`) does NOT clear the run, so the next
+  qualifying miss can still fire it.
 
 ---
 

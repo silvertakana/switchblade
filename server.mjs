@@ -725,12 +725,21 @@ function captureMiss(cfg, entry, payload) {
 // ---- ntfy push alerts (OPTIONAL) ---------------------------------------------
 //
 // OPTIONAL. Controlled by the top-level `alerts.ntfy` block ({baseUrl, topic,
-// minMissPct, minMissTokens, cooldownMs, events?}). When it is absent, or the
-// kind's event is explicitly disabled (`events[kind] === false`), nothing is
-// sent. Alerts are fire-and-forget: they must never block the hot request path
-// or crash the router if ntfy is unreachable. Cooldown per kind suppresses an
-// alert storm. Messages carry NO secrets (no keys).
+// minMissPct, minMissTokens, minBreaks, windowMs, cooldownMs, events?}). When it
+// is absent, or the kind's event is explicitly disabled (`events[kind] ===
+// false`), nothing is sent. Alerts are fire-and-forget: they must never block
+// the hot request path or crash the router if ntfy is unreachable. Cooldown per
+// kind suppresses an alert storm. Messages carry NO secrets (no keys).
+//
+// cache_miss is deliberately NOT a per-request alert. A new conversation always
+// opens on a cold cache, so a lone big miss is the EXPECTED shape of a fresh
+// session and would page the operator on every one of them. It fires on a
+// PATTERN instead: `minBreaks` qualifying misses on the same backend inside
+// `windowMs`. The streak resets once an alert fires, so the next one needs a
+// fresh run of breaks, and the per-kind cooldown still throttles the result.
+// `minBreaks: 1` restores the old fire-on-the-first-miss behavior.
 const alertCooldowns = new Map();
+const cacheBreakStreaks = new Map(); // backend id -> [timestamps of counted misses]
 const NTFY_DEFAULT_BASE = "https://ntfy.sh";
 const ALERT_DEFS = {
   cache_miss: { title: "Cache break on switchblade", tag: "warning", priority: 3 },
@@ -743,7 +752,9 @@ const ALERT_DEFS = {
 function alertMessage(kind, f) {
   switch (kind) {
     case "cache_miss":
-      return `Cache break on ${f.backend}: ${f.cacheHitPct}% hit, ~${f.missTokens} miss tokens (prompt ${f.promptTokens}, model ${f.model}, session ${f.session})`;
+      // The repeat marker only appears when the alert came through the pattern
+      // gate (noteCacheMiss); a direct buildAlert keeps the plain wording.
+      return `Cache break ${f.breakCount ? `x${f.breakCount} in ${f.windowMin ?? 30}m ` : ""}on ${f.backend}: ${f.cacheHitPct}% hit, ~${f.missTokens} miss tokens (prompt ${f.promptTokens}, model ${f.model}, session ${f.session})`;
     case "weekly_limit":
       return `${f.backend} hit its weekly usage limit (resets in ${f.days ?? "?"} days); other providers may still serve`;
     case "all_cooling":
@@ -780,8 +791,30 @@ function buildAlert(cfg, kind, fields) {
   };
 }
 
-function fireAlert(cfg, kind, fields) {
-  const a = buildAlert(cfg, kind, fields);
+// Pattern gate for the cache_miss alert. Records one qualifying miss and
+// returns the alert to send, or null while the run is still too short to be a
+// pattern. `now` is injectable so the window logic is testable without sleeps.
+// A miss counts per backend: the alert names one backend, so a run spread
+// across backends is not "this backend is breaking".
+function noteCacheMiss(cfg, fields, now = Date.now()) {
+  const n = cfg.alerts && cfg.alerts.ntfy;
+  if (!n || !n.topic) return null;
+  const minBreaks = Math.max(1, Math.floor(Number(n.minBreaks) || 5));
+  const windowMs = Math.max(1, Number(n.windowMs) || 1800000);
+  const key = fields.backend || "unknown";
+  const times = (cacheBreakStreaks.get(key) || []).filter((t) => now - t <= windowMs);
+  times.push(now);
+  cacheBreakStreaks.set(key, times);
+  if (times.length < minBreaks) return null;
+  const a = buildAlert(cfg, "cache_miss", { ...fields, breakCount: times.length, windowMin: Math.max(1, Math.round(windowMs / 60000)) });
+  // A fired alert starts a fresh run, so the next one needs minBreaks MORE
+  // breaks. When the cooldown (or a disabled event) suppressed it, the run is
+  // kept, so the very next qualifying miss can still fire it.
+  if (a) cacheBreakStreaks.set(key, []);
+  return a;
+}
+
+function sendAlert(a) {
   if (!a) return;
   // Fire-and-forget: a slow/unreachable ntfy must not stall or crash the router.
   fetch(a.url, {
@@ -792,8 +825,13 @@ function fireAlert(cfg, kind, fields) {
   }).catch(() => {});
 }
 
+function fireAlert(cfg, kind, fields) {
+  sendAlert(buildAlert(cfg, kind, fields));
+}
+
 function resetAlertCooldowns() {
   alertCooldowns.clear();
+  cacheBreakStreaks.clear();
 }
 
 // ---- request detail store (deep-dive side panel) -----------------------------
@@ -2072,13 +2110,13 @@ async function handleChat(req, res, cfg, bodyText) {
     recordStats(entry);
     recordAnalytics(entry);
     // Persistent bounded capture of the payload behind a big cache miss, and a
-    // push alert when the miss crosses the configured thresholds. Both must
-    // never break the successful response path.
+    // push alert once such misses REPEAT on one backend. Both must never break
+    // the successful response path.
     captureMiss(cfg, entry, payload);
     if (typeof metrics.cacheHitPct === "number" && metrics.cacheHitPct < (cfg.alerts && cfg.alerts.ntfy ? (cfg.alerts.ntfy.minMissPct ?? 50) : 50)) {
       const missTokens = Math.max(0, Math.round((metrics.promptTokens || 0) * (1 - metrics.cacheHitPct / 100)));
       const amin = cfg.alerts && cfg.alerts.ntfy ? (cfg.alerts.ntfy.minMissTokens ?? 20000) : 20000;
-      if (missTokens >= amin) fireAlert(cfg, "cache_miss", { backend: attempt.backend, cacheHitPct: metrics.cacheHitPct, missTokens, promptTokens: metrics.promptTokens || 0, model: modelId, session: sessionKey });
+      if (missTokens >= amin) sendAlert(noteCacheMiss(cfg, { backend: attempt.backend, cacheHitPct: metrics.cacheHitPct, missTokens, promptTokens: metrics.promptTokens || 0, model: modelId, session: sessionKey }));
     }
     if (metrics.relayError) fireAlert(cfg, "relay_cut", { backend: attempt.backend, model: modelId, error: metrics.relayError });
     // Finalize the deep-dive detail record (attempt already recorded above) with
@@ -3501,4 +3539,4 @@ if (isMain) {
   });
 }
 
-export { candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost, writeConfigAtomic };
+export { candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, noteCacheMiss, resetAlertCooldowns, computeCost, writeConfigAtomic };
