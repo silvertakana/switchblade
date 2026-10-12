@@ -5189,13 +5189,15 @@ document.addEventListener("keydown", (ev) => {
 // deleting anything, because the same block carries the topic.
 
 // `scopes` lists what this kind's payload can actually group a run by, so the
-// panel never offers "same backend" for an event that does not carry one.
+// panel never offers "same model" for an event that does not carry one. `global`
+// is offered everywhere: it is the absence of grouping, not a field.
+const ALERT_SCOPES = ["global", "backend", "model", "conversation"];
 const ALERT_KINDS = [
-  { id: "cache_miss", label: "Cache break", note: "A request mostly missed the prompt cache.", cache: true, scopes: ["backend", "conversation"] },
-  { id: "weekly_limit", label: "Weekly usage limit", note: "A backend hit its weekly cap and pinned itself until the reset.", scopes: ["backend"] },
-  { id: "all_cooling", label: "All backends cooling", note: "Every backend is cooling, so requests fail with 503.", scopes: [] },
-  { id: "request_exhausted", label: "Request failed everywhere", note: "One request failed on every provider it tried.", scopes: ["conversation"] },
-  { id: "relay_cut", label: "Stream cut mid-relay", note: "The response stream ended before the answer was finished.", scopes: ["backend", "conversation"] },
+  { id: "cache_miss", label: "Cache break", note: "A request mostly missed the prompt cache.", cache: true, scopes: ["global", "backend", "model", "conversation"] },
+  { id: "weekly_limit", label: "Weekly usage limit", note: "A backend hit its weekly cap and pinned itself until the reset.", scopes: ["global", "backend"] },
+  { id: "all_cooling", label: "All backends cooling", note: "Every backend is cooling, so requests fail with 503.", scopes: ["global"] },
+  { id: "request_exhausted", label: "Request failed everywhere", note: "One request failed on every provider it tried.", scopes: ["global", "model", "conversation"] },
+  { id: "relay_cut", label: "Stream cut mid-relay", note: "The response stream ended before the answer was finished.", scopes: ["global", "backend", "model", "conversation"] },
 ];
 
 const ALERT_DEFAULTS = { baseUrl: "https://ntfy.sh", minMissPct: 50, minMissTokens: 20000, minBreaks: 5, windowMs: 1800000, cooldownMs: 600000 };
@@ -5237,7 +5239,7 @@ function alertKindCfg(n, kind) {
     mode: raw === false ? "off" : (o.mode === "immediate" || o.mode === "repeated" ? o.mode : defMode),
     minEvents: Math.max(1, Math.floor(pick("minEvents", alertSharedNum(n, "minBreaks", ALERT_DEFAULTS.minBreaks)))),
     windowMin: Math.round(pick("windowMs", alertSharedNum(n, "windowMs", ALERT_DEFAULTS.windowMs)) / 6000) / 10,
-    scope: o.scope === "conversation" ? "conversation" : "backend",
+    scope: ALERT_SCOPES.indexOf(o.scope) >= 0 ? o.scope : "backend",
     minMissPct: Math.min(100, Math.max(0, pick("minMissPct", alertSharedNum(n, "minMissPct", ALERT_DEFAULTS.minMissPct)))),
     minMissTokens: Math.max(0, pick("minMissTokens", alertSharedNum(n, "minMissTokens", ALERT_DEFAULTS.minMissTokens))),
     quietMin: Math.max(0, pick("cooldownMs", alertSharedNum(n, "cooldownMs", ALERT_DEFAULTS.cooldownMs)) / 6000) / 10,
@@ -5298,7 +5300,7 @@ function alertField(label, control, opt) {
     "</span></div>";
 }
 
-const ALERT_SCOPE_LABEL = { backend: "same backend", conversation: "same conversation" };
+const ALERT_SCOPE_LABEL = { global: "global", backend: "same backend", model: "same model", conversation: "same conversation" };
 
 // The controls for one event: what has to happen before a push goes out. An
 // event that is switched off has nothing to tune, so it gets one line of prose.
@@ -5314,7 +5316,7 @@ function alertParams(k, n) {
     const scope = k.scopes.length > 1
       ? "<select class='alert-scope' data-alert-kind-scope='" + esc(k.id) + "' aria-label='what a run is grouped by for " + esc(k.label) + "'>" +
         k.scopes.map((s) => "<option value='" + esc(s) + "'" + (c.scope === s ? " selected" : "") + ">" + esc(ALERT_SCOPE_LABEL[s] || s) + "</option>").join("") + "</select>"
-      : "<span class='alert-static'>" + esc(k.scopes.length ? ALERT_SCOPE_LABEL[k.scopes[0]] : "everything at once") + "</span>";
+      : "<span class='alert-static'>" + esc(ALERT_SCOPE_LABEL[k.scopes[0]] || k.scopes[0] || "global") + "</span>";
     out.push(alertField("Grouped by", scope));
   }
   if (k.cache) {

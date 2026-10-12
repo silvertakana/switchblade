@@ -1739,6 +1739,39 @@ async function main() {
     assert(cacheBreakFields({ topic: "t" }, { cacheHitPct: 0, promptTokens: 100000 }) !== null, "z37t) with no events block the shared defaults still qualify it");
   }
 
+  // z38) unit-level: what a run of events is grouped by. global counts every
+  //      event of the kind together; the rest name the field they must share,
+  //      and a kind that carries none of them shares one run.
+  {
+    resetAlertCooldowns();
+    const base = { baseUrl: "http://x", topic: "t", windowMs: 600000, cooldownMs: 0, minBreaks: 2 };
+    const cfgFor = (kind, scope) => ({ alerts: { ntfy: { ...base, events: { [kind]: { mode: "repeated", minEvents: 2, scope } } } } });
+    const f = (o) => ({ backend: "b1", model: "m1", session: "s1", ...o });
+
+    const g = cfgFor("cache_miss", "global");
+    assert(alertSettings(g.alerts.ntfy, "cache_miss").scope === "global", "z38a) global survives resolution");
+    assert(noteEvent(g, "cache_miss", f({}), 1000) === null, "z38b) global: first break -> null");
+    assert(noteEvent(g, "cache_miss", f({ backend: "b2", model: "m2", session: "s2" }), 2000) !== null, "z38c) ...and a break from another backend, model and session still completes the one run");
+
+    resetAlertCooldowns();
+    const m = cfgFor("cache_miss", "model");
+    assert(noteEvent(m, "cache_miss", f({ model: "m1" }), 1000) === null, "z38d) model: m1 x1 -> null");
+    assert(noteEvent(m, "cache_miss", f({ backend: "b2", model: "m2" }), 2000) === null, "z38e) a different model does not count toward m1's run");
+    assert(noteEvent(m, "cache_miss", f({ backend: "b9", model: "m1" }), 3000) !== null, "z38f) the same model on another backend does -> alert");
+
+    resetAlertCooldowns();
+    const r = cfgFor("request_exhausted", "global");
+    assert(noteEvent(r, "request_exhausted", { model: "m1", session: "s1" }, 1000) === null, "z38g) global works for a kind that carries no backend at all");
+    assert(noteEvent(r, "request_exhausted", { model: "m2", session: "s2" }, 2000) !== null, "z38h) ...counting every session together");
+    const rm = cfgFor("request_exhausted", "model");
+    assert(noteEvent(rm, "request_exhausted", { model: "m1" }, 1000) === null, "z38i) the same kind on model scope: m1 x1 -> null");
+    assert(noteEvent(rm, "request_exhausted", { model: "m2" }, 2000) === null, "z38j) ...m2 is its own run");
+
+    assert(alertSettings({ ...base, events: { cache_miss: { scope: "banana" } } }, "cache_miss").scope === "backend", "z38k) an unknown scope falls back to backend");
+    assert(alertSettings({ ...base, events: { cache_miss: { scope: "conversation" } } }, "cache_miss").scope === "conversation", "z38l) and every known one is kept");
+    resetAlertCooldowns();
+  }
+
   // z36) unit-level: the notification switches the dashboard exposes - the
   //      master kill switch and the test-push builder. A test push must bypass
   //      every gate, because a test the switches can silence proves nothing.

@@ -275,10 +275,16 @@ missing, the router's behavior is byte-identical to before.
     "repeated"` sends nothing until `minEvents` qualifying occurrences land
     inside `windowMs`; the run then resets, so the next alert needs a fresh run.
     `minEvents: 1` with `repeated` is immediate by another name.
-  - `scope: "backend" | "conversation"` decides what a run's occurrences must
-    have in common. A kind whose payload carries neither field shares one global
-    run. Counting `cache_miss` per backend is deliberate: the alert names one
-    backend, so a run spread across backends is not "this backend is breaking".
+  - `scope: "global" | "backend" | "model" | "conversation"` decides what a
+    run's occurrences must have in common: the whole router, the same backend,
+    the same model, or the same conversation. A kind whose payload does not
+    carry the chosen field shares one run, which is the honest reading of "the
+    same thing happened again". Counting `cache_miss` per backend is the
+    default because the alert names one backend, so a run spread across
+    backends is not "this backend is breaking"; `model` follows the model
+    rather than the account serving it, and `global` is the loosest reading of
+    all. The panel only offers the scopes a kind's fields can answer
+    (weekly_limit has no model, request_exhausted no backend).
   - `cooldownMs` is independent of the mode: it throttles how often a kind can
     push at all, in every mode. `0` sends every one.
   - Numbers are clamped on read (`minEvents >= 1`, windows and cooldown `>=`,

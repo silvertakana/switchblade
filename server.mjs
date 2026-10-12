@@ -738,7 +738,8 @@ function captureMiss(cfg, entry, payload) {
 //                      inside `windowMs`; the run then resets, so the next
 //                      alert needs a fresh run. `minEvents: 1` is equivalent to
 //                      immediate.
-//   scope: "backend" | "conversation"   what the events must have in common to
+//   scope: "global" | "backend" | "model" | "conversation"   what the events
+//          must have in common to
 //                      count as the same run (a kind with neither field in its
 //                      payload falls back to one global run).
 //
@@ -790,7 +791,12 @@ const ALERT_MODE_DEFAULT = { cache_miss: "repeated" };
 function alertSettings(n, kind) {
   const raw = n && n.events ? n.events[kind] : null;
   const o = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
-  const numOr = (v, d) => { if (v === null || v === undefined || v === "") return d; const x = Number(v); return Number.isFinite(x) ? x : d; };
+  // What a run of events can be grouped by. `global` is the whole router: every
+// event of that kind shares one run, however many backends or conversations it
+// came from. The rest name the field the events must agree on.
+const ALERT_SCOPES = ["global", "backend", "model", "conversation"];
+
+const numOr = (v, d) => { if (v === null || v === undefined || v === "") return d; const x = Number(v); return Number.isFinite(x) ? x : d; };
   const from = (k, shared) => numOr(o[k] !== undefined ? o[k] : shared, numOr(shared, 0));
   const mode = o.mode === "immediate" || o.mode === "repeated" ? o.mode : ALERT_MODE_DEFAULT[kind] || "immediate";
   return {
@@ -798,7 +804,7 @@ function alertSettings(n, kind) {
     mode,
     minEvents: Math.max(1, Math.floor(from("minEvents", numOr(n && n.minBreaks, 5)))),
     windowMs: Math.max(1, from("windowMs", numOr(n && n.windowMs, 1800000))),
-    scope: o.scope === "conversation" ? "conversation" : "backend",
+    scope: ALERT_SCOPES.includes(o.scope) ? o.scope : "backend",
     minMissPct: Math.min(100, Math.max(0, from("minMissPct", numOr(n && n.minMissPct, 50)))),
     minMissTokens: Math.max(0, from("minMissTokens", numOr(n && n.minMissTokens, 20000))),
     cooldownMs: Math.max(0, from("cooldownMs", numOr(n && n.cooldownMs, 600000))),
@@ -806,9 +812,11 @@ function alertSettings(n, kind) {
 }
 
 // The key a run is counted against: the thing the events must have in common.
-// A kind whose payload carries neither field shares one run, which is the
-// honest reading of "the same thing happened again".
+// A kind whose payload does not carry the chosen field shares one run, which is
+// the honest reading of "the same thing happened again".
 function alertScopeKey(kind, scope, fields) {
+  if (scope === "global") return kind + "|global";
+  if (scope === "model") return kind + "|model:" + (fields.model || "unknown");
   if (scope === "conversation") return kind + "|session:" + (fields.session || "no-session");
   return kind + "|backend:" + (fields.backend || "unknown");
 }
