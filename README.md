@@ -333,7 +333,7 @@ three-layer shape at load, byte-identically for identical effective configs.
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| GET | `/health` | per-backend health (`state`, `fails`, `lastError`, `manual`, `probeInFlight`) plus a `routes` array: one row per route that has recorded a failure, with `backend`, `upstream`, `models`, `state` (`cooling`/`probing`/`healthy`), `fails`, `nextAvailableAtMs`, `retryInMs`, `probeInFlight`, `lastErrorKind`, `lastStatus` |
+| GET | `/health` | per-backend health (`state`, `fails`, `lastError`, `manual`, `probeInFlight`) plus a `deployments` array on each backend row and a `routes` array. Both list every route the CONFIG DECLARES, not only the ones that have failed: a route with no history is still a deployment you can read the state of. A route row carries `id` (the owning backend), `backend`, `upstream`, `models`, `state` (`cooling`/`probing`/`healthy`), `fails`, `nextAvailableAtMs`, `retryInMs`, `probeInFlight`, `lastErrorKind`, `lastStatus`, `manual`. An account-wide manual block shows on every route of that account |
 | GET | `/v1/models` | OpenAI-compatible model list (preset ids) |
 | POST | `/v1/chat/completions` | chat completions (stream + non-stream) |
 | GET | `/api/stats` | traffic stats |
@@ -352,7 +352,7 @@ three-layer shape at load, byte-identically for identical effective configs.
 | POST | `/api/env/reveal` | `{name}` -> `{name, value}` for ONE variable; 400 for protected auth names and for names outside the editor's set (config-referenced, managed, or `.env`-declared); admin required |
 | DELETE | `/api/env?name=X` | removes a managed variable; 409 for `.env`/shell-sourced names; admin required |
 | POST | `/admin/reset-health` | reset every cooling layer (accounts, routes, session exclusions, the account-outage window) and the learned session preferences |
-| POST | `/admin/backend` | `{id, action: "cool"\|"uncool", forMs?}` manual cool/uncool |
+| POST | `/admin/backend` | `{id, action: "cool"\|"uncool", forMs?, upstream?}` manual cool/uncool. Without `upstream` the block is account-wide; with it the action is narrowed to ONE physical route, which must be a route some model declares (400 malformed, 404 undeclared) |
 | GET | `/` | web UI |
 
 History lives in an in-memory ring buffer (500 entries) and appends to

@@ -615,12 +615,17 @@ Request-time 404 messages (type `model_not_found`, same shape as today):
   - nested preset refs recursively expanded, first-occurrence order, deduped)
   kept for UI/test compatibility across the phased rollout, top-level `params`
   when present, backoff. Never key values.
-- `/health`: backend rows unchanged apart from `probeInFlight`; adds a
-  `routes` array of route-scoped rows - one per route that has recorded a
-  failure - with `backend`, `upstream`, `models`, `state`, `fails`,
+- `/health`: backend rows gain `probeInFlight` and a `deployments` array -
+  one row per physical route of that account, with the same fields as a
+  `routes` row. Adds a `routes` array of route-scoped rows, one per route the
+  CONFIG DECLARES, not only the ones that have failed: a route with no history
+  is a deployment whose state is read here before anything has failed, and the
+  projection is seeded from the config for exactly that reason. A row carries
+  `id` (the owning backend), `backend`, `upstream`, `models`, `state`, `fails`,
   `nextAvailableAtMs`, `retryInMs`, `probeInFlight`, `lastErrorKind`,
-  `lastStatus`. Session exclusions are never exposed: they are per-caller
-  state.
+  `lastStatus`, `manual`. An account-wide manual block is reported on every
+  route of that account, because ineligibility consults the account before the
+  route. Session exclusions are never exposed: they are per-caller state.
 - `/api/stats`, `/api/history` (entries gain `routedModel`),
   `/v1/chat/completions`, `/admin/*`: unchanged shapes apart from
   `routedModel`.
