@@ -4717,6 +4717,127 @@ async function main() {
       await rm(hF2.dir, { recursive: true, force: true });
     }
   }
+  // zFence3) The fence gaps an independent whole-branch review found on this same code: a
+  //   route that has never failed has no registry row, so a deletion keyed off the registry
+  //   missed it entirely; an account-wide uncool deleted held rows without fencing them; and
+  //   the admin lookup accepted routes the config does not declare. Each assertion below fails
+  //   on the code as reviewed.
+  {
+    const HOLD3 = new Set();
+    const h3Hits = [];
+    const hb3 = http.createServer(async (req, res) => {
+      for await (const _ of req) { /* drain */ }
+      h3Hits.push(1);
+      HOLD3.add(res);
+    });
+    const hc3 = mockBackend("hc3", {});
+    const portHb3 = await listen(hb3);
+    hc3.port = await listen(hc3.srv);
+    const mkCfg3 = (keepHeld) => ({
+      port: 0, prefix: "/v1", masterKeyEnv: "KEY_F3",
+      backends: [
+        { id: "fb3", baseURL: "http://" + HOST + ":" + portHb3, apiKeyEnv: "KEY_FB3", timeoutMs: 600000 },
+        { id: "fc3", baseURL: "http://" + HOST + ":" + hc3.port, apiKeyEnv: "KEY_FC3" },
+      ],
+      models: { mf3: { providers: keepHeld ? [{ backend: "fb3", upstream: "u1" }, { backend: "fc3", upstream: "u2" }] : [{ backend: "fc3", upstream: "u2" }], affinityPool: 1 } },
+      presets: { pf3: { strategy: "affinity", models: ["mf3"], affinityPool: 1 } },
+      backoff: { ...BO, serverBaseMs: 30000, serverMaxMs: 300000 },
+    });
+    // The child inherits process.env, so the master key the api() helper sends has to exist
+    // BEFORE the spawn. Setting it after is how the first draft of this block got 401s.
+    process.env.KEY_F3 = "local-master";
+    const h3 = await startRouterCfg(mkCfg3(true), "KEY_FB3=k\nKEY_FC3=k\n");
+    const call3 = () => api(h3.base, "/v1/chat/completions", { body: { model: "pf3", messages: [{ role: "user", content: "hi" }] } });
+    const admin3 = (payload) => api(h3.base, "/admin/backend", { body: payload });
+    const routes3 = async () => ((await (await api(h3.base, "/health", { method: "GET" })).json()).routes || []);
+    const r3 = async (backend, upstream) => (await routes3()).find((r) => r.backend === backend && r.upstream === upstream);
+    const release3 = async (status) => {
+      for (const r of [...HOLD3]) { HOLD3.delete(r); r.writeHead(status, { "content-type": "application/json" }); r.end(JSON.stringify({ error: { message: "late", type: "server_error" } })); }
+      await new Promise((r) => setTimeout(r, 500)); // let the settlement land
+    };
+    // The response body is read exactly ONCE, in the assertion strings below. Consuming it
+    // twice (a diagnostic then a real read) hangs on an already-used body stream.
+    let last3 = null;
+    const hold3 = async () => {
+      const want = h3Hits.length + 1;
+      const p = call3();
+      p.catch(() => {}); // an abort here is the test's own doing, not a run failure
+      for (let i = 0; i < 80 && h3Hits.length < want; i++) await new Promise((r) => setTimeout(r, 25));
+      if (h3Hits.length < want) { try { const r = await p; last3 = r.status + " " + (await r.text()).slice(0, 160); } catch (e) { last3 = "err " + e.message; } }
+      return { p, reached: h3Hits.length >= want };
+    };
+    try {
+      // fb3/u1 is HEALTHY and has never failed, so the health registry has no row for it.
+      const pre3 = await r3("fb3", "u1");
+      assert(
+        !!pre3 && pre3.state === "healthy" && pre3.fails === 0,
+        "zFence3a) the route under test is configured and never-failed (" + JSON.stringify(pre3) + ")"
+      );
+      const held3 = await hold3();
+      assert(held3.reached, "zFence3a2) the held attempt reached the never-failed route (hits=" + h3Hits.length + ", last=" + last3 + ")");
+      // Reload WITHOUT fb3. It has no ROUTES row, so a fence keyed off the registry never armed.
+      await writeFile(join(h3.dir, "config.json"), JSON.stringify(mkCfg3(false), null, 2));
+      const gone3 = await (async () => {
+        for (let i = 0; i < 20; i++) { await new Promise((r) => setTimeout(r, 150)); if (!(await r3("fb3", "u1"))) return true; }
+        return false;
+      })();
+      assert(gone3, "zFence3a3) the reload prunes the never-failed route (" + gone3 + ")");
+      await release3(500);
+      try { await (await held3.p).text(); } catch { /* the relay may abort; the settlement is what matters */ }
+      const ghost3 = await r3("fb3", "u1");
+      assert(
+        !ghost3,
+        "zFence3a4) the held 500 does not recreate a route that had no row when it was deleted (" + JSON.stringify(ghost3) + ")"
+      );
+      // A registry row is not a declaration either: the admin lookup reads the config.
+      const ghostCool = await admin3({ id: "fb3", upstream: "u1", action: "cool" });
+      assert(
+        ghostCool.status === 404,
+        "zFence3d) an undeclared route is 404 for a targeted cool, registry row or not (" + ghostCool.status + ")"
+      );
+      // ---- an account-wide uncool must fence the held rows it deletes ---------
+      await writeFile(join(h3.dir, "config.json"), JSON.stringify(mkCfg3(true), null, 2));
+      for (let i = 0; i < 20; i++) { await new Promise((r) => setTimeout(r, 150)); if (await r3("fb3", "u1")) break; }
+      // The held attempt has to be taken while the route is still reachable, so it comes
+      // BEFORE the account-wide cool; cooling first would route the request to the sibling
+      // and there would be nothing in flight to fence.
+      const held3b = await hold3();
+      assert(held3b.reached, "zFence3b0b) the second held attempt is in flight (hits=" + h3Hits.length + ", sib=" + hc3.hits.length + ", last=" + last3 + ")");
+      await admin3({ id: "fb3", action: "cool" }); // account-wide, while the attempt is held
+      const un3 = await admin3({ id: "fb3", action: "uncool" }); // the operator clears the account
+      assert(un3.status === 200, "zFence3b1) the account-wide uncool is accepted (" + un3.status + ")");
+      await release3(500);
+      try { await (await held3b.p).text(); } catch { /* the router may abort the relay; the settlement is what matters */ }
+      const afterUn3 = await r3("fb3", "u1");
+      assert(
+        !!afterUn3 && afterUn3.state === "healthy" && afterUn3.fails === 0,
+        "zFence3b) an account-wide uncool is not undone by a held attempt it deleted the row for (" + JSON.stringify(afterUn3) + ")"
+      );
+      // ---- the fence must not swallow live evidence: a LATER request still charges --
+      await admin3({ id: "fb3", upstream: "u1", action: "cool" });
+      await admin3({ id: "fb3", upstream: "u1", action: "uncool" });
+      // Released BEFORE the body is read, like every other held request here: the route holds
+      // the response open on purpose, so awaiting the body first hangs until the fetch timeout.
+      const held3c = await hold3();
+      assert(held3c.reached, "zFence3c) a later request still reaches the route after its fence (hits=" + h3Hits.length + ")");
+      await release3(500);
+      try { await (await held3c.p).text(); } catch { /* the relay may abort; the settlement is what matters */ }
+      const charged3 = await r3("fb3", "u1");
+      assert(
+        !!charged3 && charged3.fails >= 1 && charged3.state !== "healthy",
+        "zFence3c2) a failure a NEW request really found is still charged to the route (" + JSON.stringify(charged3 && { state: charged3.state, fails: charged3.fails }) + ")"
+      );
+      const coolAgain = await admin3({ id: "fb3", upstream: "u1", action: "cool" });
+      const cooled3 = await r3("fb3", "u1");
+      assert(
+        coolAgain.status === 200 && !!cooled3 && cooled3.manual === true && cooled3.state === "cooling",
+        "zFence3e) a route stays operable through /admin/backend after being deleted and re-added (" + JSON.stringify(cooled3) + ")"
+      );
+    } finally {
+      h3.child.kill(); hb3.close(); hc3.srv.close();
+      await rm(h3.dir, { recursive: true, force: true });
+    }
+  }
   // zSec) A credential echoed back by an upstream must not survive anywhere durable or
   //   served, and an upstream must not be able to forge the router's own facts about the
   //   call (review findings 3 and 11, 2026-10-08).
@@ -9033,6 +9154,49 @@ async function main() {
           u9ShapeOfEntry !== "providers" || u9ServedShape === "deployments" || u9ServedShape === "providers",
           "u9s1b) the served form of the subject is " + u9ServedShape + "-shaped and the file's is " + u9ShapeOfEntry + "-shaped, so the modal's input really does decide the stored shape (" + (u9ShapeOfEntry === "providers" && u9ServedShape === "deployments" ? "the two differ, which is the case this block exercises" : "they agree on this mirror") + ")"
         );
+        // The backup mark has TWO sources and they must not be confused: a key the provider
+        // CARRIES (a value, including an explicit false) and the tail mark DERIVED from
+        // affinityPool for a legacy row. Testing "=== true" instead of "carries the key" let
+        // the derive overwrite a supplied false whenever the row sat past the pool, so an
+        // untouched open-and-save flipped a deliberate primary into a backup (independent
+        // review finding). This scenario is synthetic because the mirror does not carry the
+        // case: a real false on a row past the pool.
+        const u9BkBackends = (mirror.backends || []).map((b) => b && b.id).filter(Boolean).slice(0, 2);
+        const u9BkKey = "__u9_backup_probe";
+        if (u9BkBackends.length < 2) {
+          assert(false, "u9s7g) the backup-mark probe needs two backends in the mirror (found " + u9BkBackends.length + ")");
+        } else {
+          // Captured BEFORE anything is overwritten: these are the states the assertions
+          // below expect to find, and restoring them is what keeps this probe from leaking
+          // a model id into the served-id comparison that follows.
+          const u9BkDraftBefore = rCfg.draft;
+          const u9BkModalBefore = rCfg.modal;
+          rCfg.draft = JSON.parse(JSON.stringify(mirror));
+          rCfg.draft.models[u9BkKey] = {
+            affinityPool: 1,
+            providers: [
+              { backend: u9BkBackends[0], upstream: "u9bk-primary" },
+              { backend: u9BkBackends[1], upstream: "u9bk-secondary", backupOnly: false },
+            ],
+          };
+          const u9BkInput = JSON.parse(JSON.stringify(rCfg.draft.models[u9BkKey]));
+          rCfg.modal = { kind: "models", key: u9BkKey, data: Object.assign({ id: u9BkKey }, u9BkInput), index: null, deploys: [], models: [], exposedOn: true };
+          apiR.renderCfgModal();
+          apiR.cfgModalCollect();
+          apiR.cfgApplyModal();
+          const u9BkStored = rCfg.draft.models[u9BkKey];
+          const u9BkRows = u9BkStored && Array.isArray(u9BkStored.providers) ? u9BkStored.providers : [];
+          assert(
+            u9BkRows.length === 2 && u9BkRows[1].backupOnly === false && u9BkRows[0].backupOnly === undefined,
+            "u9s7) a no-op save keeps a provider's explicit backupOnly:false and does not invent the key where it was absent (stored=" + rJson(u9BkRows) + ")"
+          );
+          // The probe model must not survive into the assertions below: they compare the
+          // served-id surface of the draft THIS block actually saved, and a stray model id
+          // would make the comparison fail for a reason that has nothing to do with the rule
+          // under test. The draft and modal are restored, not edited back.
+          rCfg.draft = u9BkDraftBefore;
+          rCfg.modal = u9BkModalBefore;
+        }
         // The served surface is what a mixed or converted entry moves. The subject
         // is a legacy-preset-shadowing id, so a save that materializes v3
         // \`deployments\` on a legacy document moves /v1/models; this pins that it did

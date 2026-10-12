@@ -20,11 +20,12 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 // visible in review. Never lower it to turn a red run green — fix the code
 // or the test instead.
 //
-// Raised 594 -> 797 on 2026-10-12, from a clean measured final suite at commit
-// 99b6c9a on Node 22, 24 and 25. This release work ADDED assertions (779 -> 797
-// in its last two tasks alone) and deleted none, so the ratchet moves up; the
-// brief forbids lowering it, and 594 is 203 assertions of unguarded drift.
-const SUITE_FLOOR = 797;
+// Raised 594 -> 797 -> 809 on 2026-10-12, from a clean measured final suite on
+// Node 22, 24 and 25. This release work ADDED assertions (779 -> 809) and
+// deleted none, so the ratchet moves up; the brief forbids lowering it, and 594
+// was 203 assertions of unguarded drift. The last raise covers the assertions the
+// independent whole-branch review produced (zFence3a-e, u9s4).
+const SUITE_FLOOR = 809;
 
 // Sanity floor for the S5 id scan: the suite carries far more ids than this,
 // so a count below the floor means the extractor broke, not that the ids went

@@ -1013,9 +1013,11 @@ function fenceFor(key) {
 }
 
 function fenceRouteDeletion(key) {
-  if (ROUTE_FENCES.has(key)) return; // already a tombstone; the snapshot is the first one
   const f = fenceFor(key);
-  f.atArm = new Set(ATTEMPTS_IN_FLIGHT.get(key) || []);
+  // UNION, never replace. Arming twice is a second deletion of the same route (an uncool
+  // after a cool, say), and work dispatched between the two was still running when the route
+  // went away a second time. Replacing the snapshot would drop the first attempt on the floor.
+  for (const tok of ATTEMPTS_IN_FLIGHT.get(key) || []) f.atArm.add(tok);
 }
 
 // True when this attempt was already running at the moment the route was deleted. Its result
@@ -1382,7 +1384,18 @@ function pruneRoutes(cfg) {
   for (const [id, m] of Object.entries(cfg.models || {})) {
     for (const p of modelDeployments(m, id, byId)) live.add(JSON.stringify([p.backend, p.upstream]));
   }
-  for (const key of [...ROUTES.keys()]) if (!live.has(key)) { fenceRouteDeletion(key); ROUTES.delete(key); }
+  // Fence EVERY route the new config drops, not only the ones with a registry row: a route
+  // that never failed has no row, and an attempt held against it at reload time would create
+  // one on settle (the ghost-route reproduction in review finding 14). The in-flight set is a
+  // key set of its own, because it knows about routes ROUTES has never heard of.
+  // Fence EVERY route the new config drops, not only the ones with a registry row: a route
+  // that never failed has no row, and an attempt held against it at reload time would create
+  // one on settle (the ghost-route reproduction in the independent review). The in-flight set
+  // is a key set of its own, because it knows about routes ROUTES has never heard of.
+  const dropped = new Set();
+  for (const key of ROUTES.keys()) if (!live.has(key)) dropped.add(key);
+  for (const key of ATTEMPTS_IN_FLIGHT.keys()) if (!live.has(key)) dropped.add(key);
+  for (const key of dropped) { fenceRouteDeletion(key); ROUTES.delete(key); }
   for (const key of [...MANUAL_ROUTES.keys()]) if (!live.has(key)) MANUAL_ROUTES.delete(key);
   // A route the new config declares again is a fresh incarnation and must not inherit the
   // old one's deletion fence.
@@ -5342,7 +5355,16 @@ function server() {
       }
       if (body.upstream !== undefined) {
         const rKey = JSON.stringify([id, body.upstream]);
-        if (!routeHealthSnapshot(cfg, Date.now()).some((r) => r.route === rKey)) {
+        // The lookup reads the CONFIG, not the health snapshot. The snapshot also carries
+        // registry rows, so a ghost row left by an older build would make an undeclared route
+        // answer 200 here - a cool the operator can set on something nothing routes to. The
+        // config is the declaration, so it is the only thing that can authorise the action.
+        const declared = new Set();
+        const byIdAdmin = backendsById(cfg);
+        for (const [mid, m] of Object.entries(cfg.models || {})) {
+          for (const p of modelDeployments(m, mid, byIdAdmin)) declared.add(JSON.stringify([p.backend, p.upstream]));
+        }
+        if (!declared.has(rKey)) {
           res.writeHead(404, { "content-type": "application/json" });
           return res.end(JSON.stringify({ error: { message: "route '" + id + "::" + body.upstream + "' is not declared by any model", type: "not_found" } }));
         }
@@ -5390,11 +5412,17 @@ function server() {
         // (review finding 12). The operator's decision clears the whole account layer. A
         // route row does not store its backend -- the key is [backend, upstream] -- so the
         // owner is read from the key, not from a field (zUncool3 caught exactly that).
-        for (const rkey of [...ROUTES.keys()]) {
-          let owner = null;
-          try { owner = JSON.parse(rkey)[0]; } catch { owner = null; }
-          if (owner === id) ROUTES.delete(rkey);
-        }
+        // Every route key this account owns is collected from all THREE key sets before any
+        // of them is touched, because a held route that never failed and was never cooled has
+        // a row in none of them - and that is exactly the route the settlement of the held
+        // attempt would bring back. Fencing only the routes that happened to have a row left
+        // that window open (independent review, same finding as the reload path).
+        const held = new Set();
+        const ownedBy = (rkey) => { let owner = null; try { owner = JSON.parse(rkey)[0]; } catch { owner = null; } return owner === id; };
+        for (const rkey of ROUTES.keys()) if (ownedBy(rkey)) held.add(rkey);
+        for (const rkey of MANUAL_ROUTES.keys()) if (ownedBy(rkey)) held.add(rkey);
+        for (const rkey of ATTEMPTS_IN_FLIGHT.keys()) if (ownedBy(rkey)) held.add(rkey);
+        for (const rkey of held) { fenceRouteDeletion(rkey); ROUTES.delete(rkey); }
         // A targeted route block is an operator decision about this account too, so an
         // account-wide uncool clears it. Leaving it would report "healthy" while the
         // router still refused that route - the same lie finding 12 named.

@@ -5103,7 +5103,11 @@ function renderCfgModal() {
       backend: d && d.backend ? d.backend : "",
       upstream: d && d.upstream ? d.upstream : "",
       weight: d && d.weight != null ? d.weight : null,
-      backupOnly: d && d.backupOnly === true ? true : !!(legacyRows && pool != null && i >= pool),
+      // A key the provider CARRIED is the truth, including an explicit false; only an absent
+      // key falls back to the derived tail mark. Testing `=== true` instead of "carries the
+      // key" let the derive override a supplied false whenever the row sat past the pool, so
+      // opening and saving an untouched entry turned its false into true (review finding 15).
+      backupOnly: d && Object.prototype.hasOwnProperty.call(d, "backupOnly") ? d.backupOnly === true : !!(legacyRows && pool != null && i >= pool),
       legacy: legacyRows,
       // The key the entry itself carried, which is the baseline a change is measured
       // against. A legacy pair rendering a DERIVED mark (rows past the pool) has no
