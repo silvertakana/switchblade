@@ -417,6 +417,33 @@ This is load-bearing contract, not implementation detail: the failure scope
 decides which requests are affected, and a wrong scope either strands a session
 or disables a healthy fleet.
 
+**Recovery is authoritative, and it is scope-local.** Where this document and the
+shipped provider-recovery policy disagree on cooling, the recovery policy wins.
+It owns: the failure classes and their backoffs; that a failure marks EXACTLY ONE
+scope and a success clears only its own; that a route cooldown never implies an
+account cooldown (account cooling needs two DISTINCT routes failing inside 60s);
+that a manual cool is sticky, never auto-cleared, and never escalated into an
+account outage; that an opaque 400/422 is a 30s session exclusion and not a
+cooldown at all; and that expiry admits exactly ONE probe, because a lease is
+claimed synchronously before any network await. Precedence when several scopes
+block one candidate: manual cool, then account cooling, then route cooling, then a
+probe another request already holds, then this session's exclusion. The 503 from
+an empty pool names the per-scope blocker counts rather than blaming cooling in
+general, and carries a Retry-After for the nearest finite recovery - omitted when
+every blocker is a manual cool, since nothing recovers on its own.
+
+**The successful-backup-pin exception.** The route that produced usable output
+becomes the first choice for its (auth scope, session, resolved logical model)
+group, and that pin SURVIVES the original provider recovering: a recovered primary
+does not reclaim a session that already failed over successfully. This is the
+deliberate exception to ordinary stickiness, bounded three ways - the pin reorders
+only inside its own logical-model group, it is skipped the moment it is not
+eligible, and the map holds at most 10,000 entries with LRU eviction. It is
+dropped on failure, on route removal, on an operator cool/uncool/reset (an explicit
+routing decision must never be overruled by learned preference), and on process
+restart, which loses the table. Callers on the shared no-session key get no pin at
+all.
+
 **The two scopes.** A ROUTE is one physical `(backend, upstream)` pair. Route
 state is shared by every logical model that aliases that pair, and separate
 routes of one account are independent. Server-class failures (5xx, network,
@@ -820,6 +847,39 @@ Notes:
     preset), layered params precedence, dropParams/paramMap semantics and
     order, synthesis note (old configs keep working), updated "What it serves"
     table (preset -> models -> providers chain).
+
+---
+
+## 8b. Shape on save (editor contract)
+
+Two config shapes are live during the bridge era, and **a save never migrates
+between them**.
+
+- The load path is dual-shape and shape-preserving. An old-shape document is
+  normalized for serving while the file on disk keeps the shape it was written
+  with. `structuralViewForValidation` canonicalizes a COPY for the validator and
+  leaves the document alone; `convertLegacyConfig` is a pure exported function that
+  runs only when a migration is deliberately asked for.
+- The structured editor writes the shape it was GIVEN. A model entry opened with a
+  `providers` array is stored back with `providers`, keeping the `affinityPool`
+  that shape owns; one opened with `deployments` is stored back with
+  `deployments`; an entry carrying BOTH is treated as legacy and stored as
+  `providers`, because that is the array the router reads (providers win over
+  deployments), so writing `deployments` beside them would bury the edit under an
+  array nothing reads. An entry never comes back carrying both.
+- A no-op save is byte-identical to its input apart from the form's own
+  default-omission rule: a value equal to a control's default (`weight: 1`,
+  `exposed: true`) is not written back as though the operator had typed it. A
+  legacy row's `backupOnly` is derived from the entry's `affinityPool` (rows past
+  the pool are the ordered tail) and is display state, so a pooled legacy entry
+  does not acquire a stored `backupOnly: true` it never carried.
+- Served-id stability follows from this. Converting one saved model to v3 makes the
+  whole document v3 for the validator, and every id a shadowing identity preset
+  owns then collides - 17 of them in the live mirror - so /v1/models changes for
+  ids nobody edited. Keeping the document's shape keeps the served order.
+
+Migration is therefore a deliberate act, never a side effect of opening a tab and
+pressing Save.
 
 ---
 

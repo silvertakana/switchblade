@@ -110,6 +110,41 @@ Health state splits into two maps:
 - Account health, keyed `backendId` (the existing map): classes `auth` (401/403, 1 min / 30 min), `billing` (402 and the billing-error body regex, 30 s / 5 min), `weekly` (GoUsageLimitError pin, `fails: 100`). Weekly parsing and the `weeklyDefaultMs` override keep current behavior pending the explicit keep/fix decision (Open question OQ2).
 - A failure marks exactly one map entry. A success clears only the deployment that served it; it never clears account-wide state or a sibling deployment's state. Manual cools remain sticky and excluded from all-cooling fallback (`markSuccess` guard :584-590, exclusion :1902-1921).
 - Attempt selection skips a deployment when its deployment health is cooling OR its account health is cooling. The all-cooling last resort keeps today's semantics exactly: only manual cools are excluded (`server.mjs:1902-1921`); automatic account-wide states still participate.
+- **Recovery is authoritative over this draft, and it is scope-local.** Where the two
+  disagree, the shipped provider-recovery policy wins; this section describes what
+  v3 needs from cooling, not a second policy. Concretely, the recovery design has
+  final say on: the failure classes and their backoffs; that a failure marks
+  EXACTLY ONE scope and a success clears only its own; that a route cooldown never
+  implies an account cooldown (account cooling needs two DISTINCT routes failing
+  inside 60 s); that a manual cool is sticky, never auto-cleared, and never
+  escalated into an account outage; that an opaque `400`/`422` is a 30 s
+  session-scoped exclusion and NOT a cooldown at all (`upstream_rejection`, no
+  evidence the payload was at fault); and that expiry admits exactly ONE probe -
+  a lease is claimed synchronously before any network await, so a recovering route
+  or account is discovered by one request rather than by every request at once.
+  When no attempt is eligible the router returns the structured `503` naming the
+  blocking scopes with a `Retry-After` for the nearest finite recovery, and an
+  empty pool of manually cooled deployments carries no such header because nothing
+  recovers on its own.
+
+  Precedence when more than one scope blocks one candidate: manual cool outranks
+  everything (it is an operator decision), then account cooling, then a route
+  cooldown, then a probe another request already holds, then this session's
+  exclusion. The reported blocker counts are per scope, so an empty pool names what
+  actually held it instead of blaming cooling in general.
+
+  **The successful-backup-pin exception.** A deployment that produced usable output
+  becomes the first choice for its `(auth scope, session, resolved logical model)`
+  group, and that pin SURVIVES the original provider recovering: a recovered primary
+  does not reclaim a session that already failed over successfully. This is a
+  deliberate exception to ordinary stickiness, and it is bounded in three ways - the
+  pin only ever reorders within its own logical-model group, it is skipped the moment
+  it is not eligible, and the map keeps at most 10,000 entries with LRU eviction. The
+  pin is dropped on failure, on route removal, on an operator cool/uncool/reset (an
+  explicit routing decision must never be overruled by learned preference), and on
+  process restart, which loses the table. Callers with the shared `no-session` key
+  get no pin at all, because one anonymous caller's experience must not steer every
+  other caller. A pin never reorders models and never undoes backend dedup.
 - `/health` gains a `deployments[]` array per backend entry (id, upstream, state, fails, lastError, manual). `POST /admin/backend` body extends to `{id, upstream?, action: "cool"|"uncool", forMs?}`: without `upstream` it targets account-wide state as today; with `upstream` it targets one deployment.
 - History/detail attempt entries add `upstream` alongside the existing `backend` field (additive).
 
@@ -131,9 +166,40 @@ Load semantics keep the non-destructive contract: any error-class finding leaves
 
 ### Editor and UI
 
-- `cfgModalCollect` and `cfgApplyModal` are rewritten as merge-preserve: collection starts from the existing draft entry, applies only the fields the form edits, removes only explicitly cleared fields, and leaves unknown keys untouched. The per-deployment form gains `weight`, `backupOnly` inputs and `dropParams`/`paramMap`/`params` textareas; presets gain `exposed` and a read-only `strategy` display ("fallback" in v3).
+- `cfgModalCollect` and `cfgApplyModal` are rewritten as merge-preserve: collection starts from the existing draft entry, applies only the fields the form edits, removes only explicitly cleared fields, and leaves unknown keys untouched. Merge-preserve covers the CHANNEL as well as the keys: a model entry opened with `providers` is stored back with `providers` (see "Shape on save"). The per-deployment form gains `weight`, `backupOnly` inputs and `dropParams`/`paramMap`/`params` textareas; presets gain `exposed` and a read-only `strategy` display ("fallback" in v3).
 - Playground model selector and compare checkboxes derive from the same served-id rule as `/v1/models` (exposed presets then exposed models), honoring exposure; the deleted-preset stale-selection fallback posts no empty `model` value.
 - After a successful config save the dashboard config state refreshes (Models/Presets tables, config viewer); after an env write, the backend "Key env" name list refreshes. These close the 2026-09-19 audit's UI staleness gaps as part of the editor rebuild.
+
+### Shape on save (authoritative)
+
+Two shapes are live during the bridge era, and a SAVE NEVER MIGRATES BETWEEN THEM.
+
+- The load path is dual-shape and shape-preserving: an old-shape document is
+  normalized in memory and served from that normalization, while the file on disk keeps
+  whatever shape it was written with. Nothing converts a document behind the operator's
+  back `structuralViewForValidation` builds a canonicalized COPY for the validator and
+  leaves the document itself alone; `convertLegacyConfig` is a pure, exported function
+  that runs only when a migration is asked for.
+- The structured editor writes the shape it was GIVEN. A model entry opened with a
+  `providers` array is stored back with `providers` (and keeps the `affinityPool` that
+  shape owns); one opened with `deployments` is stored back with `deployments`. An entry
+  that carries BOTH is treated as legacy and stored as `providers`, because that is the
+  array the router reads - providers win over deployments in the converter, so writing
+  `deployments` beside them would bury the operator's edit under an array nothing reads.
+- A model entry therefore never comes back carrying both arrays, and a no-op save is
+  byte-identical to its input apart from the form's own default-omission rule (a value
+  equal to a control's default, such as `weight: 1` or `exposed: true`, is not written
+  back as though the operator had typed it).
+- A LEGACY row's `backupOnly` is DERIVED from the entry's `affinityPool`: rows past the
+  pool are the ordered tail. It is display state, not a stored key, so a no-op save of a
+  pooled legacy entry does not invent `backupOnly: true` on its tail rows.
+- **Served-id stability is a consequence.** Converting one saved model to v3 makes the
+  whole document v3 for the validator, and every id that a shadowing identity preset owns
+  then collides - 17 of the mirror's ids do - so `/v1/models` changes for ids nobody
+  edited. Keeping the document's shape keeps the served list in its order.
+
+Migration is therefore a deliberate act (increment 4's explicit conversion), never a side
+effect of opening a tab and pressing Save.
 
 ### Error handling
 
@@ -167,7 +233,7 @@ Six increments, each one commit/PR, each shippable and revertible, suite green a
 
 1. **Shared validation** — extend `validateConfig` to the full typed rule set; wire into save, reset (adding the RESTART_ONLY + baseRevision guards), and load. No schema change; old configs validate as today plus the new type checks. Kills the crash class and the asymmetry.
 2. **Editor merge-preserve + UI lists** — rewrite `cfgModalCollect`/`cfgApplyModal`; Playground/compare lists from the served rule; envNames and post-save refreshes. No schema change.
-3. **Schema v3 bridge** — add `deployments`/`weight`/`backupOnly`/`exposed`/`strategy: "fallback"` reading, `convertLegacyConfig`, dual-shape load (old shape converts in memory; any save writes v3). The editor gains the v3 inputs in the same increment (weight, backupOnly, exposed, per-deployment dialect textareas). Deploy protocol: capture an old-shape config snapshot to the host BEFORE deploying, since any dashboard save from this point writes v3. Live config otherwise untouched.
+3. **Schema v3 bridge** — add `deployments`/`weight`/`backupOnly`/`exposed`/`strategy: "fallback"` reading, `convertLegacyConfig`, dual-shape load (old shape normalizes in memory; a save writes back the shape it was given, see "Shape on save" — the bridge era does not migrate on save). The editor gains the v3 inputs in the same increment (weight, backupOnly, exposed, per-deployment dialect textareas). Deploy protocol: capture an old-shape config snapshot to the host BEFORE deploying, since any dashboard save from this point writes v3. Live config otherwise untouched.
 4. **Convert the live config** — over SSH: refresh/verify the pre-bridge old-shape snapshot captured in increment 3, POST the converted config, verify the served id set is identical and both consumers still resolve their pinned ids; compute the T6 golden expectations from the captured snapshot.
 5. **Cooling re-key** — deployment/account health split, per-request backend skip, `/health`/`/admin/backend` extensions. Depends on 3.
 6. **Legacy removal** — after a soak period (set at increment-6 review): remove legacy synthesis (paths A/B :1316-1333 and :1408-1462, identity-preset synthesis :1469-1473, carve-outs :1485-1490 and :1629-1633), the old-shape reader, the legacy `providers` key handling, and preset-level `affinityPool` handling (test.mjs:691 pins today's semantics); update `DESIGN-3LAYER.md` (v3 contract), `AGENTS.md`, and the switchblade skill runbook.

@@ -1011,6 +1011,13 @@ git commit -m 'feat: v3 routing read with backup-only sticky weights and exposur
 ```
 
 ### Task 13: Save/reset bridge — convert-or-refuse, writes v3 (T7 convert half)
+
+> **SUPERSEDED 2026-10-12.** The "any save writes v3" guarantee below was withdrawn in
+> the combined release work: a save writes back the shape it was given, and migration is
+> a deliberate act. See `DESIGN-3LAYER.md` section 8b and the config-v3 spec's "Shape on
+> save". The reset path still converts-or-refuses a snapshot, which is what this task's
+> convert-or-refuse half is about; only the "save converts the live config" half changed.
+> Evidence: `u9s1`/`u9s1b` in `test.mjs`.
 **Files:**
 - Modify: `C:\dev\local-model-router\server.mjs:3053-3111` (POST /api/config), `C:\dev\local-model-router\server.mjs:3113-3145` (reset convert step)
 - Test: `C:\dev\local-model-router\test.mjs` (`v39)` cases inside the existing config-editor block, after CE11: `v39a)`/`v39b)` old-shape save converts; `v39c)`/`v39d)` a corrupt old-shape snapshot is refused with the live file byte-identical)
