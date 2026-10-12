@@ -725,21 +725,31 @@ function captureMiss(cfg, entry, payload) {
 // ---- ntfy push alerts (OPTIONAL) ---------------------------------------------
 //
 // OPTIONAL. Controlled by the top-level `alerts.ntfy` block ({baseUrl, topic,
-// minMissPct, minMissTokens, minBreaks, windowMs, cooldownMs, events?}). When it
-// is absent, or the kind's event is explicitly disabled (`events[kind] ===
-// false`), nothing is sent. Alerts are fire-and-forget: they must never block
-// the hot request path or crash the router if ntfy is unreachable. Cooldown per
-// kind suppresses an alert storm. Messages carry NO secrets (no keys).
+// enabled, minMissPct, minMissTokens, minBreaks, windowMs, cooldownMs, events}).
+// When it is absent, or the kind is switched off, nothing is sent. Alerts are
+// fire-and-forget: they must never block the hot request path or crash the
+// router if ntfy is unreachable. Messages carry NO secrets (no keys).
 //
-// cache_miss is deliberately NOT a per-request alert. A new conversation always
-// opens on a cold cache, so a lone big miss is the EXPECTED shape of a fresh
-// session and would page the operator on every one of them. It fires on a
-// PATTERN instead: `minBreaks` qualifying misses on the same backend inside
-// `windowMs`. The streak resets once an alert fires, so the next one needs a
-// fresh run of breaks, and the per-kind cooldown still throttles the result.
-// `minBreaks: 1` restores the old fire-on-the-first-miss behavior.
+// EVERY kind is gated the same way, and each kind chooses its own condition:
+//
+//   mode: "immediate"  the first qualifying event sends (the cooldown still
+//                      throttles a storm; cooldownMs: 0 sends every one).
+//   mode: "repeated"   nothing is sent until `minEvents` qualifying events land
+//                      inside `windowMs`; the run then resets, so the next
+//                      alert needs a fresh run. `minEvents: 1` is equivalent to
+//                      immediate.
+//   scope: "backend" | "conversation"   what the events must have in common to
+//                      count as the same run (a kind with neither field in its
+//                      payload falls back to one global run).
+//
+// cache_miss defaults to "repeated" because a new conversation always opens on a
+// cold cache: a lone big miss is the EXPECTED shape of a fresh session and must
+// not page the operator on every one of them. Every other kind defaults to
+// "immediate", which is what the router did before the condition was
+// configurable. The shared top-level thresholds stay the defaults; an entry in
+// `events` (an OBJECT, not `false`) overrides them for that kind alone.
 const alertCooldowns = new Map();
-const cacheBreakStreaks = new Map(); // backend id -> [timestamps of counted misses]
+const alertRuns = new Map(); // "kind|scopeKey" -> [timestamps of counted events]
 const NTFY_DEFAULT_BASE = "https://ntfy.sh";
 const ALERT_DEFS = {
   cache_miss: { title: "Cache break on switchblade", tag: "warning", priority: 3 },
@@ -752,8 +762,8 @@ const ALERT_DEFS = {
 function alertMessage(kind, f) {
   switch (kind) {
     case "cache_miss":
-      // The repeat marker only appears when the alert came through the pattern
-      // gate (noteCacheMiss); a direct buildAlert keeps the plain wording.
+      // The repeat marker only appears when the alert came through the run
+      // gate (noteEvent); a direct buildAlert keeps the plain wording.
       return `Cache break ${f.breakCount ? `x${f.breakCount} in ${f.windowMin ?? 30}m ` : ""}on ${f.backend}: ${f.cacheHitPct}% hit, ~${f.missTokens} miss tokens (prompt ${f.promptTokens}, model ${f.model}, session ${f.session})`;
     case "weekly_limit":
       return `${f.backend} hit its weekly usage limit (resets in ${f.days ?? "?"} days); other providers may still serve`;
@@ -768,17 +778,51 @@ function alertMessage(kind, f) {
   }
 }
 
-function buildAlert(cfg, kind, fields) {
+// Kinds that alert on a run rather than on every occurrence. Everything else
+// is immediate, which is what the router did before this was configurable.
+const ALERT_MODE_DEFAULT = { cache_miss: "repeated" };
+
+// Resolve ONE kind's effective settings. The shared values in `alerts.ntfy` are
+// the defaults; `events[kind]` as an OBJECT overrides them for that kind alone,
+// and `events[kind] === false` keeps its original meaning: never send this kind.
+// Every number is clamped here, so a hand-edited config can never produce a
+// zero-length window, a negative cooldown, or a run that can never complete.
+function alertSettings(n, kind) {
+  const raw = n && n.events ? n.events[kind] : null;
+  const o = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+  const numOr = (v, d) => { if (v === null || v === undefined || v === "") return d; const x = Number(v); return Number.isFinite(x) ? x : d; };
+  const from = (k, shared) => numOr(o[k] !== undefined ? o[k] : shared, numOr(shared, 0));
+  const mode = o.mode === "immediate" || o.mode === "repeated" ? o.mode : ALERT_MODE_DEFAULT[kind] || "immediate";
+  return {
+    off: raw === false,
+    mode,
+    minEvents: Math.max(1, Math.floor(from("minEvents", numOr(n && n.minBreaks, 5)))),
+    windowMs: Math.max(1, from("windowMs", numOr(n && n.windowMs, 1800000))),
+    scope: o.scope === "conversation" ? "conversation" : "backend",
+    minMissPct: Math.min(100, Math.max(0, from("minMissPct", numOr(n && n.minMissPct, 50)))),
+    minMissTokens: Math.max(0, from("minMissTokens", numOr(n && n.minMissTokens, 20000))),
+    cooldownMs: Math.max(0, from("cooldownMs", numOr(n && n.cooldownMs, 600000))),
+  };
+}
+
+// The key a run is counted against: the thing the events must have in common.
+// A kind whose payload carries neither field shares one run, which is the
+// honest reading of "the same thing happened again".
+function alertScopeKey(kind, scope, fields) {
+  if (scope === "conversation") return kind + "|session:" + (fields.session || "no-session");
+  return kind + "|backend:" + (fields.backend || "unknown");
+}
+
+function buildAlert(cfg, kind, fields, settings) {
   const n = cfg.alerts && cfg.alerts.ntfy;
   if (!n || !n.topic || !ALERT_DEFS[kind]) return null;
   if (n.enabled === false) return null; // master switch: nothing is sent at all
-  const events = n.events || {};
-  if (events[kind] === false) return null;
+  const s = settings || alertSettings(n, kind);
+  if (s.off) return null;
   const message = alertMessage(kind, fields);
   if (!message) return null;
   const last = alertCooldowns.get(kind) || 0;
-  const cooldownMs = n.cooldownMs ?? 600000;
-  if (Date.now() - last < cooldownMs) return null;
+  if (Date.now() - last < s.cooldownMs) return null;
   alertCooldowns.set(kind, Date.now());
   return {
     url: (n.baseUrl || NTFY_DEFAULT_BASE).replace(/\/$/, ""),
@@ -792,27 +836,41 @@ function buildAlert(cfg, kind, fields) {
   };
 }
 
-// Pattern gate for the cache_miss alert. Records one qualifying miss and
-// returns the alert to send, or null while the run is still too short to be a
-// pattern. `now` is injectable so the window logic is testable without sleeps.
-// A miss counts per backend: the alert names one backend, so a run spread
-// across backends is not "this backend is breaking".
-function noteCacheMiss(cfg, fields, now = Date.now()) {
+// The gate every kind goes through. Records one occurrence and returns the
+// alert to send, or null while the run is still too short to be a pattern (or
+// always null in immediate mode, where the alert is returned straight away).
+// `now` is injectable so the window logic is testable without sleeps.
+function noteEvent(cfg, kind, fields, now = Date.now()) {
   const n = cfg.alerts && cfg.alerts.ntfy;
-  if (!n || !n.topic || n.enabled === false) return null;
-  const minBreaks = Math.max(1, Math.floor(Number(n.minBreaks) || 5));
-  const windowMs = Math.max(1, Number(n.windowMs) || 1800000);
-  const key = fields.backend || "unknown";
-  const times = (cacheBreakStreaks.get(key) || []).filter((t) => now - t <= windowMs);
+  if (!n || !n.topic || !ALERT_DEFS[kind] || n.enabled === false) return null;
+  const s = alertSettings(n, kind);
+  if (s.off) return null;
+  if (s.mode === "immediate") return buildAlert(cfg, kind, fields, s);
+  const key = alertScopeKey(kind, s.scope, fields);
+  const times = (alertRuns.get(key) || []).filter((t) => now - t <= s.windowMs);
   times.push(now);
-  cacheBreakStreaks.set(key, times);
-  if (times.length < minBreaks) return null;
-  const a = buildAlert(cfg, "cache_miss", { ...fields, breakCount: times.length, windowMin: Math.max(1, Math.round(windowMs / 60000)) });
-  // A fired alert starts a fresh run, so the next one needs minBreaks MORE
-  // breaks. When the cooldown (or a disabled event) suppressed it, the run is
-  // kept, so the very next qualifying miss can still fire it.
-  if (a) cacheBreakStreaks.set(key, []);
+  alertRuns.set(key, times);
+  if (times.length < s.minEvents) return null;
+  const a = buildAlert(cfg, kind, { ...fields, breakCount: times.length, windowMin: Math.max(1, Math.round(s.windowMs / 60000)) }, s);
+  // A fired alert starts a fresh run, so the next one needs minEvents MORE
+  // events. When the cooldown (or a switch) suppressed it, the run is kept, so
+  // the very next qualifying event can still fire it.
+  if (a) alertRuns.set(key, []);
   return a;
+}
+
+// Does this finished request qualify as a cache break worth counting? The
+// thresholds are the per-event ones, so the dashboard can tune what "a break"
+// means; the shared top-level values stay the fallback. Returns the alert
+// fields, or null when the request was not a break at all.
+function cacheBreakFields(n, m) {
+  if (!n || !n.topic) return null;
+  const s = alertSettings(n, "cache_miss");
+  if (s.off) return null;
+  if (typeof m.cacheHitPct !== "number" || m.cacheHitPct >= s.minMissPct) return null;
+  const missTokens = Math.max(0, Math.round((m.promptTokens || 0) * (1 - m.cacheHitPct / 100)));
+  if (missTokens < s.minMissTokens) return null;
+  return { backend: m.backend, cacheHitPct: m.cacheHitPct, missTokens, promptTokens: m.promptTokens || 0, model: m.model, session: m.session };
 }
 
 // Sample fields per kind, so the dashboard can send ONE real push of any kind
@@ -858,12 +916,12 @@ function sendAlert(a) {
 }
 
 function fireAlert(cfg, kind, fields) {
-  sendAlert(buildAlert(cfg, kind, fields));
+  sendAlert(noteEvent(cfg, kind, fields));
 }
 
 function resetAlertCooldowns() {
   alertCooldowns.clear();
-  cacheBreakStreaks.clear();
+  alertRuns.clear();
 }
 
 // ---- request detail store (deep-dive side panel) -----------------------------
@@ -2145,12 +2203,15 @@ async function handleChat(req, res, cfg, bodyText) {
     // push alert once such misses REPEAT on one backend. Both must never break
     // the successful response path.
     captureMiss(cfg, entry, payload);
-    if (typeof metrics.cacheHitPct === "number" && metrics.cacheHitPct < (cfg.alerts && cfg.alerts.ntfy ? (cfg.alerts.ntfy.minMissPct ?? 50) : 50)) {
-      const missTokens = Math.max(0, Math.round((metrics.promptTokens || 0) * (1 - metrics.cacheHitPct / 100)));
-      const amin = cfg.alerts && cfg.alerts.ntfy ? (cfg.alerts.ntfy.minMissTokens ?? 20000) : 20000;
-      if (missTokens >= amin) sendAlert(noteCacheMiss(cfg, { backend: attempt.backend, cacheHitPct: metrics.cacheHitPct, missTokens, promptTokens: metrics.promptTokens || 0, model: modelId, session: sessionKey }));
-    }
-    if (metrics.relayError) fireAlert(cfg, "relay_cut", { backend: attempt.backend, model: modelId, error: metrics.relayError });
+    const breakFields = cacheBreakFields(cfg.alerts && cfg.alerts.ntfy, {
+      cacheHitPct: metrics.cacheHitPct,
+      promptTokens: metrics.promptTokens,
+      backend: attempt.backend,
+      model: modelId,
+      session: sessionKey,
+    });
+    if (breakFields) sendAlert(noteEvent(cfg, "cache_miss", breakFields));
+    if (metrics.relayError) fireAlert(cfg, "relay_cut", { backend: attempt.backend, model: modelId, session: sessionKey, error: metrics.relayError });
     // Finalize the deep-dive detail record (attempt already recorded above) with
     // the response summary.
     finalizeDetail(detailT, {
@@ -2175,7 +2236,7 @@ async function handleChat(req, res, cfg, bodyText) {
   const failEntry = applyCost(newHistoryEntry({ t: detailT, callId, model: modelId, backend: lastTried ? lastTried.backend : "none", stream, status: 503, latencyMs, session: sessionKey, routedModel: c.ordered[0] ? c.ordered[0].model : null, errorKind: lastErr ? classify(lastErr.status, lastErr.body) : null }), cfg);
   recordHistory(failEntry);
   recordAnalytics(failEntry);
-  fireAlert(cfg, "request_exhausted", { callId, model: modelId, error: lastErr ? String(lastErr.body || lastErr.status) : "all providers unavailable" });
+  fireAlert(cfg, "request_exhausted", { callId, model: modelId, session: sessionKey, error: lastErr ? String(lastErr.body || lastErr.status) : "all providers unavailable" });
   recordStats({ backend: lastTried ? lastTried.backend : "none", model: modelId, status: 503, latencyMs });
   // A detail record exists whenever at least one attempt ran (recorded per
   // attempt above); finalize it unconditionally.
@@ -3596,4 +3657,4 @@ if (isMain) {
   });
 }
 
-export { candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, buildTestAlert, noteCacheMiss, resetAlertCooldowns, computeCost, writeConfigAtomic };
+export { candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, buildTestAlert, noteEvent, alertSettings, cacheBreakFields, resetAlertCooldowns, computeCost, writeConfigAtomic };

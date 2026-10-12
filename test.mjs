@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { spawn } from "node:child_process";
 // Unit-level imports: server.mjs only starts the server when run as a script,
 // so importing it here gives direct access to strategy selection for tests.
-import { candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, buildTestAlert, noteCacheMiss, resetAlertCooldowns, computeCost, writeConfigAtomic } from "./server.mjs";
+import { candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, buildTestAlert, noteEvent, alertSettings, cacheBreakFields, resetAlertCooldowns, computeCost, writeConfigAtomic } from "./server.mjs";
 
 const HOST = "127.0.0.1";
 let passed = 0;
@@ -1634,7 +1634,7 @@ async function main() {
   }
 
 
-  // z35) unit-level: noteCacheMiss - the cache_miss alert fires on a REPEATED
+  // z35) unit-level: noteEvent - the cache_miss alert fires on a REPEATED
   //      pattern (minBreaks misses on one backend inside windowMs), not on a
   //      single miss, because a new conversation always opens on a cold cache.
   //      `now` is injected, so the window is exercised without sleeping.
@@ -1644,38 +1644,99 @@ async function main() {
     const cfgn = { alerts: { ntfy: { ...base, minBreaks: 3, windowMs: 600000 } } };
     const miss = { backend: "b1", cacheHitPct: 10, missTokens: 100, promptTokens: 1000, model: "m", session: "s" };
     const t0 = 1000000;
-    assert(noteCacheMiss({}, miss, t0) === null, "z35a) no alerts.ntfy block -> null");
-    assert(noteCacheMiss(cfgn, miss, t0) === null, "z35b) miss 1 of 3 -> null (a lone miss is not a pattern)");
-    assert(noteCacheMiss(cfgn, miss, t0 + 1000) === null, "z35c) miss 2 of 3 -> null");
-    const a1 = noteCacheMiss(cfgn, miss, t0 + 2000);
+    assert(noteEvent({}, "cache_miss", miss, t0) === null, "z35a) no alerts.ntfy block -> null");
+    assert(noteEvent(cfgn, "cache_miss", miss, t0) === null, "z35b) miss 1 of 3 -> null (a lone miss is not a pattern)");
+    assert(noteEvent(cfgn, "cache_miss", miss, t0 + 1000) === null, "z35c) miss 2 of 3 -> null");
+    const a1 = noteEvent(cfgn, "cache_miss", miss, t0 + 2000);
     assert(
       a1 && a1.body.message.includes("x3") && a1.body.message.includes("b1") && a1.body.message.includes("10%"),
       "z35d) miss 3 of 3 -> alert carrying the run size (msg=" + (a1 && a1.body.message) + ")"
     );
-    assert(noteCacheMiss(cfgn, miss, t0 + 3000) === null, "z35e) the run reset on firing -> the next miss starts a fresh run");
+    assert(noteEvent(cfgn, "cache_miss", miss, t0 + 3000) === null, "z35e) the run reset on firing -> the next miss starts a fresh run");
     resetAlertCooldowns();
     // A run spread across backends is not one backend breaking.
-    assert(noteCacheMiss(cfgn, { ...miss, backend: "b1" }, t0) === null, "z35f) b1 x1 -> null");
-    assert(noteCacheMiss(cfgn, { ...miss, backend: "b2" }, t0) === null, "z35g) b2 x1 -> null");
-    assert(noteCacheMiss(cfgn, { ...miss, backend: "b1" }, t0) === null, "z35h) b1 x2 -> null (b2's miss does not count for b1)");
-    assert(noteCacheMiss(cfgn, { ...miss, backend: "b2" }, t0) === null, "z35i) b2 x2 -> null");
-    assert(noteCacheMiss(cfgn, { ...miss, backend: "b1" }, t0) !== null, "z35j) b1 x3 -> alert");
+    assert(noteEvent(cfgn, "cache_miss", { ...miss, backend: "b1" }, t0) === null, "z35f) b1 x1 -> null");
+    assert(noteEvent(cfgn, "cache_miss", { ...miss, backend: "b2" }, t0) === null, "z35g) b2 x1 -> null");
+    assert(noteEvent(cfgn, "cache_miss", { ...miss, backend: "b1" }, t0) === null, "z35h) b1 x2 -> null (b2's miss does not count for b1)");
+    assert(noteEvent(cfgn, "cache_miss", { ...miss, backend: "b2" }, t0) === null, "z35i) b2 x2 -> null");
+    assert(noteEvent(cfgn, "cache_miss", { ...miss, backend: "b1" }, t0) !== null, "z35j) b1 x3 -> alert");
     resetAlertCooldowns();
     // Misses older than the window age out of the run.
-    assert(noteCacheMiss(cfgn, miss, t0) === null, "z35k) t0 -> null");
-    assert(noteCacheMiss(cfgn, miss, t0 + 700000) === null, "z35l) 11m later the first miss aged out of the 10m window -> null");
-    assert(noteCacheMiss(cfgn, miss, t0 + 800000) === null, "z35m) two fresh misses -> still null");
-    assert(noteCacheMiss(cfgn, miss, t0 + 900000) !== null, "z35n) three fresh misses inside the window -> alert");
+    assert(noteEvent(cfgn, "cache_miss", miss, t0) === null, "z35k) t0 -> null");
+    assert(noteEvent(cfgn, "cache_miss", miss, t0 + 700000) === null, "z35l) 11m later the first miss aged out of the 10m window -> null");
+    assert(noteEvent(cfgn, "cache_miss", miss, t0 + 800000) === null, "z35m) two fresh misses -> still null");
+    assert(noteEvent(cfgn, "cache_miss", miss, t0 + 900000) !== null, "z35n) three fresh misses inside the window -> alert");
     resetAlertCooldowns();
     // minBreaks: 1 restores the old fire-on-the-first-miss behavior.
     const cfg1 = { alerts: { ntfy: { ...base, minBreaks: 1 } } };
-    assert(noteCacheMiss(cfg1, miss, t0) !== null, "z35o) minBreaks:1 -> the first miss fires");
+    assert(noteEvent(cfg1, "cache_miss", miss, t0) !== null, "z35o) minBreaks:1 -> the first miss fires");
     // The per-kind cooldown still throttles a pattern that keeps repeating.
     resetAlertCooldowns();
     const cfg1c = { alerts: { ntfy: { ...base, minBreaks: 1, cooldownMs: 600000 } } };
-    assert(noteCacheMiss(cfg1c, miss, t0) !== null, "z35p) minBreaks:1 fires");
-    assert(noteCacheMiss(cfg1c, miss, t0 + 1000) === null, "z35q) inside the per-kind cooldown -> null");
+    assert(noteEvent(cfg1c, "cache_miss", miss, t0) !== null, "z35p) minBreaks:1 fires");
+    assert(noteEvent(cfg1c, "cache_miss", miss, t0 + 1000) === null, "z35q) inside the per-kind cooldown -> null");
     resetAlertCooldowns();
+  }
+
+  // z37) unit-level: the per-event SEND CONDITION. Every kind can send on each
+  //      occurrence or only on a repeated issue, with its own thresholds; an
+  //      absent condition keeps the behavior that was there before.
+  {
+    resetAlertCooldowns();
+    const shared = { baseUrl: "http://x", topic: "t", minMissPct: 40, minMissTokens: 100, minBreaks: 2, windowMs: 60000, cooldownMs: 0 };
+    const n = { alerts: { ntfy: { ...shared } } };
+    const s0 = alertSettings(n.alerts.ntfy, "cache_miss");
+    assert(
+      s0.mode === "repeated" && s0.minEvents === 2 && s0.windowMs === 60000 && s0.scope === "backend" && s0.minMissPct === 40 && s0.minMissTokens === 100,
+      "z37a) the shared values are the fallback and cache_miss still defaults to repeated (mode=" + s0.mode + ")"
+    );
+    assert(alertSettings(n.alerts.ntfy, "relay_cut").mode === "immediate", "z37b) every other kind still defaults to immediate");
+
+    const n2 = { alerts: { ntfy: { ...shared, events: { cache_miss: { minEvents: 7, windowMs: 120000, scope: "conversation", minMissPct: 5, minMissTokens: 999 } } } } };
+    const s2 = alertSettings(n2.alerts.ntfy, "cache_miss");
+    assert(
+      s2.minEvents === 7 && s2.windowMs === 120000 && s2.scope === "conversation" && s2.minMissPct === 5 && s2.minMissTokens === 999,
+      "z37c) a per-event object overrides every shared value it names"
+    );
+    assert(alertSettings(n2.alerts.ntfy, "relay_cut").minEvents === 2, "z37d) and leaves the other kinds on the shared values");
+
+    const s3 = alertSettings({ ...shared, events: { cache_miss: { minEvents: 0, windowMs: -5, minMissPct: 500, cooldownMs: -1 } } }, "cache_miss");
+    assert(
+      s3.minEvents === 1 && s3.windowMs > 0 && s3.minMissPct === 100 && s3.cooldownMs === 0,
+      "z37e) a hand-edited out-of-range number is clamped, never trusted (minEvents=" + s3.minEvents + ", windowMs=" + s3.windowMs + ", pct=" + s3.minMissPct + ", cooldown=" + s3.cooldownMs + ")"
+    );
+
+    // Immediate: send on each occurrence.
+    const f = { backend: "b1", model: "m", session: "s1", error: "cut" };
+    const imm = { alerts: { ntfy: { ...shared, events: { relay_cut: { mode: "immediate" } } } } };
+    assert(noteEvent(imm, "relay_cut", f) !== null, "z37f) immediate mode sends on the first event");
+    assert(noteEvent(imm, "relay_cut", f) !== null, "z37g) ...and on the next one when the cooldown is 0");
+
+    // Repeated: wait for the run.
+    const rep = { alerts: { ntfy: { ...shared, events: { relay_cut: { mode: "repeated", minEvents: 2 } } } } };
+    assert(noteEvent(rep, "relay_cut", f, 1000) === null, "z37h) repeated mode stays silent on the first event");
+    assert(noteEvent(rep, "relay_cut", f, 2000) !== null, "z37i) ...and fires on the second");
+    const one = { alerts: { ntfy: { ...shared, events: { relay_cut: { mode: "repeated", minEvents: 1 } } } } };
+    assert(noteEvent(one, "relay_cut", f) !== null, "z37j) repeated with minEvents 1 is immediate by another name");
+
+    // Scope decides what a run is grouped by.
+    const conv = { alerts: { ntfy: { ...shared, events: { relay_cut: { mode: "repeated", minEvents: 2, scope: "conversation" } } } } };
+    assert(noteEvent(conv, "relay_cut", { ...f, session: "s1" }, 1000) === null, "z37k) s1 x1 -> null");
+    assert(noteEvent(conv, "relay_cut", { ...f, session: "s2" }, 2000) === null, "z37l) another conversation's event does not count toward s1's run");
+    assert(noteEvent(conv, "relay_cut", { ...f, session: "s1" }, 3000) !== null, "z37m) s1 x2 inside the window -> alert");
+    const byBackend = { alerts: { ntfy: { ...shared, events: { relay_cut: { mode: "repeated", minEvents: 2, scope: "backend" } } } } };
+    assert(noteEvent(byBackend, "relay_cut", { ...f, session: "s1" }, 1000) === null, "z37n) backend scope: s1 x1 -> null");
+    assert(noteEvent(byBackend, "relay_cut", { ...f, session: "s2" }, 2000) !== null, "z37o) ...but another conversation on the same backend completes the run");
+    resetAlertCooldowns();
+
+    // The call-site qualifier reads the per-event cache thresholds.
+    const q = { baseUrl: "http://x", topic: "t", events: { cache_miss: { minMissPct: 20, minMissTokens: 5000 } } };
+    assert(cacheBreakFields(q, { cacheHitPct: 30, promptTokens: 100000 }) === null, "z37p) a 30% hit is above the 20% threshold -> not a break at all");
+    const bf = cacheBreakFields(q, { cacheHitPct: 10, promptTokens: 100000, backend: "b1" });
+    assert(bf && bf.missTokens === 90000 && bf.backend === "b1", "z37q) a qualifying break carries its miss tokens and backend");
+    assert(cacheBreakFields(q, { cacheHitPct: 0, promptTokens: 3000 }) === null, "z37r) a small request never qualifies, however badly it misses");
+    assert(cacheBreakFields({ ...q, events: { cache_miss: false } }, { cacheHitPct: 0, promptTokens: 100000 }) === null, "z37s) a switched-off event never qualifies");
+    assert(cacheBreakFields({ topic: "t" }, { cacheHitPct: 0, promptTokens: 100000 }) !== null, "z37t) with no events block the shared defaults still qualify it");
   }
 
   // z36) unit-level: the notification switches the dashboard exposes - the
@@ -1691,11 +1752,11 @@ async function main() {
       kinds.every((k) => buildAlert(off, k, fields) === null),
       "z36a) enabled:false -> every kind stays silent"
     );
-    assert(noteCacheMiss(off, fields, 1000) === null, "z36b) enabled:false -> the cache-break gate stays silent too");
+    assert(noteEvent(off, "cache_miss", fields, 1000) === null, "z36b) enabled:false -> the cache-break gate stays silent too");
     // A disabled block must not bank a run that fires the moment it is switched
     // back on: the next miss starts a fresh run like any other first miss.
     const on = { alerts: { ntfy: { ...base, minBreaks: 2, windowMs: 600000 } } };
-    assert(noteCacheMiss(on, fields, 2000) === null, "z36c) switching back on starts a fresh run, not a banked one");
+    assert(noteEvent(on, "cache_miss", fields, 2000) === null, "z36c) switching back on starts a fresh run, not a banked one");
     resetAlertCooldowns();
 
     // The dashboard's test push.
@@ -1776,7 +1837,7 @@ async function main() {
         "p29b": { strategy: "affinity", models: ["m29b"] },
       },
       backoff: BO,
-      alerts: { ntfy: { baseUrl: `http://${HOST}:${ntfyPort}`, topic: "t29", minMissPct: 50, minMissTokens: 0, minBreaks: 3, windowMs: 600000, cooldownMs: 600000, events: { relay_cut: false } } },
+      alerts: { ntfy: { baseUrl: `http://${HOST}:${ntfyPort}`, topic: "t29", windowMs: 600000, cooldownMs: 600000, events: { cache_miss: { minEvents: 3, minMissPct: 50, minMissTokens: 0 }, relay_cut: false } } },
       missCapture: { enabled: true, maxMissPct: 50, minMissTokens: 0, file: "misses.jsonl" },
     };
     const { child: childZ29, base: baseZ29, dir: dirZ29 } = await startRouterCfg(cfgZ29, "KEY_Z29M=k\nKEY_Z29H=k\n");

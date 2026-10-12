@@ -252,35 +252,56 @@ missing, the router's behavior is byte-identical to before.
   bad-miss night recoverable (low cache-hit percentage = an EARLY cache break).
 - `alerts.ntfy` (object): `baseUrl` (default `https://ntfy.sh`), `topic`
   (required), `enabled` (default true; `false` is a master switch that silences
-  every kind regardless of the rest of the block), `minMissPct` (default 50) /
-  `minMissTokens` (default 20000) for
-  the `cache_miss` alert threshold, `minBreaks` (default 5) / `windowMs`
-  (default 1800000 = 30 min) for the repeat rule below, `cooldownMs` (default
-  600000, per-kind), and optional `events` map to disable specific kinds
-  (`{"cache_miss": false}`).
+  every kind regardless of the rest of the block), and the SHARED defaults:
+  `minMissPct` (50) / `minMissTokens` (20000) for what counts as a cache break,
+  `minBreaks` (5) / `windowMs` (1800000 = 30 min) for the repeat rule,
+  `cooldownMs` (600000, per kind).
   Kinds: `cache_miss`, `weekly_limit`, `all_cooling`, `request_exhausted`,
-  `relay_cut`. Alerts are fire-and-forget (never block the request path), never
-  carry secrets, and are throttled by the per-kind cooldown.
-- `cache_miss` is a PATTERN alert, not a per-request one. A new conversation
-  always opens on a cold cache, so a lone big miss is the EXPECTED shape of a
-  fresh session and must not page the operator on every one of them. It fires
-  only once `minBreaks` qualifying misses land on the SAME backend inside
-  `windowMs`; the run resets when the alert fires, so the next one needs a
-  fresh run of breaks, and the message carries the run size (`x5 in 30m `).
-  `minBreaks: 1` restores the old fire-on-the-first-miss behavior. Counting is
-  per backend on purpose: the alert names one backend, so a run spread across
-  backends is not "this backend is breaking". A suppressed alert (per-kind
-  cooldown, or `events.cache_miss: false`) does NOT clear the run, so the next
-  qualifying miss can still fire it.
+  `relay_cut`. Alerts are fire-and-forget (never block the request path) and
+  never carry secrets.
+- **Every kind chooses its own send condition** in the optional `events` map.
+  `events[kind]: false` means never send that kind (the original meaning, still
+  honored). `events[kind]: { ... }` overrides the shared defaults for that kind
+  alone:
+
+  ```json
+  "events": {
+    "relay_cut": false,
+    "cache_miss": { "mode": "repeated", "minEvents": 5, "windowMs": 1800000, "scope": "backend" }
+  }
+  ```
+
+  - `mode: "immediate"` sends on the first qualifying occurrence. `mode:
+    "repeated"` sends nothing until `minEvents` qualifying occurrences land
+    inside `windowMs`; the run then resets, so the next alert needs a fresh run.
+    `minEvents: 1` with `repeated` is immediate by another name.
+  - `scope: "backend" | "conversation"` decides what a run's occurrences must
+    have in common. A kind whose payload carries neither field shares one global
+    run. Counting `cache_miss` per backend is deliberate: the alert names one
+    backend, so a run spread across backends is not "this backend is breaking".
+  - `cooldownMs` is independent of the mode: it throttles how often a kind can
+    push at all, in every mode. `0` sends every one.
+  - Numbers are clamped on read (`minEvents >= 1`, windows and cooldown `>=`,
+    hit percentage `0..100`), so a hand-edited config can never produce a run
+    that can never complete.
+- `cache_miss` defaults to `"repeated"`; every other kind defaults to
+  `"immediate"`, which is what the router did before the condition was
+  configurable. A new conversation always opens on a cold cache, so a lone big
+  miss is the EXPECTED shape of a fresh session and must not page the operator
+  on every one of them. The message carries the run size (`x5 in 30m `). A
+  suppressed alert (cooldown, master switch, or a disabled kind) does NOT clear
+  the run, so the next qualifying event can still fire it.
 - The Config tab's **Notifications** panel is the supported way to edit this
-  block: one master switch, a switch per kind, the `cache_miss` thresholds and
-  the cooldown, written through the ordinary `POST /api/config` path so the
-  snapshot, the revision guard and validation are all unchanged. It also drives
-  `POST /api/alerts/test`, which sends ONE real push of a chosen kind, built
-  from sample fields and prefixed `[test]` in the message. A test deliberately
-  bypasses the master switch, `events`, the per-kind cooldown and the pattern
-  gate: a test the switches can silence would prove nothing about whether ntfy
-  itself works.
+  block: one master switch, the topic and server, and a per-kind condition
+  ("Off" / "Every event" / "Repeated issue") with the numbers inline, written
+  through the ordinary `POST /api/config` path so the snapshot, the revision
+  guard and validation are all unchanged. Keys that only restate the shared
+  defaults are left out, so the file stays "the defaults, plus deliberate
+  deviations". The panel also drives `POST /api/alerts/test`, which sends ONE
+  real push of a chosen kind, built from sample fields and prefixed `[test]` in
+  the message. A test deliberately bypasses the master switch, the per-kind
+  condition and the cooldown: a test the switches can silence would prove
+  nothing about whether ntfy itself works.
 
 ---
 

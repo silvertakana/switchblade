@@ -379,6 +379,13 @@
   .cfg-inline-input { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 6px 10px; font-family: var(--mono); font-size: 12px; width: 220px; }
   .cfg-inline-input:focus { outline: none; border-color: #3d3d3d; box-shadow: 0 0 0 3px rgba(255,255,255,.05); }
 .alerts-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(215px, 1fr)); gap: 14px; padding: 14px 16px; }
+.alert-cond { font-size: 12.5px; color: var(--muted); line-height: 2.2; }
+.alert-cond.off { color: var(--faint); }
+.alert-num { width: 76px; padding: 3px 4px; margin: 0 3px; background: var(--panel-2); border: 1px solid var(--border); color: var(--text); border-radius: 6px; font-family: var(--mono); font-size: 12px; text-align: center; }
+.alert-num:focus { outline: none; border-color: #3d3d3d; box-shadow: 0 0 0 3px rgba(255,255,255,.05); }
+.alert-scope, .alert-mode { padding: 5px 8px; background: var(--panel-2); border: 1px solid var(--border); color: var(--text); border-radius: 8px; font-size: 12.5px; }
+.alert-mode { min-width: 132px; }
+.alert-scope:focus, .alert-mode:focus { outline: none; border-color: #3d3d3d; }
 .alerts-field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
 .alerts-field .lbl { font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .8px; color: var(--faint); }
 .alerts-field .hint { font-size: 11px; color: var(--faint); line-height: 1.45; }
@@ -1278,12 +1285,12 @@
           <span class="ico" data-icon="zap"></span>
           <div>
             <h3>Notifications</h3>
-            <div class="desc">Phone pushes over <b>ntfy</b>. Each event can be switched off, and a switched-off event is never sent. Cache breaks are pattern-gated, so opening a new conversation stays silent.</div>
+            <div class="desc">Phone pushes over <b>ntfy</b>. Every event chooses its own condition: <b>every event</b>, or <b>repeated issue</b> (a run of them inside a window), or off. A cache break defaults to a repeated issue, so opening a new conversation stays silent.</div>
           </div>
           <span class="count" id="cfgCountAlerts">-</span>
         </div>
         <div class="cfg-sec-body" id="alertsBody"></div>
-        <div class="cfg-sec-foot"><span class="cfg-footnote" style="padding:0;text-align:left">A test sends one real push and ignores the switches, so you can prove the pipe works without waiting for an incident.</span></div>
+        <div class="cfg-sec-foot"><span class="cfg-footnote" style="padding:0;text-align:left">Each event chooses its own condition: send on every occurrence, or only after a run of them inside a window. A test sends one real push and ignores the conditions, so you can prove the pipe works without waiting for an incident.</span></div>
       </section>
 
       <section class="cfg-sec">
@@ -5158,36 +5165,121 @@ document.addEventListener("keydown", (ev) => {
 // this panel does not model. A switch writes events[kind] = false instead of
 // deleting anything, because the same block carries the topic.
 
+// `scopes` lists what this kind's payload can actually group a run by, so the
+// panel never offers "same backend" for an event that does not carry one.
 const ALERT_KINDS = [
-  { id: "cache_miss", label: "Cache break", note: "The prompt cache broke and kept breaking on one backend. Pattern-gated, so a fresh conversation stays silent." },
-  { id: "weekly_limit", label: "Weekly usage limit", note: "A backend hit its weekly cap and pinned itself until the reset." },
-  { id: "all_cooling", label: "All backends cooling", note: "Every backend is cooling, so requests fail with 503." },
-  { id: "request_exhausted", label: "Request failed everywhere", note: "One request failed on every provider it tried." },
-  { id: "relay_cut", label: "Stream cut mid-relay", note: "The response stream ended before the answer was finished." },
+  { id: "cache_miss", label: "Cache break", note: "A request mostly missed the prompt cache.", cache: true, scopes: ["backend", "conversation"] },
+  { id: "weekly_limit", label: "Weekly usage limit", note: "A backend hit its weekly cap and pinned itself until the reset.", scopes: ["backend"] },
+  { id: "all_cooling", label: "All backends cooling", note: "Every backend is cooling, so requests fail with 503.", scopes: [] },
+  { id: "request_exhausted", label: "Request failed everywhere", note: "One request failed on every provider it tried.", scopes: ["conversation"] },
+  { id: "relay_cut", label: "Stream cut mid-relay", note: "The response stream ended before the answer was finished.", scopes: ["backend", "conversation"] },
 ];
 
 const ALERT_DEFAULTS = { baseUrl: "https://ntfy.sh", minMissPct: 50, minMissTokens: 20000, minBreaks: 5, windowMs: 1800000, cooldownMs: 600000 };
 
-const ALERT_FIELDS = [
-  { key: "minMissPct", label: "Cache hit below %", def: 50, min: 0, max: 100, hint: "A request counts as a break when less than this share of its prompt came from cache." },
-  { key: "minMissTokens", label: "Miss tokens at least", def: 20000, min: 0, hint: "and at least this many prompt tokens came from nowhere. Small requests never qualify." },
-  { key: "minBreaks", label: "Breaks needed", def: 5, min: 1, hint: "How many breaks on ONE backend, inside the window, before a push is sent." },
-  { key: "windowMs", label: "Window (minutes)", def: 30, min: 1, minutes: true, hint: "The window those breaks must land in. Breaks from different conversations do not combine." },
-  { key: "cooldownMs", label: "Quiet after a push (minutes)", def: 10, min: 0, minutes: true, hint: "The same event stays silent for this long after it fires." },
-];
+// Panel units, mapped to the stored key. Both windows are entered in minutes
+// because milliseconds are not a unit anyone counts alerts in.
+const ALERT_NUM_FIELDS = {
+  minEvents: { ms: false, label: "events in the run" },
+  windowMin: { ms: true, label: "window in minutes" },
+  minMissPct: { ms: false, label: "cache hit percentage" },
+  minMissTokens: { ms: false, label: "minimum miss tokens" },
+  quietMin: { ms: true, label: "quiet period in minutes" },
+};
+const ALERT_MODE_LABEL = { off: "Off", immediate: "Every event", repeated: "Repeated issue" };
+const ALERT_REPEAT_BY_DEFAULT = { cache_miss: true }; // every other kind sends on each event
 
 function alertsNtfy() {
   return (cfg.draft && cfg.draft.alerts && cfg.draft.alerts.ntfy) || null;
 }
 
-// Show the value that is actually in effect: what the file says, else the
-// server's own default, so a blank field never looks like "off".
-function alertsEffective(n, f) {
-  const raw = n[f.key];
-  if (raw == null) return f.def;
-  const num = Number(raw);
-  if (!isFinite(num)) return f.def;
-  return f.minutes ? Math.round(num / 60000) : num;
+function alertNum(v, d) {
+  if (v === null || v === undefined || v === "") return d;
+  const x = Number(v);
+  return isFinite(x) ? x : d;
+}
+
+function alertSharedNum(n, key, def) { return alertNum(n && n[key], def); }
+
+// Mirrors alertSettings() in server.mjs. Keep the two in step: this one only
+// has to DISPLAY the resolved values, but a drift here would show the operator a
+// condition the router is not actually using.
+function alertKindCfg(n, kind) {
+  const raw = (n.events || {})[kind];
+  const o = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+  const pick = (k, shared) => alertNum(o[k] !== undefined ? o[k] : shared, alertNum(shared, 0));
+  const defMode = ALERT_REPEAT_BY_DEFAULT[kind] ? "repeated" : "immediate";
+  return {
+    off: raw === false,
+    mode: raw === false ? "off" : (o.mode === "immediate" || o.mode === "repeated" ? o.mode : defMode),
+    minEvents: Math.max(1, Math.floor(pick("minEvents", alertSharedNum(n, "minBreaks", ALERT_DEFAULTS.minBreaks)))),
+    windowMin: Math.round(pick("windowMs", alertSharedNum(n, "windowMs", ALERT_DEFAULTS.windowMs)) / 6000) / 10,
+    scope: o.scope === "conversation" ? "conversation" : "backend",
+    minMissPct: Math.min(100, Math.max(0, pick("minMissPct", alertSharedNum(n, "minMissPct", ALERT_DEFAULTS.minMissPct)))),
+    minMissTokens: Math.max(0, pick("minMissTokens", alertSharedNum(n, "minMissTokens", ALERT_DEFAULTS.minMissTokens))),
+    quietMin: Math.max(0, pick("cooldownMs", alertSharedNum(n, "cooldownMs", ALERT_DEFAULTS.cooldownMs)) / 6000) / 10,
+  };
+}
+
+// Persist one event's condition. Keys that only restate the shared default are
+// left out, so the file stays "the defaults, plus deliberate deviations" instead
+// of one frozen copy per kind.
+function alertsSetKind(kind, patch) {
+  cfgMutate((d) => {
+    const n = d.alerts.ntfy;
+    const next = Object.assign(alertKindCfg(n, kind), patch);
+    const evs = n.events || (n.events = {});
+    if (next.mode === "off") {
+      evs[kind] = false;
+    } else {
+      const defMode = ALERT_REPEAT_BY_DEFAULT[kind] ? "repeated" : "immediate";
+      const o = {};
+      if (next.mode !== defMode) o.mode = next.mode;
+      if (next.minEvents !== alertSharedNum(n, "minBreaks", ALERT_DEFAULTS.minBreaks)) o.minEvents = next.minEvents;
+      if (Math.round(next.windowMin * 60000) !== alertSharedNum(n, "windowMs", ALERT_DEFAULTS.windowMs)) o.windowMs = Math.round(next.windowMin * 60000);
+      if (next.scope !== "backend") o.scope = next.scope;
+      if (Math.round(next.quietMin * 60000) !== alertSharedNum(n, "cooldownMs", ALERT_DEFAULTS.cooldownMs)) o.cooldownMs = Math.round(next.quietMin * 60000);
+      if (kind === "cache_miss") {
+        if (next.minMissPct !== alertSharedNum(n, "minMissPct", ALERT_DEFAULTS.minMissPct)) o.minMissPct = next.minMissPct;
+        if (next.minMissTokens !== alertSharedNum(n, "minMissTokens", ALERT_DEFAULTS.minMissTokens)) o.minMissTokens = next.minMissTokens;
+      }
+      if (Object.keys(o).length) evs[kind] = o; else delete evs[kind];
+    }
+    if (!Object.keys(evs).length) delete n.events;
+  });
+}
+
+// A number inside the condition sentence, so the sentence reads as one line of
+// prose instead of a grid of unlabelled boxes.
+function alertNumInput(kind, field, value, opt) {
+  const o = opt || {};
+  return "<input class='alert-num' type='number' min='" + (o.min == null ? 0 : o.min) + "'" + (o.max == null ? "" : " max='" + o.max + "'") +
+    " value='" + esc(value) + "' data-alert-kind-num='" + esc(kind) + "' data-alert-field='" + esc(field) + "'" +
+    " aria-label='" + esc((ALERT_NUM_FIELDS[field] ? ALERT_NUM_FIELDS[field].label : field) + " for " + kind) + "'>";
+}
+
+function alertScopeSelect(kind, scope, scopes) {
+  return "<select class='alert-scope' data-alert-kind-scope='" + esc(kind) + "' aria-label='what a run is grouped by for " + esc(kind) + "'>" +
+    scopes.map((s) => "<option value='" + esc(s) + "'" + (scope === s ? " selected" : "") + ">" + esc(s) + "</option>").join("") + "</select>";
+}
+
+// The sentence shown for one event: what has to happen before a push goes out.
+function alertCondition(k, n) {
+  const c = alertKindCfg(n, k.id);
+  if (c.mode === "off") return "<span class='alert-cond off'>Never sent.</span>";
+  const bits = [];
+  if (c.mode === "repeated") {
+    bits.push("after " + alertNumInput(k.id, "minEvents", c.minEvents, { min: 1 }) + " events in " + alertNumInput(k.id, "windowMin", c.windowMin, { min: 1 }) + " min");
+    if (k.scopes.length > 1) bits.push("on the same " + alertScopeSelect(k.id, c.scope, k.scopes));
+    else if (k.scopes.length === 1) bits.push("on the same " + esc(k.scopes[0]));
+  } else {
+    bits.push(k.cache ? "on the first qualifying break" : "every time it happens");
+  }
+  if (k.cache) {
+    bits.push("with cache hit under " + alertNumInput(k.id, "minMissPct", c.minMissPct, { min: 0, max: 100 }) + "% and at least " + alertNumInput(k.id, "minMissTokens", c.minMissTokens, { min: 0 }) + " miss tokens");
+  }
+  bits.push((c.mode === "repeated" ? "then quiet for " : "at most one every ") + alertNumInput(k.id, "quietMin", c.quietMin, { min: 0 }) + " min");
+  return "<span class='alert-cond'>" + bits.join(", ") + "</span>";
 }
 
 function renderCfgAlerts() {
@@ -5203,26 +5295,22 @@ function renderCfgAlerts() {
     cfgInjectIcons(host);
     return;
   }
-  const events = n.events || {};
   const master = n.enabled !== false;
-  const live = ALERT_KINDS.filter((k) => events[k.id] !== false).length;
+  const live = ALERT_KINDS.filter((k) => alertKindCfg(n, k.id).mode !== "off").length;
   if (count) count.textContent = master ? live + " of " + ALERT_KINDS.length + " on" : "all off";
 
   const rows = ALERT_KINDS.map((k) => {
-    const on = events[k.id] !== false;
+    const c = alertKindCfg(n, k.id);
+    const mode = "<select class='alert-mode' data-alert-mode='" + esc(k.id) + "' aria-label='When to send " + esc(k.label) + "'>" +
+      ["off", "immediate", "repeated"].map((m) => "<option value='" + m + "'" + (c.mode === m ? " selected" : "") + ">" + esc(ALERT_MODE_LABEL[m]) + "</option>").join("") +
+      "</select>";
     return "<tr>" +
       "<td><div class='cfg-td-name'>" + esc(k.label) + "</div><div class='cfg-td-sub' style='font-family:inherit'>" + esc(k.note) + "</div></td>" +
-      "<td><label class='check'><input type='checkbox' data-alert-kind='" + esc(k.id) + "'" + (on ? " checked" : "") + " aria-label='Send " + esc(k.label) + "'> " + (on ? "Sent" : "Off") + "</label></td>" +
+      "<td>" + mode + "</td>" +
+      "<td>" + alertCondition(k, n) + "</td>" +
       "<td class='actions'><button class='cfg-iconbtn' data-alert-test='" + esc(k.id) + "' data-ic='bell' title='Send one real test push for this event' aria-label='Send a test push for " + esc(k.label) + "'></button></td>" +
       "</tr>";
   }).join("");
-
-  const fields = ALERT_FIELDS.map((f) =>
-    "<label class='alerts-field'><span class='lbl'>" + esc(f.label) + "</span>" +
-    "<input class='cfg-inline-input' type='number' min='" + f.min + "'" + (f.max == null ? "" : " max='" + f.max + "'") +
-    " value='" + esc(alertsEffective(n, f)) + "' data-alert-num='" + esc(f.key) + "' aria-label='" + esc(f.label) + "'>" +
-    "<span class='hint'>" + esc(f.hint) + "</span></label>"
-  ).join("");
 
   host.innerHTML =
     "<div class='alerts-grid'>" +
@@ -5231,9 +5319,7 @@ function renderCfgAlerts() {
       "<label class='alerts-field'><span class='lbl'>ntfy server</span><input class='cfg-inline-input' id='alertsBase' value='" + esc(n.baseUrl || ALERT_DEFAULTS.baseUrl) + "' spellcheck='false' autocomplete='off' aria-label='ntfy server'><span class='hint'>The ntfy host that receives the push.</span></label>" +
     "</div>" +
     (master ? "" : "<div class='cfg-issues warn'>" + ICONS.warn + "<div>Notifications are switched off at the top, so nothing is pushed whatever the rows below say.</div></div>") +
-    "<div class='cfg-wrap'><table class='cfg-table'>" + cfgTableHead(["Event", "Push", "Test"]) + "<tbody>" + rows + "</tbody></table></div>" +
-    "<div class='cfg-subhead'>Cache break rule</div>" +
-    "<div class='alerts-grid'>" + fields + "</div>" +
+    "<div class='cfg-wrap'><table class='cfg-table'>" + cfgTableHead(["Event", "Send when", "Condition", "Test"]) + "<tbody>" + rows + "</tbody></table></div>" +
     "<div class='alerts-state' id='alertsMsg' role='status'></div>";
   cfgInjectIcons(host);
 }
@@ -5262,25 +5348,20 @@ $("alertsBody").addEventListener("change", (ev) => {
   if (t.id === "alertsMaster") { cfgMutate((d) => { if (t.checked) delete d.alerts.ntfy.enabled; else d.alerts.ntfy.enabled = false; }); return; }
   if (t.id === "alertsTopic") { cfgMutate((d) => { d.alerts.ntfy.topic = t.value.trim(); }); return; }
   if (t.id === "alertsBase") { cfgMutate((d) => { const v = t.value.trim(); if (v) d.alerts.ntfy.baseUrl = v; else delete d.alerts.ntfy.baseUrl; }); return; }
-  if (t.dataset.alertKind) {
-    const kind = t.dataset.alertKind;
-    cfgMutate((d) => {
-      const evs = d.alerts.ntfy.events || (d.alerts.ntfy.events = {});
-      if (t.checked) delete evs[kind]; else evs[kind] = false;
-      if (!Object.keys(evs).length) delete d.alerts.ntfy.events;
-    });
-    return;
-  }
-  if (t.dataset.alertNum) {
-    const key = t.dataset.alertNum;
-    const f = ALERT_FIELDS.find((x) => x.key === key);
+  if (t.dataset.alertMode) { alertsSetKind(t.dataset.alertMode, { mode: t.value }); return; }
+  if (t.dataset.alertKindScope) { alertsSetKind(t.dataset.alertKindScope, { scope: t.value }); return; }
+  if (t.dataset.alertKindNum) {
+    const kind = t.dataset.alertKindNum;
+    const field = t.dataset.alertField;
+    const f = ALERT_NUM_FIELDS[field];
     const raw = t.value.trim();
-    cfgMutate((d) => {
-      if (raw === "") { delete d.alerts.ntfy[key]; return; }
-      const num = Number(raw);
-      if (!isFinite(num)) { delete d.alerts.ntfy[key]; return; }
-      d.alerts.ntfy[key] = f && f.minutes ? Math.round(num * 60000) : num;
-    });
+    // An empty or unreadable box falls back to the value already in effect
+    // rather than writing a zero nobody asked for.
+    const cur = alertKindCfg(alertsNtfy(), kind)[field];
+    const num = raw === "" ? cur : Number(raw);
+    if (!isFinite(num)) { alertsSetKind(kind, {}); return; }
+    alertsSetKind(kind, { [field]: num });
+    return;
   }
 });
 
