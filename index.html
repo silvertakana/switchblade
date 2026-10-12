@@ -378,6 +378,47 @@
   .cfg-footnote { padding: 16px; color: var(--faint); font-size: 12px; text-align: center; }
   .cfg-inline-input { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 6px 10px; font-family: var(--mono); font-size: 12px; width: 220px; }
   .cfg-inline-input:focus { outline: none; border-color: #3d3d3d; box-shadow: 0 0 0 3px rgba(255,255,255,.05); }
+/* Notifications panel. Every event is a row: what it is on the left, how it is
+   sent on the right, and its condition underneath as a strip of labelled fields.
+   The strip wraps, so one markup works from a phone to a wide window. */
+.alert-master { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; padding: 14px 16px; border-bottom: 1px solid var(--border); }
+.alert-master .check { color: var(--text); font-size: 13.5px; }
+.alert-conn { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 22px; padding: 15px 16px; border-bottom: 1px solid var(--border); }
+.alert-hint { color: var(--faint); font-size: 11.5px; line-height: 1.45; max-width: 62ch; }
+.alert-row { padding: 14px 16px 15px; border-bottom: 1px solid var(--border); }
+.alert-row:last-child { border-bottom: none; }
+.alert-row.off { background: rgba(255,255,255,.014); }
+.alert-head { display: flex; align-items: flex-start; gap: 10px 18px; flex-wrap: wrap; }
+.alert-id { flex: 1 1 250px; min-width: 0; }
+.alert-name { font-family: var(--data-font); font-size: 12.5px; font-weight: 600; color: var(--text); }
+.alert-note { color: var(--muted); font-size: 12px; margin-top: 3px; line-height: 1.45; max-width: 68ch; }
+.alert-ctl { display: flex; align-items: center; gap: 8px; flex-shrink: 0; margin-left: auto; }
+.alert-field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.alert-field > .albl { font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .7px; color: var(--faint); }
+.alert-field .cfg-inline-input { width: 100%; }
+.alert-val { display: flex; align-items: center; gap: 5px; }
+.alert-op, .alert-unit { font-family: var(--data-font); font-size: 12.5px; color: var(--muted); }
+.alert-unit { color: var(--faint); }
+.alert-params { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px 22px; margin-top: 12px; }
+.alert-static { font-family: var(--data-font); font-size: 12.5px; color: var(--muted); padding: 6px 0; }
+.alert-off { color: var(--faint); font-size: 12px; margin-top: 10px; }
+.alert-num { width: 74px; padding: 5px 6px; background: var(--panel-2); border: 1px solid var(--border); color: var(--text); border-radius: 7px; font-family: var(--data-font); font-size: 12.5px; text-align: center; }
+.alert-num:focus { outline: none; border-color: #3d3d3d; box-shadow: 0 0 0 3px rgba(255,255,255,.05); }
+.alert-scope { padding-right: 6px; }
+.alert-scope, .alert-mode { padding: 5px 9px; background: var(--panel-2); border: 1px solid var(--border); color: var(--text); border-radius: 7px; font-size: 12.5px; }
+.alert-mode { min-width: 128px; }
+.alert-scope:focus, .alert-mode:focus { outline: none; border-color: #3d3d3d; box-shadow: 0 0 0 3px rgba(255,255,255,.05); }
+.alert-test { display: inline-flex; align-items: center; gap: 6px; padding: 5px 10px; background: var(--panel-2); border: 1px solid var(--border); color: var(--muted); border-radius: 7px; font-size: 12px; }
+.alert-test:hover { color: var(--text); border-color: var(--faint); }
+.alert-test svg { width: 13px; height: 13px; margin: 0; }
+.alerts-state { padding: 12px 16px; color: var(--muted); font-size: 12.5px; }
+.alerts-state:empty { display: none; }
+.alerts-state.ok { color: var(--green); }
+.alerts-state.err { color: var(--red); }
+@media (max-width: 720px) {
+  .alert-conn { grid-template-columns: 1fr; }
+  .alert-ctl { margin-left: 0; }
+}
 
   /* ---- config editor: environment (managed secrets store) ---- */
   /* Values come from three layers and only one of them is ours, so the source
@@ -1264,6 +1305,19 @@
 
       <section class="cfg-sec">
         <div class="cfg-sec-head">
+          <span class="ico" data-icon="zap"></span>
+          <div>
+            <h3>Notifications</h3>
+            <div class="desc">Phone pushes over <b>ntfy</b>. Every event chooses its own condition: <b>every event</b>, or <b>repeated issue</b> (a run of them inside a window), or off. A cache break defaults to a repeated issue, so opening a new conversation stays silent.</div>
+          </div>
+          <span class="count" id="cfgCountAlerts">-</span>
+        </div>
+        <div class="cfg-sec-body" id="alertsBody"></div>
+        <div class="cfg-sec-foot"><span class="cfg-footnote" style="padding:0;text-align:left"><b>Test</b> sends one real push for that event and ignores its condition, so you can prove the pipe works without waiting for an incident.</span></div>
+      </section>
+
+      <section class="cfg-sec">
+        <div class="cfg-sec-head">
           <span class="ico" data-icon="key"></span>
           <div>
             <h3>Environment</h3>
@@ -1681,6 +1735,7 @@ const ICONS = {
   refresh: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>',
   send: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>',
   zap: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>',
+  bell: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>',
   hash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="9" x2="20" y2="9"/><line x1="4" y1="15" x2="20" y2="15"/><line x1="10" y1="3" x2="8" y2="21"/><line x1="16" y1="3" x2="14" y2="21"/></svg>',
   gauge: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></svg>',
   database: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>',
@@ -4005,7 +4060,9 @@ async function cfgSave() {
     cfg.errors = [{ path: "", message: "Save failed: " + e.message }];
     renderConfig();
   } finally {
-    btn.disabled = false;
+    // A successful save leaves nothing to save: let the renderer's own rule
+    // decide, instead of re-enabling a button with no work behind it.
+    btn.disabled = !cfg.dirty;
   }
 }
 
@@ -4108,6 +4165,7 @@ function renderConfig() {
     renderCfgModels();
     renderCfgPresets();
     renderCfgSettings();
+    renderCfgAlerts();
     renderEnv();
   }
   renderCfgSnapshots();
@@ -4281,7 +4339,7 @@ function renderCfgSettings() {
     simple("uiPasswordEnv", "key", "UI password env", "Env var NAME for the dashboard login") +
     block("pricing", "dollar", "Pricing", "Off-peak multiplier and peak windows used by the cost model") +
     block("missCapture", "database", "Cache miss capture", "Payload capture on low-cache-hit requests") +
-    block("alerts", "zap", "Alerts", "ntfy pushes when the cache hit rate drops") +
+
     block("backoff", "clock", "Backoff", "Per-failure-class cooling windows") +
     "</tbody>";
   cfgInjectIcons($("cfgSettingsTable"));
@@ -5122,6 +5180,260 @@ $("cfgModalBg").addEventListener("click", (ev) => { if (ev.target === $("cfgModa
 document.addEventListener("keydown", (ev) => {
   if (ev.key === "Escape" && cfg.modal) cfgCloseModal();
 });
+// ---- config editor: notifications (alerts.ntfy) --------------------------------
+//
+// The friendly editor for the `alerts` block. It mutates cfg.draft.alerts.ntfy
+// like every other form editor, so Save, Validate, snapshots and the lost-update
+// guard all apply unchanged; the raw JSON view stays the escape hatch for keys
+// this panel does not model. A switch writes events[kind] = false instead of
+// deleting anything, because the same block carries the topic.
+
+// `scopes` lists what this kind's payload can actually group a run by, so the
+// panel never offers "same model" for an event that does not carry one. `global`
+// is offered everywhere: it is the absence of grouping, not a field.
+const ALERT_SCOPES = ["global", "backend", "model", "conversation"];
+const ALERT_KINDS = [
+  { id: "cache_miss", label: "Cache break", note: "A request mostly missed the prompt cache.", cache: true, scopes: ["global", "backend", "model", "conversation"] },
+  { id: "weekly_limit", label: "Weekly usage limit", note: "A backend hit its weekly cap and pinned itself until the reset.", scopes: ["global", "backend"] },
+  { id: "all_cooling", label: "All backends cooling", note: "Every backend is cooling, so requests fail with 503.", scopes: ["global"] },
+  { id: "request_exhausted", label: "Request failed everywhere", note: "One request failed on every provider it tried.", scopes: ["global", "model", "conversation"] },
+  { id: "relay_cut", label: "Stream cut mid-relay", note: "The response stream ended before the answer was finished.", scopes: ["global", "backend", "model", "conversation"] },
+];
+
+const ALERT_DEFAULTS = { baseUrl: "https://ntfy.sh", minMissPct: 50, minMissTokens: 20000, minBreaks: 5, windowMs: 1800000, cooldownMs: 600000 };
+
+// Panel units, mapped to the stored key. Both windows are entered in minutes
+// because milliseconds are not a unit anyone counts alerts in.
+const ALERT_NUM_FIELDS = {
+  minEvents: { ms: false, label: "events in the run" },
+  windowMin: { ms: true, label: "window in minutes" },
+  minMissPct: { ms: false, label: "cache hit percentage" },
+  minMissTokens: { ms: false, label: "minimum miss tokens" },
+  quietMin: { ms: true, label: "quiet period in minutes" },
+};
+const ALERT_MODE_LABEL = { off: "Off", immediate: "Every event", repeated: "Repeated issue" };
+const ALERT_REPEAT_BY_DEFAULT = { cache_miss: true }; // every other kind sends on each event
+
+function alertsNtfy() {
+  return (cfg.draft && cfg.draft.alerts && cfg.draft.alerts.ntfy) || null;
+}
+
+function alertNum(v, d) {
+  if (v === null || v === undefined || v === "") return d;
+  const x = Number(v);
+  return isFinite(x) ? x : d;
+}
+
+function alertSharedNum(n, key, def) { return alertNum(n && n[key], def); }
+
+// Mirrors alertSettings() in server.mjs. Keep the two in step: this one only
+// has to DISPLAY the resolved values, but a drift here would show the operator a
+// condition the router is not actually using.
+function alertKindCfg(n, kind) {
+  const raw = (n.events || {})[kind];
+  const o = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+  const pick = (k, shared) => alertNum(o[k] !== undefined ? o[k] : shared, alertNum(shared, 0));
+  const defMode = ALERT_REPEAT_BY_DEFAULT[kind] ? "repeated" : "immediate";
+  return {
+    off: raw === false,
+    mode: raw === false ? "off" : (o.mode === "immediate" || o.mode === "repeated" ? o.mode : defMode),
+    minEvents: Math.max(1, Math.floor(pick("minEvents", alertSharedNum(n, "minBreaks", ALERT_DEFAULTS.minBreaks)))),
+    windowMin: Math.round(pick("windowMs", alertSharedNum(n, "windowMs", ALERT_DEFAULTS.windowMs)) / 6000) / 10,
+    scope: ALERT_SCOPES.indexOf(o.scope) >= 0 ? o.scope : "backend",
+    minMissPct: Math.min(100, Math.max(0, pick("minMissPct", alertSharedNum(n, "minMissPct", ALERT_DEFAULTS.minMissPct)))),
+    minMissTokens: Math.max(0, pick("minMissTokens", alertSharedNum(n, "minMissTokens", ALERT_DEFAULTS.minMissTokens))),
+    quietMin: Math.max(0, pick("cooldownMs", alertSharedNum(n, "cooldownMs", ALERT_DEFAULTS.cooldownMs)) / 6000) / 10,
+  };
+}
+
+// Persist one event's condition. Keys that only restate the shared default are
+// left out, so the file stays "the defaults, plus deliberate deviations" instead
+// of one frozen copy per kind.
+function alertsSetKind(kind, patch) {
+  cfgMutate((d) => {
+    const n = d.alerts.ntfy;
+    const next = Object.assign(alertKindCfg(n, kind), patch);
+    const evs = n.events || (n.events = {});
+    if (next.mode === "off") {
+      evs[kind] = false;
+    } else {
+      const defMode = ALERT_REPEAT_BY_DEFAULT[kind] ? "repeated" : "immediate";
+      const o = {};
+      if (next.mode !== defMode) o.mode = next.mode;
+      if (next.minEvents !== alertSharedNum(n, "minBreaks", ALERT_DEFAULTS.minBreaks)) o.minEvents = next.minEvents;
+      if (Math.round(next.windowMin * 60000) !== alertSharedNum(n, "windowMs", ALERT_DEFAULTS.windowMs)) o.windowMs = Math.round(next.windowMin * 60000);
+      if (next.scope !== "backend") o.scope = next.scope;
+      if (Math.round(next.quietMin * 60000) !== alertSharedNum(n, "cooldownMs", ALERT_DEFAULTS.cooldownMs)) o.cooldownMs = Math.round(next.quietMin * 60000);
+      if (kind === "cache_miss") {
+        if (next.minMissPct !== alertSharedNum(n, "minMissPct", ALERT_DEFAULTS.minMissPct)) o.minMissPct = next.minMissPct;
+        if (next.minMissTokens !== alertSharedNum(n, "minMissTokens", ALERT_DEFAULTS.minMissTokens)) o.minMissTokens = next.minMissTokens;
+      }
+      if (Object.keys(o).length) evs[kind] = o; else delete evs[kind];
+    }
+    if (!Object.keys(evs).length) delete n.events;
+  });
+}
+
+// A number in a labelled field. The label above the box carries the meaning,
+// which is why these read as named controls rather than as boxes dropped into a
+// sentence: a sentence with six inputs in it wraps somewhere different on every
+// window width and stops being readable.
+function alertNumInput(kind, field, value, opt) {
+  const o = opt || {};
+  const f = ALERT_NUM_FIELDS[field] || { label: field };
+  return "<input class='alert-num' type='number' inputmode='numeric' min='" + (o.min == null ? 0 : o.min) + "'" +
+    (o.max == null ? "" : " max='" + o.max + "'") +
+    " value='" + esc(value) + "' data-alert-kind-num='" + esc(kind) + "' data-alert-field='" + esc(field) + "'" +
+    " aria-label='" + esc(f.label + " for " + kind) + "'>";
+}
+
+// One labelled control. `op` and `unit` are the little glyphs that bracket the
+// box (a "<" before the cache percentage, a "min" after the window), so the label
+// itself can stay short enough to fit on one line.
+function alertField(label, control, opt) {
+  const o = opt || {};
+  return "<div class='alert-field'>" +
+    "<span class='albl'>" + esc(label) + "</span>" +
+    "<span class='alert-val'>" +
+      (o.op ? "<span class='alert-op'>" + esc(o.op) + "</span>" : "") + control +
+      (o.unit ? "<span class='alert-unit'>" + esc(o.unit) + "</span>" : "") +
+    "</span></div>";
+}
+
+const ALERT_SCOPE_LABEL = { global: "global", backend: "same backend", model: "same model", conversation: "same conversation" };
+
+// The controls for one event: what has to happen before a push goes out. An
+// event that is switched off has nothing to tune, so it gets one line of prose.
+function alertParams(k, n) {
+  const c = alertKindCfg(n, k.id);
+  if (c.mode === "off") return "<div class='alert-off'>Switched off. This event never sends a push.</div>";
+  const out = [];
+  if (c.mode === "repeated") {
+    out.push(alertField("Events", alertNumInput(k.id, "minEvents", c.minEvents, { min: 1 })));
+    out.push(alertField("Window", alertNumInput(k.id, "windowMin", c.windowMin, { min: 1 }), { unit: "min" }));
+    // Only offer a choice the payload can actually answer: a kind that carries
+    // no backend has one global run, and saying so beats a select with one item.
+    const scope = k.scopes.length > 1
+      ? "<select class='alert-scope' data-alert-kind-scope='" + esc(k.id) + "' aria-label='what a run is grouped by for " + esc(k.label) + "'>" +
+        k.scopes.map((s) => "<option value='" + esc(s) + "'" + (c.scope === s ? " selected" : "") + ">" + esc(ALERT_SCOPE_LABEL[s] || s) + "</option>").join("") + "</select>"
+      : "<span class='alert-static'>" + esc(ALERT_SCOPE_LABEL[k.scopes[0]] || k.scopes[0] || "global") + "</span>";
+    out.push(alertField("Grouped by", scope));
+  }
+  if (k.cache) {
+    out.push(alertField("Cache hit", alertNumInput(k.id, "minMissPct", c.minMissPct, { min: 0, max: 100 }), { op: "<", unit: "%" }));
+    out.push(alertField("Miss tokens", alertNumInput(k.id, "minMissTokens", c.minMissTokens, { min: 0 }), { op: "\u2265" }));
+  }
+  out.push(alertField("At most one per", alertNumInput(k.id, "quietMin", c.quietMin, { min: 0 }), { unit: "min" }));
+  return "<div class='alert-params'>" + out.join("") + "</div>";
+}
+
+function renderCfgAlerts() {
+  const host = $("alertsBody");
+  if (!host) return;
+  const n = alertsNtfy();
+  const count = $("cfgCountAlerts");
+  if (!n) {
+    if (count) count.textContent = "off";
+    host.innerHTML =
+      "<div class='alerts-state'>No notifications are configured, so nothing is pushed anywhere." +
+      "<div style='margin-top:10px'><button id='alertsEnable' class='primary' data-icon='plus' type='button'>Turn on notifications</button></div></div>";
+    cfgInjectIcons(host);
+    return;
+  }
+  const master = n.enabled !== false;
+  const live = ALERT_KINDS.filter((k) => alertKindCfg(n, k.id).mode !== "off").length;
+  if (count) count.textContent = master ? live + " of " + ALERT_KINDS.length + " on" : "all off";
+
+  const rows = ALERT_KINDS.map((k) => {
+    const c = alertKindCfg(n, k.id);
+    const mode = "<select class='alert-mode' data-alert-mode='" + esc(k.id) + "' aria-label='When to send " + esc(k.label) + "'>" +
+      ["off", "immediate", "repeated"].map((m) => "<option value='" + m + "'" + (c.mode === m ? " selected" : "") + ">" + esc(ALERT_MODE_LABEL[m]) + "</option>").join("") +
+      "</select>";
+    return "<div class='alert-row" + (c.mode === "off" ? " off" : "") + "'>" +
+      "<div class='alert-head'>" +
+        "<div class='alert-id'><div class='alert-name'>" + esc(k.label) + "</div><div class='alert-note'>" + esc(k.note) + "</div></div>" +
+        "<div class='alert-ctl'>" + mode +
+          "<button type='button' class='alert-test' data-alert-test='" + esc(k.id) + "' aria-label='Send a test push for " + esc(k.label) + "'>" +
+          "<span data-ic='bell'></span>Test</button>" +
+        "</div>" +
+      "</div>" +
+      alertParams(k, n) +
+    "</div>";
+  }).join("");
+
+  host.innerHTML =
+    "<div class='alert-master'>" +
+      "<label class='check'><input type='checkbox' id='alertsMaster'" + (master ? " checked" : "") + "> <b>Send notifications</b></label>" +
+      "<span class='alert-hint'>Off silences every event below, whatever its condition says.</span>" +
+    "</div>" +
+    "<div class='alert-conn'>" +
+      "<label class='alert-field'><span class='albl'>ntfy topic</span>" +
+        "<input class='cfg-inline-input' id='alertsTopic' value='" + esc(n.topic || "") + "' spellcheck='false' autocomplete='off' aria-label='ntfy topic'>" +
+        "<span class='alert-hint'>Anyone who knows this topic can read it, so treat it as public.</span></label>" +
+      "<label class='alert-field'><span class='albl'>ntfy server</span>" +
+        "<input class='cfg-inline-input' id='alertsBase' value='" + esc(n.baseUrl || ALERT_DEFAULTS.baseUrl) + "' spellcheck='false' autocomplete='off' aria-label='ntfy server'>" +
+        "<span class='alert-hint'>The ntfy host that receives the push.</span></label>" +
+    "</div>" +
+    (master ? "" : "<div class='cfg-issues warn'>" + ICONS.warn + "<div>Notifications are switched off above, so nothing is pushed whatever these conditions say.</div></div>") +
+    "<div class='alert-list'>" + rows + "</div>" +
+    "<div class='alerts-state' id='alertsMsg' role='status'></div>";
+  cfgInjectIcons(host);
+}
+
+async function alertsSendTest(kind, btn) {
+  const say = (cls, text) => { const m = $("alertsMsg"); if (m) { m.className = "alerts-state " + cls; m.textContent = text; } };
+  say("", "Sending a test push...");
+  btn.disabled = true;
+  try {
+    const r = await cfgPost("/api/alerts/test", { kind });
+    if (r.status === 200 && r.payload && r.payload.ok) say("ok", "Sent a test push (ntfy answered HTTP " + r.payload.status + "). Check the phone.");
+    else say("err", (r.payload && r.payload.error && r.payload.error.message) || "The test failed (HTTP " + r.status + ").");
+  } catch (e) {
+    say("err", "The test failed: " + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// Every control writes the draft and re-renders, so the panel always shows what
+// the file now says. `change` (not `input`) keeps a re-render from stealing
+// focus mid-keystroke.
+$("alertsBody").addEventListener("change", (ev) => {
+  const t = ev.target;
+  if (!alertsNtfy()) return;
+  if (t.id === "alertsMaster") { cfgMutate((d) => { if (t.checked) delete d.alerts.ntfy.enabled; else d.alerts.ntfy.enabled = false; }); return; }
+  if (t.id === "alertsTopic") { cfgMutate((d) => { d.alerts.ntfy.topic = t.value.trim(); }); return; }
+  if (t.id === "alertsBase") { cfgMutate((d) => { const v = t.value.trim(); if (v) d.alerts.ntfy.baseUrl = v; else delete d.alerts.ntfy.baseUrl; }); return; }
+  if (t.dataset.alertMode) { alertsSetKind(t.dataset.alertMode, { mode: t.value }); return; }
+  if (t.dataset.alertKindScope) { alertsSetKind(t.dataset.alertKindScope, { scope: t.value }); return; }
+  if (t.dataset.alertKindNum) {
+    const kind = t.dataset.alertKindNum;
+    const field = t.dataset.alertField;
+    const f = ALERT_NUM_FIELDS[field];
+    const raw = t.value.trim();
+    // An empty or unreadable box falls back to the value already in effect
+    // rather than writing a zero nobody asked for.
+    const cur = alertKindCfg(alertsNtfy(), kind)[field];
+    const num = raw === "" ? cur : Number(raw);
+    if (!isFinite(num)) { alertsSetKind(kind, {}); return; }
+    alertsSetKind(kind, { [field]: num });
+    return;
+  }
+});
+
+$("alertsBody").addEventListener("click", (ev) => {
+  const btn = ev.target.closest("button");
+  if (!btn) return;
+  if (btn.id === "alertsEnable") {
+    cfgMutate((d) => {
+      d.alerts = d.alerts || {};
+      d.alerts.ntfy = Object.assign({ topic: "" }, ALERT_DEFAULTS, d.alerts.ntfy || {});
+    });
+    return;
+  }
+  if (btn.dataset.alertTest) alertsSendTest(btn.dataset.alertTest, btn);
+});
+
 // Settings inputs are plain inline fields rather than modal entries.
 $("cfgSettingsTable").addEventListener("input", (ev) => {
   const input = ev.target.closest("[data-cfg-set]");
