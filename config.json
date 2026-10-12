@@ -994,7 +994,10 @@
       "minMissTokens": 20000,
       "minBreaks": 5,
       "windowMs": 1800000,
-      "cooldownMs": 600000
+      "cooldownMs": 600000,
+      "events": {
+        "relay_cut": false
+      }
     }
   }
 }

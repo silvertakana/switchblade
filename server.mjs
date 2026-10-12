@@ -771,6 +771,7 @@ function alertMessage(kind, f) {
 function buildAlert(cfg, kind, fields) {
   const n = cfg.alerts && cfg.alerts.ntfy;
   if (!n || !n.topic || !ALERT_DEFS[kind]) return null;
+  if (n.enabled === false) return null; // master switch: nothing is sent at all
   const events = n.events || {};
   if (events[kind] === false) return null;
   const message = alertMessage(kind, fields);
@@ -798,7 +799,7 @@ function buildAlert(cfg, kind, fields) {
 // across backends is not "this backend is breaking".
 function noteCacheMiss(cfg, fields, now = Date.now()) {
   const n = cfg.alerts && cfg.alerts.ntfy;
-  if (!n || !n.topic) return null;
+  if (!n || !n.topic || n.enabled === false) return null;
   const minBreaks = Math.max(1, Math.floor(Number(n.minBreaks) || 5));
   const windowMs = Math.max(1, Number(n.windowMs) || 1800000);
   const key = fields.backend || "unknown";
@@ -812,6 +813,37 @@ function noteCacheMiss(cfg, fields, now = Date.now()) {
   // kept, so the very next qualifying miss can still fire it.
   if (a) cacheBreakStreaks.set(key, []);
   return a;
+}
+
+// Sample fields per kind, so the dashboard can send ONE real push of any kind
+// without waiting for a real incident. The values are obviously synthetic
+// ("sample"), so a test push is never mistaken for a live one.
+const ALERT_SAMPLES = {
+  cache_miss: { backend: "sample-backend", cacheHitPct: 4, missTokens: 82000, promptTokens: 85000, model: "sample-model", session: "sample-session", breakCount: 5, windowMin: 30 },
+  weekly_limit: { backend: "sample-backend", days: 7 },
+  all_cooling: { manualCooled: 2 },
+  request_exhausted: { callId: "sample000", model: "sample-model", error: "sample failure" },
+  relay_cut: { backend: "sample-backend", model: "sample-model", error: "sample cut" },
+};
+
+// Build (never send) a test push. Deliberately bypasses the master switch, the
+// per-kind events map, the cooldown and the cache-break pattern gate: a test
+// that the switches can silence would prove nothing about whether ntfy works.
+function buildTestAlert(cfg, kind) {
+  const n = cfg.alerts && cfg.alerts.ntfy;
+  if (!n || !n.topic || !ALERT_DEFS[kind]) return null;
+  const message = alertMessage(kind, ALERT_SAMPLES[kind] || {});
+  if (!message) return null;
+  return {
+    url: (n.baseUrl || NTFY_DEFAULT_BASE).replace(/\/$/, ""),
+    body: {
+      topic: n.topic,
+      title: ALERT_DEFS[kind].title,
+      message: "[test] " + message,
+      tags: [ALERT_DEFS[kind].tag],
+      priority: ALERT_DEFS[kind].priority,
+    },
+  };
 }
 
 function sendAlert(a) {
@@ -2903,7 +2935,7 @@ function requireAuth(cfg, req) {
   const url = req.url.split("?")[0];
   const p = (cfg.prefix || "/v1").replace(/\/$/, "");
   const isChat = url === p + "/chat/completions";
-  if (!isChat && !url.startsWith("/admin") && !url.startsWith("/api/config") && !url.startsWith("/api/keys") && !url.startsWith("/api/env")) return null;
+  if (!isChat && !url.startsWith("/admin") && !url.startsWith("/api/config") && !url.startsWith("/api/keys") && !url.startsWith("/api/env") && !url.startsWith("/api/alerts")) return null;
   const expected = process.env[name];
   const unauthorized = newError(401, JSON.stringify({ error: { message: "authentication required", type: "authentication_error" } }));
   if (!expected) {
@@ -3086,6 +3118,31 @@ function server() {
           envNames: envNames(),
         })
       );
+    }
+
+    // One real push of a chosen kind, so the dashboard can prove the pipe works
+    // on demand instead of waiting for an incident. Awaited (unlike the request
+    // path) so the UI can report the result of the push.
+    if (req.method === "POST" && url === "/api/alerts/test") {
+      const body = await readJsonBody(req);
+      if (body.error) return writeError(res, body.error);
+      const kind = String((body.value || {}).kind || "cache_miss");
+      const a = buildTestAlert(cfg, kind);
+      if (!a) {
+        return writeError(res, newError(400, JSON.stringify({ error: { message: "no alerts.ntfy block with a topic, or unknown kind '" + kind + "'", type: "invalid_request_error" } })));
+      }
+      try {
+        const up = await fetch(a.url, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(a.body),
+          signal: AbortSignal.timeout(5000),
+        });
+        res.writeHead(200, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ ok: true, kind, status: up.status, title: a.body.title, message: a.body.message }));
+      } catch (e) {
+        return writeError(res, newError(502, JSON.stringify({ error: { message: "the push could not be sent: " + String((e && e.message) || e), type: "upstream_error" } })));
+      }
     }
 
     if (req.method === "POST" && url === "/api/config") {
@@ -3539,4 +3596,4 @@ if (isMain) {
   });
 }
 
-export { candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, noteCacheMiss, resetAlertCooldowns, computeCost, writeConfigAtomic };
+export { candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, buildTestAlert, noteCacheMiss, resetAlertCooldowns, computeCost, writeConfigAtomic };

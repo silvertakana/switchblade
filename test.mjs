@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { spawn } from "node:child_process";
 // Unit-level imports: server.mjs only starts the server when run as a script,
 // so importing it here gives direct access to strategy selection for tests.
-import { candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, noteCacheMiss, resetAlertCooldowns, computeCost, writeConfigAtomic } from "./server.mjs";
+import { candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, buildTestAlert, noteCacheMiss, resetAlertCooldowns, computeCost, writeConfigAtomic } from "./server.mjs";
 
 const HOST = "127.0.0.1";
 let passed = 0;
@@ -1678,6 +1678,52 @@ async function main() {
     resetAlertCooldowns();
   }
 
+  // z36) unit-level: the notification switches the dashboard exposes - the
+  //      master kill switch and the test-push builder. A test push must bypass
+  //      every gate, because a test the switches can silence proves nothing.
+  {
+    resetAlertCooldowns();
+    const base = { baseUrl: "http://x", topic: "t", minMissPct: 50, minMissTokens: 0 };
+    const fields = { backend: "b1", cacheHitPct: 10, missTokens: 100, promptTokens: 1000, model: "m", session: "s", days: 7, manualCooled: 1, callId: "c1", error: "e" };
+    const kinds = ["cache_miss", "weekly_limit", "all_cooling", "request_exhausted", "relay_cut"];
+    const off = { alerts: { ntfy: { ...base, enabled: false } } };
+    assert(
+      kinds.every((k) => buildAlert(off, k, fields) === null),
+      "z36a) enabled:false -> every kind stays silent"
+    );
+    assert(noteCacheMiss(off, fields, 1000) === null, "z36b) enabled:false -> the cache-break gate stays silent too");
+    // A disabled block must not bank a run that fires the moment it is switched
+    // back on: the next miss starts a fresh run like any other first miss.
+    const on = { alerts: { ntfy: { ...base, minBreaks: 2, windowMs: 600000 } } };
+    assert(noteCacheMiss(on, fields, 2000) === null, "z36c) switching back on starts a fresh run, not a banked one");
+    resetAlertCooldowns();
+
+    // The dashboard's test push.
+    assert(buildTestAlert({}, "cache_miss") === null, "z36d) no alerts.ntfy block -> no test push");
+    assert(buildTestAlert(on, "nope") === null, "z36e) unknown kind -> no test push");
+    const cfgOff = { alerts: { ntfy: { ...base, enabled: false, events: { relay_cut: false } } } };
+    const t1 = buildTestAlert(cfgOff, "relay_cut");
+    assert(
+      t1 && t1.url === "http://x" && t1.body.topic === "t" && typeof t1.body.message === "string" &&
+      t1.body.message.startsWith("[test]") && t1.body.message.includes("sample-backend"),
+      "z36f) a test push ignores the master switch and the events map, and uses sample fields (msg=" + (t1 && t1.body.message) + ")"
+    );
+    // Every kind is sendable from the panel. The "[test]" prefix - not the
+    // sample values - is what marks a push as synthetic, so the wording of a
+    // real alert is never bent to carry a marker.
+    assert(
+      kinds.every((k) => { const a = buildTestAlert(on, k); return a && a.body.title && typeof a.body.message === "string" && a.body.message.startsWith("[test]") && a.body.message.length > 10; }),
+      "z36g) every kind builds a titled test push marked [test]"
+    );
+    // The per-kind cooldown blocks a real repeat but never a test.
+    resetAlertCooldowns();
+    const cooled = { alerts: { ntfy: { ...base, cooldownMs: 86400000 } } };
+    buildAlert(cooled, "relay_cut", fields);
+    assert(buildAlert(cooled, "relay_cut", fields) === null, "z36h) the cooldown blocks a repeat of the same kind");
+    assert(buildTestAlert(cooled, "relay_cut") !== null, "z36i) ...but never a test push");
+    resetAlertCooldowns();
+  }
+
   // z29) integration: a big cache MISS persists a bounded payload row, and the
   //      ntfy alert waits for a PATTERN - three qualifying misses on the same
   //      backend inside the window - instead of firing on the first one, so a
@@ -1730,7 +1776,7 @@ async function main() {
         "p29b": { strategy: "affinity", models: ["m29b"] },
       },
       backoff: BO,
-      alerts: { ntfy: { baseUrl: `http://${HOST}:${ntfyPort}`, topic: "t29", minMissPct: 50, minMissTokens: 0, minBreaks: 3, windowMs: 600000, cooldownMs: 600000 } },
+      alerts: { ntfy: { baseUrl: `http://${HOST}:${ntfyPort}`, topic: "t29", minMissPct: 50, minMissTokens: 0, minBreaks: 3, windowMs: 600000, cooldownMs: 600000, events: { relay_cut: false } } },
       missCapture: { enabled: true, maxMissPct: 50, minMissTokens: 0, file: "misses.jsonl" },
     };
     const { child: childZ29, base: baseZ29, dir: dirZ29 } = await startRouterCfg(cfgZ29, "KEY_Z29M=k\nKEY_Z29H=k\n");
@@ -1797,6 +1843,19 @@ async function main() {
         (await rows29()).length === 3 && received.length === 1,
         "z29k) 100% hit: misses.jsonl still 3 rows and ntfy count still 1 (rows=" + (await rows29()).length + ", ntfy=" + received.length + ")"
       );
+      // The dashboard's test button. relay_cut is switched OFF in this config
+      // on purpose: a test push must go out anyway, marked [test], or the button
+      // could not prove the pipe works for a kind the user has silenced.
+      const rt = await api(baseZ29, "/api/alerts/test", { body: { kind: "relay_cut" } });
+      const tp = await rt.json();
+      const gotTest = await waitFor(() => received.length >= 2, 2000);
+      assert(
+        rt.status === 200 && tp && tp.ok === true && gotTest &&
+        typeof received[1].message === "string" && received[1].message.startsWith("[test]"),
+        "z29l) POST /api/alerts/test pushes once for a disabled kind, marked [test] (status=" + rt.status + ", received=" + received.length + ")"
+      );
+      const rt2 = await api(baseZ29, "/api/alerts/test", { body: { kind: "nope" } });
+      assert(rt2.status === 400, "z29m) an unknown kind -> 400 (got " + rt2.status + ")");
     } finally {
       childZ29.kill();
       missSrv.close(); hitSrv.close(); ntfySrv.close();

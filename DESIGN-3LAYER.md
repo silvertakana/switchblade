@@ -251,7 +251,9 @@ missing, the router's behavior is byte-identical to before.
   the outgoing payload (see `boundedPayload`), never API keys. Used to make a
   bad-miss night recoverable (low cache-hit percentage = an EARLY cache break).
 - `alerts.ntfy` (object): `baseUrl` (default `https://ntfy.sh`), `topic`
-  (required), `minMissPct` (default 50) / `minMissTokens` (default 20000) for
+  (required), `enabled` (default true; `false` is a master switch that silences
+  every kind regardless of the rest of the block), `minMissPct` (default 50) /
+  `minMissTokens` (default 20000) for
   the `cache_miss` alert threshold, `minBreaks` (default 5) / `windowMs`
   (default 1800000 = 30 min) for the repeat rule below, `cooldownMs` (default
   600000, per-kind), and optional `events` map to disable specific kinds
@@ -270,6 +272,15 @@ missing, the router's behavior is byte-identical to before.
   backends is not "this backend is breaking". A suppressed alert (per-kind
   cooldown, or `events.cache_miss: false`) does NOT clear the run, so the next
   qualifying miss can still fire it.
+- The Config tab's **Notifications** panel is the supported way to edit this
+  block: one master switch, a switch per kind, the `cache_miss` thresholds and
+  the cooldown, written through the ordinary `POST /api/config` path so the
+  snapshot, the revision guard and validation are all unchanged. It also drives
+  `POST /api/alerts/test`, which sends ONE real push of a chosen kind, built
+  from sample fields and prefixed `[test]` in the message. A test deliberately
+  bypasses the master switch, `events`, the per-kind cooldown and the pattern
+  gate: a test the switches can silence would prove nothing about whether ntfy
+  itself works.
 
 ---
 

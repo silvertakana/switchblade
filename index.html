@@ -378,6 +378,17 @@
   .cfg-footnote { padding: 16px; color: var(--faint); font-size: 12px; text-align: center; }
   .cfg-inline-input { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 6px 10px; font-family: var(--mono); font-size: 12px; width: 220px; }
   .cfg-inline-input:focus { outline: none; border-color: #3d3d3d; box-shadow: 0 0 0 3px rgba(255,255,255,.05); }
+.alerts-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(215px, 1fr)); gap: 14px; padding: 14px 16px; }
+.alerts-field { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.alerts-field .lbl { font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .8px; color: var(--faint); }
+.alerts-field .hint { font-size: 11px; color: var(--faint); line-height: 1.45; }
+.alerts-field .cfg-inline-input { width: 100%; }
+.alerts-grid .check { align-self: start; padding-top: 18px; color: var(--text); }
+.cfg-subhead { padding: 14px 16px 0; font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .8px; color: var(--faint); }
+.alerts-state { padding: 12px 16px; color: var(--muted); font-size: 12.5px; }
+.alerts-state:empty { display: none; }
+.alerts-state.ok { color: var(--green); }
+.alerts-state.err { color: var(--red); }
 
   /* ---- config editor: environment (managed secrets store) ---- */
   /* Values come from three layers and only one of them is ours, so the source
@@ -1264,6 +1275,19 @@
 
       <section class="cfg-sec">
         <div class="cfg-sec-head">
+          <span class="ico" data-icon="zap"></span>
+          <div>
+            <h3>Notifications</h3>
+            <div class="desc">Phone pushes over <b>ntfy</b>. Each event can be switched off, and a switched-off event is never sent. Cache breaks are pattern-gated, so opening a new conversation stays silent.</div>
+          </div>
+          <span class="count" id="cfgCountAlerts">-</span>
+        </div>
+        <div class="cfg-sec-body" id="alertsBody"></div>
+        <div class="cfg-sec-foot"><span class="cfg-footnote" style="padding:0;text-align:left">A test sends one real push and ignores the switches, so you can prove the pipe works without waiting for an incident.</span></div>
+      </section>
+
+      <section class="cfg-sec">
+        <div class="cfg-sec-head">
           <span class="ico" data-icon="key"></span>
           <div>
             <h3>Environment</h3>
@@ -1681,6 +1705,7 @@ const ICONS = {
   refresh: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>',
   send: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>',
   zap: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>',
+  bell: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/></svg>',
   hash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="9" x2="20" y2="9"/><line x1="4" y1="15" x2="20" y2="15"/><line x1="10" y1="3" x2="8" y2="21"/><line x1="16" y1="3" x2="14" y2="21"/></svg>',
   gauge: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></svg>',
   database: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>',
@@ -4005,7 +4030,9 @@ async function cfgSave() {
     cfg.errors = [{ path: "", message: "Save failed: " + e.message }];
     renderConfig();
   } finally {
-    btn.disabled = false;
+    // A successful save leaves nothing to save: let the renderer's own rule
+    // decide, instead of re-enabling a button with no work behind it.
+    btn.disabled = !cfg.dirty;
   }
 }
 
@@ -4108,6 +4135,7 @@ function renderConfig() {
     renderCfgModels();
     renderCfgPresets();
     renderCfgSettings();
+    renderCfgAlerts();
     renderEnv();
   }
   renderCfgSnapshots();
@@ -4281,7 +4309,7 @@ function renderCfgSettings() {
     simple("uiPasswordEnv", "key", "UI password env", "Env var NAME for the dashboard login") +
     block("pricing", "dollar", "Pricing", "Off-peak multiplier and peak windows used by the cost model") +
     block("missCapture", "database", "Cache miss capture", "Payload capture on low-cache-hit requests") +
-    block("alerts", "zap", "Alerts", "ntfy pushes when the cache hit rate drops") +
+
     block("backoff", "clock", "Backoff", "Per-failure-class cooling windows") +
     "</tbody>";
   cfgInjectIcons($("cfgSettingsTable"));
@@ -5122,6 +5150,153 @@ $("cfgModalBg").addEventListener("click", (ev) => { if (ev.target === $("cfgModa
 document.addEventListener("keydown", (ev) => {
   if (ev.key === "Escape" && cfg.modal) cfgCloseModal();
 });
+// ---- config editor: notifications (alerts.ntfy) --------------------------------
+//
+// The friendly editor for the `alerts` block. It mutates cfg.draft.alerts.ntfy
+// like every other form editor, so Save, Validate, snapshots and the lost-update
+// guard all apply unchanged; the raw JSON view stays the escape hatch for keys
+// this panel does not model. A switch writes events[kind] = false instead of
+// deleting anything, because the same block carries the topic.
+
+const ALERT_KINDS = [
+  { id: "cache_miss", label: "Cache break", note: "The prompt cache broke and kept breaking on one backend. Pattern-gated, so a fresh conversation stays silent." },
+  { id: "weekly_limit", label: "Weekly usage limit", note: "A backend hit its weekly cap and pinned itself until the reset." },
+  { id: "all_cooling", label: "All backends cooling", note: "Every backend is cooling, so requests fail with 503." },
+  { id: "request_exhausted", label: "Request failed everywhere", note: "One request failed on every provider it tried." },
+  { id: "relay_cut", label: "Stream cut mid-relay", note: "The response stream ended before the answer was finished." },
+];
+
+const ALERT_DEFAULTS = { baseUrl: "https://ntfy.sh", minMissPct: 50, minMissTokens: 20000, minBreaks: 5, windowMs: 1800000, cooldownMs: 600000 };
+
+const ALERT_FIELDS = [
+  { key: "minMissPct", label: "Cache hit below %", def: 50, min: 0, max: 100, hint: "A request counts as a break when less than this share of its prompt came from cache." },
+  { key: "minMissTokens", label: "Miss tokens at least", def: 20000, min: 0, hint: "and at least this many prompt tokens came from nowhere. Small requests never qualify." },
+  { key: "minBreaks", label: "Breaks needed", def: 5, min: 1, hint: "How many breaks on ONE backend, inside the window, before a push is sent." },
+  { key: "windowMs", label: "Window (minutes)", def: 30, min: 1, minutes: true, hint: "The window those breaks must land in. Breaks from different conversations do not combine." },
+  { key: "cooldownMs", label: "Quiet after a push (minutes)", def: 10, min: 0, minutes: true, hint: "The same event stays silent for this long after it fires." },
+];
+
+function alertsNtfy() {
+  return (cfg.draft && cfg.draft.alerts && cfg.draft.alerts.ntfy) || null;
+}
+
+// Show the value that is actually in effect: what the file says, else the
+// server's own default, so a blank field never looks like "off".
+function alertsEffective(n, f) {
+  const raw = n[f.key];
+  if (raw == null) return f.def;
+  const num = Number(raw);
+  if (!isFinite(num)) return f.def;
+  return f.minutes ? Math.round(num / 60000) : num;
+}
+
+function renderCfgAlerts() {
+  const host = $("alertsBody");
+  if (!host) return;
+  const n = alertsNtfy();
+  const count = $("cfgCountAlerts");
+  if (!n) {
+    if (count) count.textContent = "off";
+    host.innerHTML =
+      "<div class='alerts-state'>No notifications are configured, so nothing is pushed anywhere." +
+      "<div style='margin-top:10px'><button id='alertsEnable' class='primary' data-icon='plus' type='button'>Turn on notifications</button></div></div>";
+    cfgInjectIcons(host);
+    return;
+  }
+  const events = n.events || {};
+  const master = n.enabled !== false;
+  const live = ALERT_KINDS.filter((k) => events[k.id] !== false).length;
+  if (count) count.textContent = master ? live + " of " + ALERT_KINDS.length + " on" : "all off";
+
+  const rows = ALERT_KINDS.map((k) => {
+    const on = events[k.id] !== false;
+    return "<tr>" +
+      "<td><div class='cfg-td-name'>" + esc(k.label) + "</div><div class='cfg-td-sub' style='font-family:inherit'>" + esc(k.note) + "</div></td>" +
+      "<td><label class='check'><input type='checkbox' data-alert-kind='" + esc(k.id) + "'" + (on ? " checked" : "") + " aria-label='Send " + esc(k.label) + "'> " + (on ? "Sent" : "Off") + "</label></td>" +
+      "<td class='actions'><button class='cfg-iconbtn' data-alert-test='" + esc(k.id) + "' data-ic='bell' title='Send one real test push for this event' aria-label='Send a test push for " + esc(k.label) + "'></button></td>" +
+      "</tr>";
+  }).join("");
+
+  const fields = ALERT_FIELDS.map((f) =>
+    "<label class='alerts-field'><span class='lbl'>" + esc(f.label) + "</span>" +
+    "<input class='cfg-inline-input' type='number' min='" + f.min + "'" + (f.max == null ? "" : " max='" + f.max + "'") +
+    " value='" + esc(alertsEffective(n, f)) + "' data-alert-num='" + esc(f.key) + "' aria-label='" + esc(f.label) + "'>" +
+    "<span class='hint'>" + esc(f.hint) + "</span></label>"
+  ).join("");
+
+  host.innerHTML =
+    "<div class='alerts-grid'>" +
+      "<label class='check'><input type='checkbox' id='alertsMaster'" + (master ? " checked" : "") + "> <b>Send notifications</b></label>" +
+      "<label class='alerts-field'><span class='lbl'>ntfy topic</span><input class='cfg-inline-input' id='alertsTopic' value='" + esc(n.topic || "") + "' spellcheck='false' autocomplete='off' aria-label='ntfy topic'><span class='hint'>Where the pushes go. Anyone who knows this topic can read it, so treat it as public.</span></label>" +
+      "<label class='alerts-field'><span class='lbl'>ntfy server</span><input class='cfg-inline-input' id='alertsBase' value='" + esc(n.baseUrl || ALERT_DEFAULTS.baseUrl) + "' spellcheck='false' autocomplete='off' aria-label='ntfy server'><span class='hint'>The ntfy host that receives the push.</span></label>" +
+    "</div>" +
+    (master ? "" : "<div class='cfg-issues warn'>" + ICONS.warn + "<div>Notifications are switched off at the top, so nothing is pushed whatever the rows below say.</div></div>") +
+    "<div class='cfg-wrap'><table class='cfg-table'>" + cfgTableHead(["Event", "Push", "Test"]) + "<tbody>" + rows + "</tbody></table></div>" +
+    "<div class='cfg-subhead'>Cache break rule</div>" +
+    "<div class='alerts-grid'>" + fields + "</div>" +
+    "<div class='alerts-state' id='alertsMsg' role='status'></div>";
+  cfgInjectIcons(host);
+}
+
+async function alertsSendTest(kind, btn) {
+  const say = (cls, text) => { const m = $("alertsMsg"); if (m) { m.className = "alerts-state " + cls; m.textContent = text; } };
+  say("", "Sending a test push...");
+  btn.disabled = true;
+  try {
+    const r = await cfgPost("/api/alerts/test", { kind });
+    if (r.status === 200 && r.payload && r.payload.ok) say("ok", "Sent a test push (ntfy answered HTTP " + r.payload.status + "). Check the phone.");
+    else say("err", (r.payload && r.payload.error && r.payload.error.message) || "The test failed (HTTP " + r.status + ").");
+  } catch (e) {
+    say("err", "The test failed: " + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// Every control writes the draft and re-renders, so the panel always shows what
+// the file now says. `change` (not `input`) keeps a re-render from stealing
+// focus mid-keystroke.
+$("alertsBody").addEventListener("change", (ev) => {
+  const t = ev.target;
+  if (!alertsNtfy()) return;
+  if (t.id === "alertsMaster") { cfgMutate((d) => { if (t.checked) delete d.alerts.ntfy.enabled; else d.alerts.ntfy.enabled = false; }); return; }
+  if (t.id === "alertsTopic") { cfgMutate((d) => { d.alerts.ntfy.topic = t.value.trim(); }); return; }
+  if (t.id === "alertsBase") { cfgMutate((d) => { const v = t.value.trim(); if (v) d.alerts.ntfy.baseUrl = v; else delete d.alerts.ntfy.baseUrl; }); return; }
+  if (t.dataset.alertKind) {
+    const kind = t.dataset.alertKind;
+    cfgMutate((d) => {
+      const evs = d.alerts.ntfy.events || (d.alerts.ntfy.events = {});
+      if (t.checked) delete evs[kind]; else evs[kind] = false;
+      if (!Object.keys(evs).length) delete d.alerts.ntfy.events;
+    });
+    return;
+  }
+  if (t.dataset.alertNum) {
+    const key = t.dataset.alertNum;
+    const f = ALERT_FIELDS.find((x) => x.key === key);
+    const raw = t.value.trim();
+    cfgMutate((d) => {
+      if (raw === "") { delete d.alerts.ntfy[key]; return; }
+      const num = Number(raw);
+      if (!isFinite(num)) { delete d.alerts.ntfy[key]; return; }
+      d.alerts.ntfy[key] = f && f.minutes ? Math.round(num * 60000) : num;
+    });
+  }
+});
+
+$("alertsBody").addEventListener("click", (ev) => {
+  const btn = ev.target.closest("button");
+  if (!btn) return;
+  if (btn.id === "alertsEnable") {
+    cfgMutate((d) => {
+      d.alerts = d.alerts || {};
+      d.alerts.ntfy = Object.assign({ topic: "" }, ALERT_DEFAULTS, d.alerts.ntfy || {});
+    });
+    return;
+  }
+  if (btn.dataset.alertTest) alertsSendTest(btn.dataset.alertTest, btn);
+});
+
 // Settings inputs are plain inline fields rather than modal entries.
 $("cfgSettingsTable").addEventListener("input", (ev) => {
   const input = ev.target.closest("[data-cfg-set]");
