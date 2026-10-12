@@ -293,7 +293,8 @@ missing, the router's behavior is byte-identical to before.
   the run, so the next qualifying event can still fire it.
 - The Config tab's **Notifications** panel is the supported way to edit this
   block: one master switch, the topic and server, and a per-kind condition
-  ("Off" / "Every event" / "Repeated issue") with the numbers inline, written
+  ("Off" / "Every event" / "Repeated issue") with its numbers as labelled
+  fields underneath, written
   through the ordinary `POST /api/config` path so the snapshot, the revision
   guard and validation are all unchanged. Keys that only restate the shared
   defaults are left out, so the file stays "the defaults, plus deliberate
