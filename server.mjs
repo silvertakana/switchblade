@@ -4600,6 +4600,11 @@ const MISSING_TOP_CONTAINERS = ["models", "presets"];
 // provider with no upstream the runtime could resolve, a legacy empty-string param -
 // because a sanitizing converter in front of the validator is exactly how a bad
 // reference reaches the disk unjudged.
+// Exported under the name its consumers know it by: the editor harness measures a
+// draft through THIS function so the UI's view of a saved payload and the server's
+// are the same function rather than two policies that drift. It canonicalizes a COPY
+// and never converts a document that has not started migrating - which is what makes
+// a legacy no-op save a legacy save.
 function structuralViewForValidation(rawInput) {
   if (!rawInput || typeof rawInput !== "object" || Array.isArray(rawInput)) return rawInput;
   const copy = JSON.parse(JSON.stringify(rawInput));
@@ -5368,4 +5373,5 @@ if (isMain) {
 }
 
 export { claimAttempt, releaseAttempt, ineligibility, health, ROUTES };
+export { structuralViewForValidation as validationSubjectOf };
 export { backoffFor, sessionHeaderFor, noteAccountOutage, markSuccess, ACCOUNT_OUTAGE_ROUTES, classify, readUpstreamError, terminalChatError, redactSecrets, capAttemptsSummary, attemptOutcome, candidates, touchSessionPreference, evictSessionPreferences, SESSION_PREFS, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost, writeConfigAtomic, routeKey, routeBackoffMs, authScopeOf, sessionPreferenceKey, beginSessionRequest, orderSessionProviders, rememberProvider, sessionPreferenceStats, clearSessionPreferences, validateConfig, convertLegacyConfig };
