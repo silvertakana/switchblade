@@ -5091,6 +5091,13 @@ function renderCfgModal() {
     // primaries, and the first save would silently un-mark the backups the pool
     // had declared.
     const legacyRows = Array.isArray(data.providers);
+    // The shape this entry was OPENED with decides the shape it is stored back in,
+    // and \`providers\` wins when it carries both - that is the key the server's own
+    // converter honours, so storing \`deployments\` would bury this edit under the
+    // array the router actually reads. A save never starts a migration by itself:
+    // conversion is a deliberate act with its own tooling, and converting here is
+    // what turns a legacy document into a half-v3 one whose served id list moves.
+    cfg.modal.storeAs = legacyRows ? "providers" : "deployments";
     const pool = typeof data.affinityPool === "number" ? data.affinityPool : null;
     cfg.modal.deploys = deploymentListOf(data).map((d, i) => ({
       backend: d && d.backend ? d.backend : "",
@@ -5098,6 +5105,10 @@ function renderCfgModal() {
       weight: d && d.weight != null ? d.weight : null,
       backupOnly: d && d.backupOnly === true ? true : !!(legacyRows && pool != null && i >= pool),
       legacy: legacyRows,
+      // The key the entry itself carried, which is the baseline a change is measured
+      // against. A legacy pair rendering a DERIVED mark (rows past the pool) has no
+      // such key, so the mark stays display-only and a no-op save cannot invent it.
+      hadBackupOnly: !!(d && Object.prototype.hasOwnProperty.call(d, "backupOnly")),
       params: d && d.params,
       dropParams: d && d.dropParams,
       paramMap: d && d.paramMap,
@@ -5296,12 +5307,13 @@ function cfgModalCollect() {
   if (kind === "models") {
     const m = prevEntry("models");
     setText(m, "id", "f_id");
-    // Deployments replace `providers` outright, and the legacy key is REMOVED
-    // even when the input carried one: a model with both keys is read by the
-    // server's converter as `providers`-wins, so keeping it would silently
-    // discard every edit made here.
-    delete m.providers;
-    m.deployments = (cfg.modal.deploys || [])
+    // The rows go back into the channel the entry was opened with, so this list is
+    // built ONCE and assigned to one key or the other. A legacy entry takes them as
+    // \`providers\` (and keeps the \`affinityPool\` that shape owns); a v3 entry takes
+    // them as \`deployments\`. Writing v3 keys onto a legacy entry is what turns a
+    // legacy document into a half-v3 one: the served id list moves, and the file no
+    // longer says which shape it is.
+    const collectRows = (cfg.modal.deploys || [])
       .map((d, i) => ({ d, i }))
       // A row with no backend names no account to send to, so it is dropped
       // rather than stored half-formed. The form-field index is the ORIGINAL
@@ -5311,7 +5323,7 @@ function cfgModalCollect() {
         const d = r.d;
         // The previous object is the base in both shapes, so every key the form
         // does not own survives where it was. A LEGACY row (one listed from a
-        // `providers` entry) additionally has its derived v3 keys materialized
+        // \`providers\` entry) additionally has its derived v3 keys materialized
         // here: the two helpers below skip a box that still matches the state the
         // form rendered, and for a legacy row that state is new, so the weight, the
         // backup flag and the three dialect keys would otherwise be dropped the
@@ -5324,19 +5336,38 @@ function cfgModalCollect() {
         if (d.legacy) {
           const lw = d.weight == null ? 1 : Math.floor(Number(d.weight));
           if (Number.isFinite(lw) && lw > 1) out.weight = lw;
-          if (d.backupOnly) out.backupOnly = true;
+          if (d.backupOnly && d.hadBackupOnly) out.backupOnly = true;
           for (const k of ["params", "dropParams", "paramMap"]) if (d[k] !== undefined && out[k] === undefined) out[k] = cfgDeepCopy(d[k]);
         }
         setWeight(out, d.weight, "f_d" + r.i + "_weight");
-        setBackupOnly(out, d.backupOnly, "f_d" + r.i + "_backupOnly");
+        // A legacy row's backup mark is DERIVED: the render shows the rows past the
+        // entry's \`affinityPool\` as the ordered tail, because that is what the pool
+        // means. It is not a key the provider carried, so storing it would invent a
+        // \`backupOnly: true\` on the first no-op save of every pooled entry - and v3
+        // \`backupOnly\` is exactly the field the row no longer has. The pool itself is
+        // preserved on the entry, so the mark survives as what it always was: derived.
+        if (!d.legacy) setBackupOnly(out, d.backupOnly, "f_d" + r.i + "_backupOnly");
         setDeployJson(out, "params", "f_d" + r.i + "_params", d.orig && d.orig.params);
         setDeployJson(out, "dropParams", "f_d" + r.i + "_dropParams", d.orig && d.orig.dropParams);
         setDeployJson(out, "paramMap", "f_d" + r.i + "_paramMap", d.orig && d.orig.paramMap);
         return out;
       });
-    // `affinityPool` is gone from v3 and has no field here, so nothing writes it
-    // and the copy of the previous entry must not carry it forward either.
-    delete m.affinityPool;
+    if (Array.isArray(m.providers) || cfg.modal.storeAs === "providers") {
+      // Providers-wins, the same precedence the server's converter applies: an entry
+      // carrying both is legacy for as long as it carries both, so the rows go back
+      // into `providers` and the v3 key is removed rather than left to shadow them.
+      delete m.deployments;
+      m.providers = collectRows;
+    } else {
+      // A model carrying both keys is read by the server's converter as
+      // \`providers\`-wins, so the other channel is removed rather than left to
+      // shadow this edit.
+      delete m.providers;
+      m.deployments = collectRows;
+      // \`affinityPool\` is gone from v3 and has no field here, so a v3 entry must
+      // not carry it forward.
+      delete m.affinityPool;
+    }
     if (exposedOn()) delete m.exposed;
     else m.exposed = false;
     const meta = Object.assign({}, m.meta && typeof m.meta === "object" && !Array.isArray(m.meta) ? m.meta : {});
