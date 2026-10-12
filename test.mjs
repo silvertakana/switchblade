@@ -3457,8 +3457,10 @@ async function main() {
       const hh = await (await api(hCn.base, "/health", { method: "GET" })).json();
       const acct = hh.backends.find((x) => x.id === "ca");
       const rows = (hh.routes || []).filter((x) => x.backend === "ca");
+      // The row now EXISTS by construction (a configured route is always listed); what must
+      // hold is that the aborted call left it healthy with no streak, not that it vanished.
       assert(
-        upstreamReleased && bHits === 0 && acct && acct.state === "healthy" && rows.length === 0,
+        upstreamReleased && bHits === 0 && acct && acct.state === "healthy" && rows.length === 1 && rows[0].state === "healthy" && rows[0].fails === 0,
         "zCancel1) a caller who leaves before any headers releases the upstream request, fails over nowhere, and charges no health (upstreamReleased=" + upstreamReleased + ", bHits=" + bHits + ", state=" + (acct ? acct.state : "?") + ", routes=" + JSON.stringify(rows) + ")"
       );
     } finally {
@@ -3963,9 +3965,15 @@ async function main() {
       const hh = await (await api(hC.base, "/health", { method: "GET" })).json();
       const b = hh.backends.find((x) => x.id === "sc5");
       const rows = (hh.routes || []).filter((x) => x.backend === "sc5");
+      // Same as zCancel1: the route is listed whether or not it ever failed, so the fact to
+      // pin is that the abort left it healthy with no streak and nothing in flight.
       assert(
-        hits === 1 && b.state === "healthy" && rows.length === 0,
+        hits === 1 && b.state === "healthy" && rows.length === 1 && rows[0].state === "healthy" && rows[0].fails === 0 && rows[0].probeInFlight === false,
         "zSess5) a caller abort is not charged to the provider (hits=" + hits + ", state=" + b.state + ", routes=" + JSON.stringify(rows) + ")"
+      );
+      assert(
+        (b.deployments || []).length === 1 && b.deployments[0].state === "healthy" && b.deployments[0].upstream === "u5",
+        "zSess5b) the same answer appears in the backend deployment projection (" + JSON.stringify(b.deployments) + ")"
       );
     } finally {
       hC.child.kill(); srvC.close();
@@ -4187,7 +4195,13 @@ async function main() {
       const rst = await api(hR.base, "/admin/reset-health", { method: "POST" });
       await rst.text();
       const hb2 = await (await api(hR.base, "/health", { method: "GET" })).json();
-      assert(routesFor(hb2, "r1") === 0, "zT4f2) reset-health clears the ROUTE recovery, not just the account row (r1routes=" + routesFor(hb2, "r1") + ")");
+      // The row survives a reset (a configured route is always listed) but its RECOVERY must
+      // not: fails 0, no deadline, no probe, and a healthy state.
+      const afterReset = (hb2.routes || []).find((x) => x.backend === "r1");
+      assert(
+        routesFor(hb2, "r1") === 1 && afterReset && afterReset.fails === 0 && afterReset.state === "healthy" && afterReset.nextAvailableAtMs === 0 && afterReset.probeInFlight === false,
+        "zT4f2) reset-health clears the ROUTE recovery, not just the account row (r1routes=" + routesFor(hb2, "r1") + ", row=" + JSON.stringify(afterReset) + ")"
+      );
       const b = await hit(); await b.text();
       assert(
         r1.hits.length === 2,
@@ -4471,6 +4485,238 @@ async function main() {
     }
   }
 
+  // zHl4) /health deployments[] projection, and targeted /admin/backend by upstream.
+  //   The projection is built from the ROUTE REGISTRY, so it lists every CONFIGURED route
+  //   even when the route has never failed, and it lists aliases. The admin extension
+  //   reaches ONE physical route, and a targeted uncool must not clear an account-wide or
+  //   manual block - an operator who cooled the account means the account.
+  {
+    const ha = mockBackend("ha", {});
+    const hb = mockBackend("hb", {});
+    ha.port = await listen(ha.srv);
+    hb.port = await listen(hb.srv);
+    const cfgH = {
+      port: 0, prefix: "/v1", masterKeyEnv: "KEY_H", apiKeyEnv: "KEY_H",
+      backends: [
+        { id: "ha", baseURL: `http://${HOST}:${ha.port}`, apiKeyEnv: "KEY_HA" },
+        { id: "hb", baseURL: `http://${HOST}:${hb.port}`, apiKeyEnv: "KEY_HB" },
+      ],
+      models: {
+        hm1: { deployments: [{ backend: "ha", upstream: "u1" }, { backend: "ha", upstream: "u2" }, { backend: "hb", upstream: "u3" }], affinityPool: 2 },
+        hm2: { providers: [{ backend: "ha", upstream: "u1" }], affinityPool: 1 },
+      },
+      presets: { hp1: { strategy: "affinity", models: ["hm1"] }, hp2: { strategy: "affinity", models: ["hm2"] } },
+      backoff: { ...BO, serverBaseMs: 30000, serverMaxMs: 300000 },
+    };
+    const hH = await startRouterCfg(cfgH, "KEY_H=local-master\nKEY_HA=k\nKEY_HB=k\n"); // the api() helper sends this exact bearer
+    const hbJson = async () => await (await api(hH.base, "/health", { method: "GET" })).json();
+    const depsOf = (body, id) => {
+      const row = (body.backends || []).find((b) => b.id === id);
+      return (row && Array.isArray(row.deployments)) ? row.deployments : null;
+    };
+    const one = (deps, backend, upstream) => deps && deps.find((d) => d.id === backend && d.upstream === upstream);
+    const admin = (payload) => api(hH.base, "/admin/backend", { body: payload });
+    try {
+      const b0 = await hbJson();
+      const d0 = depsOf(b0, "ha");
+      const r0 = one(d0, "ha", "u1");
+      assert(
+        Array.isArray(d0) && d0.length === 2 && d0.every((d) => d.state === "healthy" && d.fails === 0 && d.manual === false) && r0 && r0.nextAvailableAtMs === 0,
+        "zHl4a) a configured route appears in /health deployments as healthy before any traffic (" + JSON.stringify(d0) + ")"
+      );
+      assert(
+        r0 && r0.models.length === 2 && r0.models.includes("hm1") && r0.models.includes("hm2") && r0.lastStatus === null && r0.lastErrorKind === null,
+        "zHl4b) the row names every logical model that aliases the route, both shapes included (" + JSON.stringify(r0) + ")"
+      );
+      // The TARGETED cool is exercised with no account block in force, which is the only way
+      // "only that route" is observable: an account-wide block marks every deployment of the
+      // account, so afterwards the distinction is invisible by construction.
+      const target = await admin({ id: "ha", upstream: "u1", action: "cool" });
+      const bTgt = await hbJson();
+      assert(
+        target.status === 200 && one(depsOf(bTgt, "ha"), "ha", "u1").manual === true && one(depsOf(bTgt, "ha"), "ha", "u1").state === "cooling",
+        "zHl4d) a targeted cool marks its own physical route (" + JSON.stringify(depsOf(bTgt, "ha")) + ")"
+      );
+      assert(
+        one(depsOf(bTgt, "ha"), "ha", "u2").manual === false && one(depsOf(bTgt, "ha"), "ha", "u2").state === "healthy",
+        "zHl4d2) a targeted cool leaves the sibling route alone (" + JSON.stringify(one(depsOf(bTgt, "ha"), "ha", "u2")) + ")"
+      );
+      // ...and with no account block in force, the targeted uncool clears it.
+      const unTgt = await admin({ id: "ha", upstream: "u1", action: "uncool" });
+      const bUnTgt = await hbJson();
+      assert(
+        unTgt.status === 200 && one(depsOf(bUnTgt, "ha"), "ha", "u1").state === "healthy" && one(depsOf(bUnTgt, "ha"), "ha", "u1").manual === false,
+        "zHl4d3) a targeted uncool clears its own route when nothing else blocks it (" + JSON.stringify(one(depsOf(bUnTgt, "ha"), "ha", "u1")) + ")"
+      );
+      const acct = await admin({ id: "ha", action: "cool" });
+      const bAcct = await hbJson();
+      assert(
+        acct.status === 200 && depsOf(bAcct, "ha").every((d) => d.manual === true && d.state === "cooling"),
+        "zHl4c) an account-wide cool shows on every deployment of that account as manual (" + JSON.stringify(depsOf(bAcct, "ha")) + ")"
+      );
+      const un = await admin({ id: "ha", upstream: "u1", action: "uncool" });
+      const bUn = await hbJson();
+      assert(
+        un.status === 200 && one(depsOf(bUn, "ha"), "ha", "u1").state === "cooling",
+        "zHl4e) a targeted uncool cannot clear the account-wide block (" + JSON.stringify(one(depsOf(bUn, "ha"), "ha", "u1")) + ")"
+      );
+      // With no account block, the targeted uncool does clear its own route.
+      await admin({ id: "ha", action: "uncool" });
+      await admin({ id: "ha", upstream: "u2", action: "cool" });
+      await admin({ id: "ha", upstream: "u2", action: "uncool" });
+      const bClear = await hbJson();
+      // The row is listed because every configured route is; what the uncool clears is the
+      // BLOCK, so the row goes back to a plain healthy route with no deadline.
+      const u2After = one(depsOf(bClear, "ha"), "ha", "u2");
+      assert(
+        u2After && u2After.state === "healthy" && u2After.manual === false && u2After.nextAvailableAtMs === 0,
+        "zHl4f) a targeted uncool clears its own route once no account block remains (" + JSON.stringify(u2After) + ")"
+      );
+      const bad = await admin({ id: "ha", upstream: 7, action: "cool" });
+      const ghost = await admin({ id: "ha", upstream: "nope", action: "cool" });
+      assert(
+        bad.status === 400 && ghost.status === 404,
+        "zHl4g) a malformed upstream is 400 and a route no model declares is 404 (malformed=" + bad.status + ", ghost=" + ghost.status + ")"
+      );
+    } finally {
+      hH.child.kill(); ha.srv.close(); hb.srv.close();
+      await rm(hH.dir, { recursive: true, force: true });
+    }
+  }
+
+  // zFence) Deleting a route while an attempt is still in flight: the held settlement must
+  //   not recreate the row the deletion removed, whether the deletion came from a config
+  //   reload or from a targeted /admin/backend uncool. The fence exists only while an older
+  //   lease can settle - once nothing is in flight, the route is really gone.
+  {
+    const HOLDING = new Set();
+    const fbHits = [];
+    const fb = http.createServer(async (req, res) => {
+      for await (const _ of req) { /* drain */ }
+      fbHits.push(1);
+      HOLDING.add(res);
+    });
+    const fc = mockBackend("fc", {});
+    const fd = mockBackend("fd", {});
+    const portFb = await listen(fb);
+    fc.port = await listen(fc.srv);
+    fd.port = await listen(fd.srv);
+    const cfgF = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "fb", baseURL: "http://" + HOST + ":" + portFb, apiKeyEnv: "KEY_FB", timeoutMs: 20000 },
+        { id: "fc", baseURL: "http://" + HOST + ":" + fc.port, apiKeyEnv: "KEY_FC" },
+        { id: "fd", baseURL: "http://" + HOST + ":" + fd.port, apiKeyEnv: "KEY_FD" },
+      ],
+      models: { mf: { providers: [{ backend: "fb", upstream: "u1" }, { backend: "fc", upstream: "u2" }], affinityPool: 1 } },
+      presets: { pf: { strategy: "failover", models: ["mf"] } },
+      backoff: { ...BO, serverBaseMs: 30000, serverMaxMs: 300000 },
+    };
+    const hF = await startRouterCfg(cfgF, "KEY_FB=k\nKEY_FC=k\nKEY_FD=k\n");
+    const call = () => api(hF.base, "/v1/chat/completions", { body: { model: "pf", messages: [{ role: "user", content: "hi" }] } });
+    const routeOf = async (backend) => ((await (await api(hF.base, "/health", { method: "GET" })).json()).routes || []).find((r) => r.backend === backend && r.upstream === "u1");
+    const releaseHeld = async (status) => {
+      for (const r of [...HOLDING]) { HOLDING.delete(r); r.writeHead(status, { "content-type": "application/json" }); r.end(JSON.stringify({ error: { message: "late", type: "server_error" } })); }
+    };
+    try {
+      const held = call();
+      held.catch(() => {}); // an abort here is the test's own doing, not a run failure
+      for (let i = 0; i < 40 && fbHits.length === 0; i++) await new Promise((r) => setTimeout(r, 25));
+      // The held attempt is genuinely in flight, and the sibling routes keep serving while it
+      // is. Deliberately NOT claimed here: that a second request avoids a route a probe already
+      // holds is the lease single-flight property, already pinned by the zProbe/zAdmit blocks.
+      const second = await call();
+      await second.text();
+      assert(
+        fbHits.length >= 1 && fc.hits.length >= 1 && HOLDING.size >= 1,
+        "zFence1a) the held attempt is in flight while the sibling routes serve the other request (fb=" + fbHits.length + ", fc=" + fc.hits.length + ", held=" + HOLDING.size + ")"
+      );
+      // Reload without fb: the route is deleted while its attempt is still in flight.
+      const cfgF2 = JSON.parse(JSON.stringify(cfgF));
+      cfgF2.models.mf.providers = [{ backend: "fc", upstream: "u2" }];
+      await writeFile(join(hF.dir, "config.json"), JSON.stringify(cfgF2, null, 2));
+      const gone = await (async () => {
+        for (let i = 0; i < 20; i++) { await new Promise((r) => setTimeout(r, 200)); if (!(await routeOf("fb"))) return true; }
+        return false;
+      })();
+      assert(gone, "zFence1b) a reload prunes the removed route while its attempt is in flight (gone=" + gone + ")");
+      await releaseHeld(500);
+      const heldRes = await held;
+      await heldRes.text();
+      const after = await routeOf("fb");
+      assert(
+        after === undefined,
+        "zFence1c) the held failure does NOT recreate the route a reload removed (" + JSON.stringify(after) + ")"
+      );
+      const fresh = await call();
+      await fresh.text();
+      assert(
+        fc.hits.length === 3 && fd.hits.length === 0,
+        "zFence1d) routing continues on the surviving route (fc=" + fc.hits.length + ", fd=" + fd.hits.length + ")"
+      );
+    } finally {
+      hF.child.kill(); fb.close(); fc.srv.close(); fd.srv.close();
+      await rm(hF.dir, { recursive: true, force: true });
+    }
+  }
+
+  // zFence2) The targeted uncool is the other deletion path, and it must fence too: the
+  //   held failure lands after the operator cleared the route.
+  {
+    const HOLDING = new Set();
+    const fb2Hits = [];
+    const fb = http.createServer(async (req, res) => {
+      for await (const _ of req) { /* drain */ }
+      fb2Hits.push(1);
+      HOLDING.add(res);
+    });
+    const portFb = await listen(fb);
+    const cfgF = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "fb", baseURL: "http://" + HOST + ":" + portFb, apiKeyEnv: "KEY_FB", timeoutMs: 20000 }],
+      models: { mf: { providers: [{ backend: "fb", upstream: "u1" }], affinityPool: 1 } },
+      presets: { pf: { strategy: "failover", models: ["mf"] } },
+      backoff: { ...BO, serverBaseMs: 30000, serverMaxMs: 300000 },
+    };
+    const hF2 = await startRouterCfg(cfgF, "KEY_FB=k\n");
+    const routeOf = async () => ((await (await api(hF2.base, "/health", { method: "GET" })).json()).routes || []).find((r) => r.backend === "fb");
+    try {
+      const held = api(hF2.base, "/v1/chat/completions", { body: { model: "pf", messages: [{ role: "user", content: "hi" }] } });
+      held.catch(() => {});
+      for (let i = 0; i < 40 && fb2Hits.length === 0; i++) await new Promise((r) => setTimeout(r, 25));
+      await api(hF2.base, "/admin/backend", { body: { id: "fb", upstream: "u1", action: "cool" } });
+      const cooled = await routeOf();
+      assert(cooled && cooled.manual === true, "zFence2a) the targeted cool shows on its route row (" + JSON.stringify(cooled && { state: cooled.state, manual: cooled.manual }) + ")");
+      await api(hF2.base, "/admin/backend", { body: { id: "fb", upstream: "u1", action: "uncool" } });
+      for (const r of [...HOLDING]) { HOLDING.delete(r); r.writeHead(500, { "content-type": "application/json" }); r.end(JSON.stringify({ error: { message: "late", type: "server_error" } })); }
+      const cleared = await routeOf();
+      assert(
+        cleared && cleared.state === "healthy" && cleared.manual === false && cleared.fails === 0,
+        "zFence2b) the targeted uncool leaves a plain healthy route (" + JSON.stringify(cleared) + ")"
+      );
+      // The held 500 lands now. It describes work that was already running when the operator
+      // cleared the route, so it must not put a failure streak back on it.
+      const res = await held;
+      await res.text();
+      const after = await routeOf();
+      assert(
+        after && after.fails === 0 && after.state === "healthy" && after.manual === false,
+        "zFence2c) the held failure does NOT charge the route a targeted uncool cleared (" + JSON.stringify(after) + ")"
+      );
+      // ...while a request dispatched AFTER the uncool is free to find the provider broken and
+      // cool it for real, which is what keeps the epoch half from fencing live evidence.
+      const reopen = await api(hF2.base, "/v1/chat/completions", { body: { model: "pf", messages: [{ role: "user", content: "again" }] } });
+      await reopen.text();
+      const served = await routeOf();
+      assert(
+        fb2Hits.length === 2 && served && served.state === "cooling" && served.fails === 1,
+        "zFence2d) a later request still reaches the provider and cools it (hits=" + fb2Hits.length + ", row=" + JSON.stringify(served && { state: served.state, fails: served.fails }) + ")"
+      );
+    } finally {
+      hF2.child.kill(); fb.close();
+      await rm(hF2.dir, { recursive: true, force: true });
+    }
+  }
   // zSec) A credential echoed back by an upstream must not survive anywhere durable or
   //   served, and an upstream must not be able to forge the router's own facts about the
   //   call (review findings 3 and 11, 2026-10-08).

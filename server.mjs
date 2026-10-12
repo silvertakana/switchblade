@@ -928,7 +928,12 @@ function resetAllHealth() {
   // account-outage escalation window, and this run's session preferences. A reset
   // that left routes cooling would report "healthy" and still refuse to route.
   clearSessionPreferences();
+  // Fence every route with an attempt still in flight before clearing: a reset is an
+  // operator override, and a late failure from work that started before it must not
+  // recreate the row the override just cleared.
+  for (const key of [...ATTEMPTS_IN_FLIGHT.keys()]) fenceRouteDeletion(key);
   ROUTES.clear();
+  MANUAL_ROUTES.clear(); // an operator block on one route is a layer too
   SESSION_EXCLUSIONS.clear();
   ACCOUNT_OUTAGE_ROUTES.clear();
   for (const id of health.keys()) markHealthy(id, "reset");
@@ -973,6 +978,103 @@ function isUsableCurrently(id, now) {
 const ROUTES = new Map(); // routeKey -> {generation, fails, nextAvailableAt, probeInFlight, lastErrorKind, lastStatus, lastError}
 const SESSION_EXCLUSIONS = new Map(); // "sessionKey routeKey" -> {blockedUntil, generation}
 const OPAQUE_EXCLUSION_MS = 30000;
+
+// Operator blocks on ONE physical route (the targeted half of /admin/backend). Kept OUT
+// of the ROUTES row on purpose: a row is failure evidence and its streak has to survive
+// an uncool, so an operator decision cannot live in the same fields a late failure writes.
+// A sticky block carries MAX_SAFE_INTEGER, exactly like the account-level one, so /health
+// renders "until uncooled" rather than a countdown.
+const MANUAL_ROUTES = new Map(); // routeKey -> {until, since}
+
+// Deletion fences. A route that is deleted while an attempt is still in flight - a config
+// reload that dropped it, a targeted uncool, a reset - must not come back when that attempt
+// settles: the late callback writes failure evidence for a route the operator or the config
+// already removed, and the next /health then reports a route nothing routes to.
+//
+// The fence snapshots the attempts that were in flight WHEN IT WAS ARMED, and blocks their
+// settlements. Identity, not a timestamp: an attempt is exactly the work that was running at
+// that moment, while any counter or sequence comparison is a proxy that a dispatch happening
+// concurrently with the arming can invalidate (a request that starts a hair after the uncool
+// shares no property with the old one that distinguishes them). An attempt that starts LATER
+// is not in the snapshot and settles normally, which is what keeps live evidence - a provider
+// a new request really did find broken - from being swallowed.
+//
+// The fence outlives the last release. The window being protected is "until the route is live
+// again", not "until the old attempt returns", and a settlement can land after every lease is
+// back while the response is still relaying. It is dropped the moment the config declares the
+// route again (unfenceRoute), which is the only moment the tombstone stops being true.
+const ROUTE_FENCES = new Map(); // routeKey -> {atArm: Set<token>, inFlight}
+const ATTEMPTS_IN_FLIGHT = new Map(); // routeKey -> Set<token>
+
+function fenceFor(key) {
+  let f = ROUTE_FENCES.get(key);
+  if (!f) { f = { atArm: new Set(), inFlight: 0 }; ROUTE_FENCES.set(key, f); }
+  return f;
+}
+
+function fenceRouteDeletion(key) {
+  if (ROUTE_FENCES.has(key)) return; // already a tombstone; the snapshot is the first one
+  const f = fenceFor(key);
+  f.atArm = new Set(ATTEMPTS_IN_FLIGHT.get(key) || []);
+}
+
+// True when this attempt was already running at the moment the route was deleted. Its result
+// describes a route that no longer exists, so the row it would write is not evidence about
+// anything the config declares now.
+function fenceBlocks(key, attempt) {
+  const f = ROUTE_FENCES.get(key);
+  if (!f) return false;
+  const tok = attempt && attempt.fenceToken;
+  return !!(tok && f.atArm.has(tok));
+}
+
+// A config change that re-declares a route is a NEW incarnation: the fence was about the old
+// one, and keeping it would silently refuse the route the operator just configured.
+function unfenceRoute(key) {
+  ROUTE_FENCES.delete(key);
+}
+
+function noteDispatchForFence(token) {
+  const key = token.routeKey;
+  if (!key) return;
+  if (!ATTEMPTS_IN_FLIGHT.has(key)) ATTEMPTS_IN_FLIGHT.set(key, new Set());
+  ATTEMPTS_IN_FLIGHT.get(key).add(token);
+  // A fence is NOT created here. Most routes are never deleted, and allocating a tombstone
+  // per dispatch would grow the map with the traffic rather than with the deletions.
+  const f = ROUTE_FENCES.get(key);
+  if (f) f.inFlight++;
+}
+
+function noteReleaseForFence(token) {
+  const key = token.routeKey;
+  const set = key ? ATTEMPTS_IN_FLIGHT.get(key) : null;
+  if (set) { set.delete(token); if (!set.size) ATTEMPTS_IN_FLIGHT.delete(key); }
+  const f = key ? ROUTE_FENCES.get(key) : null;
+  if (!f) return;
+  // The counter tracks how many leases are out; it does NOT decide when the fence goes. A
+  // tombstone stays until the config re-declares the route.
+  f.inFlight = Math.max(0, f.inFlight - 1);
+}
+
+function routeFenceStats() {
+  return { fences: ROUTE_FENCES.size, inFlightRoutes: ATTEMPTS_IN_FLIGHT.size };
+}
+
+function manualRouteBlock(key, now) {
+  const m = MANUAL_ROUTES.get(key);
+  if (!m) return null;
+  if (m.until > now) return m;
+  // Lazy expiry, like every other deadline here: a timed operator block is dropped on
+  // sight rather than swept, so a dead entry can never keep blocking a route.
+  MANUAL_ROUTES.delete(key);
+  return null;
+}
+
+// A route the operator cooled is refused for EVERY caller whatever its own streak says,
+// and it has no automatic recovery - which is what makes it the strongest route blocker.
+function manualRouteBlocked(attempt, now = Date.now()) {
+  return !!manualRouteBlock(routeKey(attempt), now);
+}
 
 // Monotonic across the whole process and NEVER reset - not by reset-health, not by
 // a config reload, not by a route being removed and re-added. A generation is how a
@@ -1026,6 +1128,9 @@ function isSessionExcluded(exclScope, attempt, now) {
 // route backs off further each time instead of restarting at the base delay.
 function markRouteFailure(cfg, attempt, status, bodyText, kind) {
   const key = routeKey(attempt);
+  // Deleted mid-flight: this failure describes a route that no longer exists, and writing
+  // it would recreate the row the deletion just removed (see ROUTE_FENCES).
+  if (fenceBlocks(key, attempt)) return null;
   const r = ROUTES.get(key) || { generation: nextGeneration(), fails: 0, nextAvailableAt: 0, probeInFlight: false, lastErrorKind: null, lastStatus: null, lastError: null };
   r.fails = (r.fails || 0) + 1;
   r.nextAvailableAt = Date.now() + routeBackoffMs(r.fails, cfg);
@@ -1113,6 +1218,9 @@ function ineligibility(attempt, exclScope, now, lease = null) {
     // request at once.
     if ((h.fails || 0) > 0 && h.probeInFlight && !leaseHolds(lease, "account", h)) return "probe_in_flight";
   }
+  // The operator's route block outranks the route's own streak and every caller-scoped
+  // answer: a manual cool means "do not use this route", and a sticky one never expires.
+  if (manualRouteBlocked(attempt, now)) return "manual";
   const r = ROUTES.get(routeKey(attempt));
   if (r && (r.fails || 0) > 0) {
     if (r.nextAvailableAt > now) return "route_cooling";
@@ -1128,6 +1236,8 @@ function nearestRecoveryMs(ordered, exclScope, now) {
   let best = null;
   for (const a of ordered) {
     const why = ineligibility(a, exclScope, now);
+    // "manual" covers both the account-level sticky cool and a targeted route block:
+    // neither recovers on its own, so advertising a deadline for it would be a guess.
     if (!why || why === "manual") continue;
     const h = health.get(a.backend);
     const r = ROUTES.get(routeKey(a));
@@ -1206,6 +1316,13 @@ function claimAttempt(attempt, now) {
     token.routeClaim = true;
     token.routeGeneration = r.generation;
   }
+  // Booked with the deletion fence BEFORE any await: a route deleted while this attempt
+  // is in flight keeps a fence until this token is released, so the late settlement cannot
+  // resurrect a route the config or the operator already removed.
+  token.fenceNoted = true;
+  token.attempt = attempt;
+  attempt.fenceToken = token; // identity for the deletion fence (see fenceBlocks)
+  noteDispatchForFence(token);
   return token;
 }
 
@@ -1218,6 +1335,7 @@ function releaseAttempt(token) {
   // putting two probes on one route.
   if (!token || token.released) return;
   token.released = true;
+  if (token.fenceNoted) noteReleaseForFence(token);
   const r = ROUTES.get(token.routeKey);
   if (token.routeClaim && r && r.generation === token.routeGeneration) r.probeInFlight = false;
   const h = health.get(token.backend);
@@ -1264,7 +1382,11 @@ function pruneRoutes(cfg) {
   for (const [id, m] of Object.entries(cfg.models || {})) {
     for (const p of modelDeployments(m, id, byId)) live.add(JSON.stringify([p.backend, p.upstream]));
   }
-  for (const key of [...ROUTES.keys()]) if (!live.has(key)) ROUTES.delete(key);
+  for (const key of [...ROUTES.keys()]) if (!live.has(key)) { fenceRouteDeletion(key); ROUTES.delete(key); }
+  for (const key of [...MANUAL_ROUTES.keys()]) if (!live.has(key)) MANUAL_ROUTES.delete(key);
+  // A route the new config declares again is a fresh incarnation and must not inherit the
+  // old one's deletion fence.
+  for (const key of [...ROUTE_FENCES.keys()]) if (live.has(key)) unfenceRoute(key);
   for (const [key, e] of [...SESSION_EXCLUSIONS]) if (!live.has(e.routeKey)) SESSION_EXCLUSIONS.delete(key);
   for (const [key, row] of [...SESSION_PREFS]) if (!live.has(row.routeKey)) SESSION_PREFS.delete(key);
   for (const id of [...ACCOUNT_OUTAGE_ROUTES.keys()]) {
@@ -1289,23 +1411,43 @@ function routeHealthSnapshot(cfg, now) {
     }
   }
   const rows = [];
-  for (const [key, r] of ROUTES) {
+  // Every CONFIGURED route gets a row, whether or not the registry has ever heard of it.
+  // A route with no history is not a route that does not exist: the operator configured
+  // it, and /health is where a deployment's state is read before anything has failed.
+  // Registry rows cannot be built first and merged later, because the seeded ones have to
+  // win on the fields the registry owns.
+  // The union of configured routes and live registry rows. ROUTES only ever holds routes the
+  // current config declares (pruneRoutes drops the rest), so a registry key missing from
+  // modelsByRoute is a route with no model reference - still live, still listed.
+  const allKeys = [...modelsByRoute.keys()];
+  for (const key of ROUTES.keys()) if (!modelsByRoute.has(key)) allKeys.push(key);
+  for (const key of allKeys) {
     const [backend, upstream] = JSON.parse(key);
-    const cooling = r.nextAvailableAt > now;
+    const r = ROUTES.get(key) || null;
+    const cooling = !!r && (r.nextAvailableAt || 0) > now;
+    // An operator block is reported with lastErrorKind "manual" and no deadline for a
+    // sticky one, so the dashboard renders the "uncool to restore" affordance instead of
+    // counting down to a recovery that will never come.
+    const manual = manualRouteBlock(key, now);
     rows.push({
       route: key,
+      id: backend, // the v3 field name for "which backend this deployment belongs to"
       backend,
       upstream,
       models: modelsByRoute.get(key) || [],
-      state: cooling ? "cooling" : (r.fails || 0) > 0 ? "probing" : "healthy",
-      fails: r.fails || 0,
-      nextAvailableAtMs: r.nextAvailableAt || 0,
-      retryInMs: cooling ? r.nextAvailableAt - now : 0,
-      probeInFlight: !!r.probeInFlight,
-      lastErrorKind: r.lastErrorKind || null,
-      lastStatus: r.lastStatus ?? null,
+      state: manual || cooling ? "cooling" : r && (r.fails || 0) > 0 ? "probing" : "healthy",
+      manual: !!manual,
+      fails: r ? (r.fails || 0) : 0,
+      nextAvailableAtMs: manual ? manual.until : (r ? (r.nextAvailableAt || 0) : 0),
+      retryInMs: manual ? (manual.until === Number.MAX_SAFE_INTEGER ? 0 : Math.max(0, manual.until - now)) : cooling ? r.nextAvailableAt - now : 0,
+      probeInFlight: !!(r && r.probeInFlight),
+      lastErrorKind: manual ? "manual" : (r && r.lastErrorKind) || null,
+      lastStatus: manual ? null : (r ? (r.lastStatus ?? null) : null),
     });
   }
+  // A registry row for a route the CURRENT config no longer declares is deliberately not
+  // listed: it is deleted (and fenced) by pruneRoutes, and a stale row here would make a
+  // removed route look routable.
   return rows;
 }
 
@@ -4741,9 +4883,14 @@ function server() {
 
     if (req.method === "GET" && url === "/health") {
       const now = Date.now();
+      // ONE snapshot for the whole response: the per-backend deployments[] projection and
+      // the flat routes[] list are two views of the same registry, and computing it twice
+      // would let a route cool between them.
+      const routeRows = routeHealthSnapshot(cfg, now);
       const backends = usableBackends(cfg).map((b) => {
         const h = health.get(b.id) || {};
         const isCooling = h.state === "cooling" && h.nextAvailableAt > now;
+        const accountCooling = !!isCooling; // an ACCOUNT block applies to every route of it
         return {
           id: b.id,
           state: isCooling ? "cooling" : "healthy",
@@ -4752,10 +4899,34 @@ function server() {
           lastError: h.lastError || null,
           manual: !!(isCooling && h.lastError && h.lastError.kind === "manual"),
           probeInFlight: !!h.probeInFlight,
+          // v3 projection, from the same route registry the dashboard already reads, so a
+          // configured route is listed before it has any history to report. The row is the
+          // route's own state, EXCEPT that an account-wide block is reported on every route
+          // of that account: ineligibility consults the account first, so a route with no
+          // failure of its own is still refused while its account is cooling, and a row
+          // claiming "healthy" there would be a lie about routing. lastErrorKind is
+          // deliberately the ROUTE's own kind - what the route itself last failed with.
+          deployments: routeRows
+            .filter((r) => r.backend === b.id)
+            .map((r) => ({
+              id: b.id,
+              upstream: r.upstream,
+              state: accountCooling || r.state === "cooling" ? "cooling" : r.state,
+              models: r.models,
+              fails: r.fails,
+              nextAvailableAtMs: accountCooling ? (h.nextAvailableAt || 0) : r.nextAvailableAtMs,
+              retryInMs: accountCooling ? Math.max(0, (h.nextAvailableAt || 0) - now) : r.retryInMs,
+              probeInFlight: accountCooling ? !!h.probeInFlight : r.probeInFlight,
+              lastErrorKind: r.lastErrorKind,
+              lastStatus: r.lastStatus,
+              manual: accountCooling
+                ? !!(h.lastError && h.lastError.kind === "manual")
+                : (r.state === "cooling" && r.lastErrorKind === "manual"),
+            })),
         };
       });
       res.writeHead(200, { "content-type": "application/json" });
-      return res.end(JSON.stringify({ ok: true, port: cfg.port, backends, routes: routeHealthSnapshot(cfg, now), preferences: sessionPreferenceStats() }));
+      return res.end(JSON.stringify({ ok: true, port: cfg.port, backends, routes: routeRows, preferences: sessionPreferenceStats() }));
     }
 
     if (req.method === "POST" && url === "/admin/reset-health") {
@@ -5162,6 +5333,44 @@ function server() {
         res.writeHead(400, { "content-type": "application/json" });
         return res.end(JSON.stringify({ error: { message: "action must be 'cool' or 'uncool'", type: "invalid_request_error" } }));
       }
+      // The optional `upstream` narrows the action to ONE physical route. It must name a
+      // string, and it must be a route some model actually declares - cooling a route
+      // nothing routes to would be a no-op reported as success.
+      if (body.upstream !== undefined && (typeof body.upstream !== "string" || !body.upstream)) {
+        res.writeHead(400, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ error: { message: "upstream must be a non-empty string", type: "invalid_request_error" } }));
+      }
+      if (body.upstream !== undefined) {
+        const rKey = JSON.stringify([id, body.upstream]);
+        if (!routeHealthSnapshot(cfg, Date.now()).some((r) => r.route === rKey)) {
+          res.writeHead(404, { "content-type": "application/json" });
+          return res.end(JSON.stringify({ error: { message: "route '" + id + "::" + body.upstream + "' is not declared by any model", type: "not_found" } }));
+        }
+        if (action === "cool") {
+          const forMs = typeof body.forMs === "number" && body.forMs > 0 ? body.forMs : null;
+          MANUAL_ROUTES.set(rKey, { until: forMs ? Date.now() + forMs : Number.MAX_SAFE_INTEGER, since: Date.now() });
+          recordCoolingEvent({ backend: id, action: "cool", kind: "manual", manual: true, scope: "route" });
+        } else {
+          MANUAL_ROUTES.delete(rKey);
+          // The route row goes with it: the operator cleared the only reason it was
+          // cooling, so leaving it behind would keep lastErrorKind "manual" on the
+          // dashboard for a route that is now eligible again.
+          //
+          // The fence is armed WHETHER OR NOT a row exists right now. A route that was never
+          // cooled has no row yet, and a request already in flight against it is exactly the
+          // work that must not create one after the operator cleared it. Hanging the fence off
+          // the row's presence made the guard conditional on a coincidence.
+          fenceRouteDeletion(rKey);
+          if (ROUTES.has(rKey)) {
+            ROUTES.delete(rKey);
+            recordCoolingEvent({ backend: id, action: "uncool", kind: "manual", manual: true, scope: "route" });
+          }
+        }
+        clearSessionPreferences(); // re-learn rather than overrule the operator
+        const after = routeHealthSnapshot(cfg, Date.now()).find((r) => r.route === rKey);
+        res.writeHead(200, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ ok: true, id, upstream: body.upstream, state: after ? after.state : "healthy" }));
+      }
       if (action === "cool") {
         const h = health.get(id) || { state: "healthy", fails: 0, backoffMs: 0 };
         // No forMs = STICKY manual cool: cooled until uncooled. MAX_SAFE_INTEGER
@@ -5185,6 +5394,14 @@ function server() {
           let owner = null;
           try { owner = JSON.parse(rkey)[0]; } catch { owner = null; }
           if (owner === id) ROUTES.delete(rkey);
+        }
+        // A targeted route block is an operator decision about this account too, so an
+        // account-wide uncool clears it. Leaving it would report "healthy" while the
+        // router still refused that route - the same lie finding 12 named.
+        for (const rkey of [...MANUAL_ROUTES.keys()]) {
+          let owner = null;
+          try { owner = JSON.parse(rkey)[0]; } catch { owner = null; }
+          if (owner === id) MANUAL_ROUTES.delete(rkey);
         }
       }
       clearSessionPreferences(); // re-learn rather than overrule the operator
