@@ -10,7 +10,7 @@ import { spawn } from "node:child_process";
 import vm from "node:vm";
 // Unit-level imports: server.mjs only starts the server when run as a script,
 // so importing it here gives direct access to strategy selection for tests.
-import { candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, resetAlertCooldowns, computeCost, writeConfigAtomic, validateConfig, convertLegacyConfig, validationSubjectOf } from "./server.mjs";
+import { candidates, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, noteCacheMiss, resetAlertCooldowns, computeCost, writeConfigAtomic, validateConfig, convertLegacyConfig, validationSubjectOf } from "./server.mjs";
 // Namespace import so a not-yet-implemented helper reads as undefined and fails
 // its own assertion, rather than crashing the whole file at load time.
 import * as SRV from "./server.mjs";
@@ -2111,11 +2111,58 @@ async function main() {
     resetAlertCooldowns();
   }
 
-  // z29) integration: a big cache MISS persists a bounded payload row AND fires
-  //      an ntfy alert; a full cache HIT does neither. Exercises Part 1 (pct
-  //      on /api/history) + Part 2 (persistent capture) + Part 3 (ntfy) end to
-  //      end through a real server child against mock backends and a mock ntfy
-  //      receiver.
+
+  // z35) unit-level: noteCacheMiss - the cache_miss alert fires on a REPEATED
+  //      pattern (minBreaks misses on one backend inside windowMs), not on a
+  //      single miss, because a new conversation always opens on a cold cache.
+  //      `now` is injected, so the window is exercised without sleeping.
+  {
+    resetAlertCooldowns(); // order independence: clear cooldown + streak state
+    const base = { baseUrl: "http://x", topic: "t", minMissPct: 50, minMissTokens: 0 };
+    const cfgn = { alerts: { ntfy: { ...base, minBreaks: 3, windowMs: 600000 } } };
+    const miss = { backend: "b1", cacheHitPct: 10, missTokens: 100, promptTokens: 1000, model: "m", session: "s" };
+    const t0 = 1000000;
+    assert(noteCacheMiss({}, miss, t0) === null, "z35a) no alerts.ntfy block -> null");
+    assert(noteCacheMiss(cfgn, miss, t0) === null, "z35b) miss 1 of 3 -> null (a lone miss is not a pattern)");
+    assert(noteCacheMiss(cfgn, miss, t0 + 1000) === null, "z35c) miss 2 of 3 -> null");
+    const a1 = noteCacheMiss(cfgn, miss, t0 + 2000);
+    assert(
+      a1 && a1.body.message.includes("x3") && a1.body.message.includes("b1") && a1.body.message.includes("10%"),
+      "z35d) miss 3 of 3 -> alert carrying the run size (msg=" + (a1 && a1.body.message) + ")"
+    );
+    assert(noteCacheMiss(cfgn, miss, t0 + 3000) === null, "z35e) the run reset on firing -> the next miss starts a fresh run");
+    resetAlertCooldowns();
+    // A run spread across backends is not one backend breaking.
+    assert(noteCacheMiss(cfgn, { ...miss, backend: "b1" }, t0) === null, "z35f) b1 x1 -> null");
+    assert(noteCacheMiss(cfgn, { ...miss, backend: "b2" }, t0) === null, "z35g) b2 x1 -> null");
+    assert(noteCacheMiss(cfgn, { ...miss, backend: "b1" }, t0) === null, "z35h) b1 x2 -> null (b2's miss does not count for b1)");
+    assert(noteCacheMiss(cfgn, { ...miss, backend: "b2" }, t0) === null, "z35i) b2 x2 -> null");
+    assert(noteCacheMiss(cfgn, { ...miss, backend: "b1" }, t0) !== null, "z35j) b1 x3 -> alert");
+    resetAlertCooldowns();
+    // Misses older than the window age out of the run.
+    assert(noteCacheMiss(cfgn, miss, t0) === null, "z35k) t0 -> null");
+    assert(noteCacheMiss(cfgn, miss, t0 + 700000) === null, "z35l) 11m later the first miss aged out of the 10m window -> null");
+    assert(noteCacheMiss(cfgn, miss, t0 + 800000) === null, "z35m) two fresh misses -> still null");
+    assert(noteCacheMiss(cfgn, miss, t0 + 900000) !== null, "z35n) three fresh misses inside the window -> alert");
+    resetAlertCooldowns();
+    // minBreaks: 1 restores the old fire-on-the-first-miss behavior.
+    const cfg1 = { alerts: { ntfy: { ...base, minBreaks: 1 } } };
+    assert(noteCacheMiss(cfg1, miss, t0) !== null, "z35o) minBreaks:1 -> the first miss fires");
+    // The per-kind cooldown still throttles a pattern that keeps repeating.
+    resetAlertCooldowns();
+    const cfg1c = { alerts: { ntfy: { ...base, minBreaks: 1, cooldownMs: 600000 } } };
+    assert(noteCacheMiss(cfg1c, miss, t0) !== null, "z35p) minBreaks:1 fires");
+    assert(noteCacheMiss(cfg1c, miss, t0 + 1000) === null, "z35q) inside the per-kind cooldown -> null");
+    resetAlertCooldowns();
+  }
+
+  // z29) integration: a big cache MISS persists a bounded payload row, and the
+  //      ntfy alert waits for a PATTERN - three qualifying misses on the same
+  //      backend inside the window - instead of firing on the first one, so a
+  //      fresh conversation's cold cache does not page the operator. A full
+  //      cache HIT does neither. Exercises Part 1 (pct on /api/history) + Part 2
+  //      (persistent capture) + Part 3 (ntfy) end to end through a real server
+  //      child against mock backends and a mock ntfy receiver.
   {
     const received = []; // POST bodies recorded by the mock ntfy receiver
     const ntfySrv = http.createServer((req, res) => {
@@ -2161,7 +2208,7 @@ async function main() {
         "p29b": { strategy: "affinity", models: ["m29b"] },
       },
       backoff: BO,
-      alerts: { ntfy: { baseUrl: `http://${HOST}:${ntfyPort}`, topic: "t29", minMissPct: 50, minMissTokens: 0, cooldownMs: 600000 } },
+      alerts: { ntfy: { baseUrl: `http://${HOST}:${ntfyPort}`, topic: "t29", minMissPct: 50, minMissTokens: 0, minBreaks: 3, windowMs: 600000, cooldownMs: 600000 } },
       missCapture: { enabled: true, maxMissPct: 50, minMissTokens: 0, file: "misses.jsonl" },
     };
     const { child: childZ29, base: baseZ29, dir: dirZ29 } = await startRouterCfg(cfgZ29, "KEY_Z29M=k\nKEY_Z29H=k\n");
@@ -2175,9 +2222,16 @@ async function main() {
       return false;
     };
     try {
-      // p29a: 10% cache hit -> a real miss. Tri-state stays true (hit > 0); the
-      // percentage is what the new feature reports.
-      const ra = await api(baseZ29, "/v1/chat/completions", { body: { model: "p29a", messages: [{ role: "user", content: "z29 miss probe" }] } });
+      const missesFile = join(dirZ29, "misses.jsonl");
+      const rows29 = async () => {
+        try { return (await readFile(missesFile, "utf8")).split("\n").filter(Boolean); } catch { return []; }
+      };
+      // One conversation (same `user`), one model, one backend: every miss below
+      // is the same run.
+      const miss = () => api(baseZ29, "/v1/chat/completions", { body: { model: "p29a", messages: [{ role: "user", content: "z29 miss probe" }], user: "s29" } });
+      // Miss 1: 10% cache hit -> a real miss. Tri-state stays true (hit > 0); the
+      // percentage is what the feature reports. The run is too short to alert.
+      const ra = await miss();
       assert(ra.status === 200, "z29a) p29a request succeeds (status=" + ra.status + ")");
       let hist = await (await api(baseZ29, "/api/history?limit=10", { method: "GET" })).json();
       let ea = hist.entries.find((e) => e.model === "p29a");
@@ -2185,34 +2239,41 @@ async function main() {
         ea && ea.cacheHit === true && ea.cacheHitPct === 10,
         "z29b) p29a history: cacheHit=true, cacheHitPct=10 (hit=" + (ea && ea.cacheHit) + ", pct=" + (ea && ea.cacheHitPct) + ")"
       );
+      await waitFor(async () => (await rows29()).length >= 1, 2000);
+      await sleep(150); // allow any (wrong) fire-and-forget to land
+      assert(
+        received.length === 0,
+        "z29c) 1 miss: no ntfy alert yet, the run is too short (received=" + received.length + ")"
+      );
+      const r2 = await miss();
+      assert(r2.status === 200, "z29d) second p29a miss succeeds (status=" + r2.status + ")");
+      await sleep(150);
+      assert(received.length === 0, "z29e) 2 misses: still no alert (received=" + received.length + ")");
+      const r3 = await miss();
+      assert(r3.status === 200, "z29f) third p29a miss succeeds (status=" + r3.status + ")");
       const alerted = await waitFor(() => received.length >= 1, 2000);
       assert(
-        alerted && received[0] && received[0].topic === "t29" && typeof received[0].message === "string" && received[0].message.includes("10%"),
-        "z29c) cache_miss ntfy alert fired with 10% (received=" + received.length + ")"
+        alerted && received[0] && received[0].topic === "t29" && typeof received[0].message === "string" &&
+        received[0].message.includes("10%") && received[0].message.includes("x3"),
+        "z29g) 3rd miss completes the run -> alert says x3 and 10% (received=" + received.length + ", msg=" + (received[0] && received[0].message) + ")"
       );
-      let missesFile = join(dirZ29, "misses.jsonl");
-      const missWritten = await waitFor(async () => {
-        try { return (await readFile(missesFile, "utf8")).split("\n").filter(Boolean).length === 1; } catch { return false; }
-      }, 2000);
-      let rows = missWritten ? (await readFile(missesFile, "utf8")).split("\n").filter(Boolean) : [];
-      let row0 = rows.length ? JSON.parse(rows[0]) : null;
+      const rows = await rows29();
+      const row0 = rows.length ? JSON.parse(rows[0]) : null;
       assert(
-        missWritten && row0 && row0.cacheHitPct === 10 && row0.cacheMissTokens === 900 &&
+        rows.length === 3 && row0 && row0.cacheHitPct === 10 && row0.cacheMissTokens === 900 &&
         Array.isArray(row0.payload && row0.payload.messages) && row0.payload.messages.some((m) => m.content === "z29 miss probe"),
-        "z29d) misses.jsonl has exactly 1 row with cacheHitPct=10, cacheMissTokens=900, and the sent message (rows=" + rows.length + ")"
+        "z29h) misses.jsonl holds one bounded row per miss, cacheHitPct=10, cacheMissTokens=900, with the sent message (rows=" + rows.length + ")"
       );
       // p29b: 100% cache hit -> no capture, no alert.
       const rb = await api(baseZ29, "/v1/chat/completions", { body: { model: "p29b", messages: [{ role: "user", content: "z29 hit probe" }] } });
-      assert(rb.status === 200, "z29e) p29b request succeeds (status=" + rb.status + ")");
+      assert(rb.status === 200, "z29i) p29b request succeeds (status=" + rb.status + ")");
       hist = await (await api(baseZ29, "/api/history?limit=10", { method: "GET" })).json();
       const eb = hist.entries.find((e) => e.model === "p29b");
-      assert(eb && eb.cacheHitPct === 100, "z29f) p29b history: cacheHitPct=100 (pct=" + (eb && eb.cacheHitPct) + ")");
+      assert(eb && eb.cacheHitPct === 100, "z29j) p29b history: cacheHitPct=100 (pct=" + (eb && eb.cacheHitPct) + ")");
       await sleep(100); // allow any (wrong) fire-and-forget to land
-      let rowsAfter = [];
-      try { rowsAfter = (await readFile(missesFile, "utf8")).split("\n").filter(Boolean); } catch { /* file may be absent -> 0 rows */ }
       assert(
-        rowsAfter.length === 1 && received.length === 1,
-        "z29g) 100% hit: misses.jsonl still 1 row and ntfy count still 1 (rows=" + rowsAfter.length + ", ntfy=" + received.length + ")"
+        (await rows29()).length === 3 && received.length === 1,
+        "z29k) 100% hit: misses.jsonl still 3 rows and ntfy count still 1 (rows=" + (await rows29()).length + ", ntfy=" + received.length + ")"
       );
     } finally {
       childZ29.kill();
@@ -2220,6 +2281,7 @@ async function main() {
       await rm(dirZ29, { recursive: true, force: true });
     }
   }
+
 
   // z34) integration: an ABSOLUTE missCapture.file is used as-is rather than
   //      joined to the config directory, so capture really appends there. The

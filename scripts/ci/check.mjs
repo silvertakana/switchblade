@@ -20,12 +20,12 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 // visible in review. Never lower it to turn a red run green — fix the code
 // or the test instead.
 //
-// Raised 594 -> 797 -> 809 on 2026-10-12, from a clean measured final suite on
-// Node 22, 24 and 25. This release work ADDED assertions (779 -> 809) and
-// deleted none, so the ratchet moves up; the brief forbids lowering it, and 594
-// was 203 assertions of unguarded drift. The last raise covers the assertions the
-// independent whole-branch review produced (zFence3a-e, u9s4).
-const SUITE_FLOOR = 809;
+// Raised 594 -> 797 -> 809 -> 830, every time from a clean measured suite, and
+// never lowered. Each raise counts only assertions this line added and deleted
+// none: 779 -> 809 is the combined release work plus the assertions the
+// independent whole-branch review produced (zFence3a-e, u9s4), and 809 -> 830 is
+// main's cache_miss escalation merging in (z35a-z35q) on top of that.
+const SUITE_FLOOR = 830;
 
 // Sanity floor for the S5 id scan: the suite carries far more ids than this,
 // so a count below the floor means the extractor broke, not that the ids went

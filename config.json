@@ -992,6 +992,8 @@
       "topic": "switchboardrouter_82738362",
       "minMissPct": 50,
       "minMissTokens": 20000,
+      "minBreaks": 5,
+      "windowMs": 1800000,
       "cooldownMs": 600000
     }
   }
