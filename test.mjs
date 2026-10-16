@@ -10500,6 +10500,82 @@ async function main() {
 
 
 
+  // zTool1) A tool `parameters` that declares no type is repaired to an object
+  //   schema before dispatch. A stub - `{}` for a hidden/rare tool, or no
+  //   `parameters` key for a no-argument tool - is legal JSON Schema, and a lenient
+  //   provider takes it, but a strict one rejects the WHOLE payload: OpenCode Zen Go
+  //   answers 400 "schema must be a JSON Schema of 'type: \"object\"', got 'type:
+  //   null'". The mock below is that strict provider, so what this pins is that the
+  //   turn is served instead of failing on the caller's stub.
+  {
+    let seenTools = null;
+    const srvStrict = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      seenTools = body.tools || null;
+      const bad = (body.tools || []).find((t) => {
+        const p = t.function && t.function.parameters;
+        return !p || (typeof p === "object" && !Array.isArray(p) && Object.keys(p).length === 0);
+      });
+      if (bad) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { param: null, type: "invalid_request_error", code: "invalid_request_error", message: "Upstream request failed: [invalid_request_error] Invalid schema for function '" + (bad.function && bad.function.name) + "': schema must be a JSON Schema of 'type: \"object\"', got 'type: null'." } }));
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: "mock", object: "chat.completion", choices: [{ message: { role: "assistant", content: "ok:strict" } }] }));
+    });
+    const portStrict = await listen(srvStrict);
+    const cfgTool = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "strict", baseURL: "http://" + HOST + ":" + portStrict, apiKeyEnv: "KEY_STRICT" }],
+      models: { mTool: { providers: [{ backend: "strict", upstream: "uTool" }], affinityPool: 1 } },
+      presets: { pTool: { strategy: "failover", models: ["mTool"] } },
+      backoff: { ...BO },
+    };
+    const hTool = await startRouterCfg(cfgTool, "KEY_STRICT=k\n");
+    const toolFixtures = [
+      { type: "function", function: { name: "browser_auth", description: "[rare] Export or restore the browser session's cookies (login state).", parameters: {} } },
+      { type: "function", function: { name: "no_arguments", description: "a tool declared with no parameters key" } },
+      { type: "function", function: { name: "typeless", description: "properties without a type", parameters: { properties: { a: { type: "string" } }, required: ["a"] } } },
+      { type: "function", function: { name: "declared", description: "a real schema", parameters: { type: "object", properties: { b: { type: "number" } }, required: ["b"] } } },
+      { type: "function", function: { name: "own_type", description: "declares a non-object type", parameters: { type: "array", items: { type: "string" } } } },
+      { type: "function", function: { name: "opaque", description: "a typeless anyOf", parameters: { anyOf: [{ type: "object" }] } } },
+    ];
+    try {
+      const rStrict = await api(hTool.base, "/v1/chat/completions", { body: { model: "pTool", messages: [{ role: "user", content: "hi" }], tools: toolFixtures } });
+      const txtStrict = await rStrict.text();
+      assert(
+        rStrict.status === 200 && txtStrict.indexOf("ok:strict") !== -1,
+        "zTool1) a typeless tool parameters is repaired before dispatch, so a strict provider serves the turn (status=" + rStrict.status + ", body=" + txtStrict.slice(0, 140) + ")"
+      );
+      const paramOf = (name) => {
+        const t = (seenTools || []).find((x) => x.function && x.function.name === name);
+        return t ? t.function.parameters : undefined;
+      };
+      assert(JSON.stringify(paramOf("browser_auth")) === '{"type":"object"}', "zTool1a) an empty parameters object becomes a bare object schema (got " + JSON.stringify(paramOf("browser_auth")) + ")");
+      assert(JSON.stringify(paramOf("no_arguments")) === '{"type":"object"}', "zTool1b) a missing parameters key becomes a bare object schema (got " + JSON.stringify(paramOf("no_arguments")) + ")");
+      assert(JSON.stringify(paramOf("typeless")) === '{"type":"object","properties":{"a":{"type":"string"}},"required":["a"]}', "zTool1c) a typeless properties schema gains the object type and keeps its keys (got " + JSON.stringify(paramOf("typeless")) + ")");
+      assert(JSON.stringify(paramOf("declared")) === JSON.stringify(toolFixtures[3].function.parameters), "zTool1d) a schema that already declares its type is passed through byte-identical (got " + JSON.stringify(paramOf("declared")) + ")");
+      assert(JSON.stringify(paramOf("own_type")) === JSON.stringify(toolFixtures[4].function.parameters), "zTool1e) a declared non-object type is left alone (got " + JSON.stringify(paramOf("own_type")) + ")");
+      assert(JSON.stringify(paramOf("opaque")) === JSON.stringify(toolFixtures[5].function.parameters), "zTool1f) a typeless anyOf is left alone, never narrowed (got " + JSON.stringify(paramOf("opaque")) + ")");
+      // Unit level, where the same object IS handed to both sides: the repair must
+      // build a new tool entry rather than edit the caller's body in place.
+      const unitBody = { model: "mTool", messages: [], tools: [{ type: "function", function: { name: "stub", parameters: {} } }] };
+      const unitBuilt = buildPayload(unitBody, {}, null, {}, { upstream: "uTool", params: {}, dropParams: [] }, { params: {}, dropParams: [] });
+      assert(
+        unitBuilt.tools[0].function.parameters.type === "object" && Object.keys(unitBody.tools[0].function.parameters).length === 0,
+        "zTool1g) buildPayload repairs the forwarded schema without mutating the caller's payload (unit got " + JSON.stringify(unitBuilt.tools[0].function.parameters) + " / caller " + JSON.stringify(unitBody.tools[0].function.parameters) + ")"
+      );
+      assert(unitBuilt.tools !== unitBody.tools, "zTool1h) the repaired tools array is a fresh array, so a later attempt cannot see an earlier attempt's edit");
+    } finally {
+      hTool.child.kill();
+      srvStrict.close();
+      await rm(hTool.dir, { recursive: true, force: true });
+    }
+  }
+
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
 }
