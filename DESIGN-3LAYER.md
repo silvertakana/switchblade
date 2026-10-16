@@ -582,6 +582,17 @@ Notes:
   authoritative for the whole reasoning group - a merged `reasoning_effort`
   (from config defaults or the client) is stripped so upstream never receives
   the contradictory pair (2026-09-09 reasoning-off fix).
+- Tool schemas: a tool whose `parameters` declares no JSON Schema type is
+  repaired (after the dialect steps, on a fresh tools array, never mutating the
+  caller's body) to `{"type":"object"}` - or to its own keys plus
+  `"type":"object"` when it carries properties with no type. Clients stub a
+  rare tool that way: dsh's tool-tiers plugin sends `parameters: {}` for every
+  hidden tool, and a strict provider rejects the entire payload over it
+  (OpenCode Zen Go: 400 "schema must be a JSON Schema of 'type: \"object\"', got
+  'type: null'", 2026-10-17). Function arguments are always an object, so this
+  is a no-op for a real schema: a declared type, a top-level
+  `anyOf`/`oneOf`/`allOf`/`$ref`/`enum`/`const`/`not`, and a `parameters` that
+  is not a plain object all pass through untouched.
 
 ### Config-time validation warnings (console.warn, never refuse to load)
 
@@ -1019,6 +1030,13 @@ backends capture payloads):
 19. z22 unknown id in nesting: a preset whose models list contains an unknown
     id (dropped at normalize) inside a nested preset context; valid sibling
     models still route.
+20. zTool1 tool schema repair: a mock provider that rejects any tool without
+    `parameters.type === "object"` (Zen's rule) serves a request whose tools
+    include `parameters: {}`, a missing `parameters`, and a typeless
+    properties schema; a schema that declares its type, a declared non-object
+    type, and a typeless anyOf reach the wire byte-identical. Unit level:
+    buildPayload repairs without mutating the caller's body and hands back a
+    fresh tools array.
 
 Expected total after preset-of-presets: 80 + 11 = 91 passing asserts (63
 legacy names, y-block, z1..z18 = 83 baseline, plus z19..z22 = 8 more).

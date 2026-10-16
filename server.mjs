@@ -3264,7 +3264,40 @@ function buildPayload(body, cfg, preset, model, deployment, backend) {
   if (backend.translateDeveloperRole && Array.isArray(out.messages)) {
     out.messages = out.messages.map((m) => (m && m.role === "developer" ? { ...m, role: "system" } : m));
   }
+  // Tool schemas last, once the dialect steps have settled the payload: a
+  // `parameters` that declares no type is repaired to an object schema. See
+  // normalizeToolParameters for why the repair exists and what it refuses to touch.
+  if (Array.isArray(out.tools)) out.tools = out.tools.map(normalizeToolParameters);
   return out;
+}
+
+// ---- tool schema repair ----------------------------------------------------
+
+// A client may stub a tool instead of describing its arguments: dsh's tool-tiers
+// plugin sends `parameters: {}` for every hidden/rare tool (the real contract stays
+// behind tool_search), and a tool declared with no arguments at all arrives with no
+// `parameters` key. The stub is legal JSON Schema, but a strict provider validates
+// the shape and refuses the WHOLE payload: OpenCode Zen Go answers 400 "Invalid
+// schema for function 'browser_auth': schema must be a JSON Schema of 'type:
+// \"object\"', got 'type: null'". The router classifies a 400 as the caller's payload
+// error (correctly, by status) and relays it, so the turn dies on a client's
+// presentation choice rather than on anything the model did (2026-10-17). Function
+// arguments are always an object, so a typeless schema becomes a bare object schema
+// here. A schema that already declares a type, one whose top level cannot be proven
+// object-shaped (anyOf/oneOf/$ref/...), and a `parameters` that is not a plain
+// object at all are returned exactly as the client sent them.
+const OPAQUE_SCHEMA_KEYS = ["anyOf", "oneOf", "allOf", "$ref", "enum", "const", "not"];
+
+function normalizeToolParameters(tool) {
+  const fn = tool && tool.function;
+  if (!fn || typeof fn !== "object") return tool;
+  const p = fn.parameters;
+  if (p !== undefined && p !== null && (typeof p !== "object" || Array.isArray(p))) return tool;
+  const keys = Object.keys(p || {});
+  if (!keys.length) return { ...tool, function: { ...fn, parameters: { type: "object" } } };
+  if (keys.includes("type")) return tool;
+  if (keys.some((k) => OPAQUE_SCHEMA_KEYS.includes(k))) return tool;
+  return { ...tool, function: { ...fn, parameters: { type: "object", ...p } } };
 }
 
 // ---- request forwarding ----------------------------------------------------
