@@ -1690,6 +1690,90 @@ async function main() {
     }
   }
 
+  // z11d) thinking-mode round-trip guard: with thinking enabled AND tools
+  //       present, every assistant tool-call turn must reach the upstream
+  //       carrying reasoning_content, because DeepSeek rejects the whole
+  //       request otherwise ("The reasoning_content in the thinking mode must
+  //       be passed back to the API"). Clients leave the field off when a step
+  //       produced no CoT, so it is filled with ""; a reasoning-keyed turn is
+  //       copied across; anything already carrying it stays byte-identical.
+  {
+    const z11d = mockBackend("z11d", {});
+    const portZ11d = await listen(z11d.srv);
+    z11d.port = portZ11d;
+    const cfgZ11d = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "z11d", baseURL: `http://${HOST}:${z11d.port}`, apiKeyEnv: "KEY_Z11D" }],
+      models: {
+        "m11d": { providers: [{ backend: "z11d", upstream: "deepseek-v4-flash" }], params: { thinking: { type: "enabled" } } },
+      },
+      presets: { "p11d": { strategy: "affinity", models: ["m11d"] } },
+      backoff: BO,
+    };
+    const { child: childZ11d, base: baseZ11d, dir: dirZ11d } = await startRouterCfg(cfgZ11d, "KEY_Z11D=test-key-z11d\n");
+    const toolCall = (id, name) => ({ id, type: "function", function: { name, arguments: "{}" } });
+    const messages = [
+      { role: "user", content: "go" },
+      { role: "assistant", content: null, tool_calls: [toolCall("c1", "read")] },
+      { role: "tool", tool_call_id: "c1", content: "result" },
+      { role: "assistant", content: null, reasoning_content: "kept", tool_calls: [toolCall("c2", "read")] },
+      { role: "tool", tool_call_id: "c2", content: "result" },
+      { role: "assistant", content: null, reasoning: "copied", tool_calls: [toolCall("c3", "read")] },
+      { role: "tool", tool_call_id: "c3", content: "result" },
+      { role: "assistant", content: "plain answer" },
+      { role: "user", content: "again" },
+    ];
+    const toolDefs = [{ type: "function", function: { name: "read", parameters: { type: "object", properties: {} } } }];
+    try {
+      await api(baseZ11d, "/v1/chat/completions", { body: { model: "p11d", messages, thinking: { type: "enabled" }, tools: toolDefs } });
+      const sent = JSON.parse(z11d.hits[z11d.hits.length - 1].body);
+      assert(
+        sent.messages[1].reasoning_content === "" && sent.messages[1].tool_calls.length === 1,
+        "z11d) a tool-call turn with no CoT is sent with reasoning_content:'' (" + JSON.stringify(sent.messages[1]) + ")"
+      );
+      assert(
+        sent.messages[3].reasoning_content === "kept",
+        "z11d2) an existing CoT is never overwritten (" + JSON.stringify(sent.messages[3]) + ")"
+      );
+      assert(
+        sent.messages[5].reasoning_content === "copied" && sent.messages[5].reasoning === "copied",
+        "z11d3) a reasoning-keyed turn is copied to reasoning_content, original kept (" + JSON.stringify(sent.messages[5]) + ")"
+      );
+      assert(
+        !("reasoning_content" in sent.messages[7]) && !("reasoning_content" in sent.messages[0]),
+        "z11d4) non-tool turns (assistant answer, user) are untouched (" + JSON.stringify(sent.messages[7]) + ")"
+      );
+      assert(
+        !("reasoningFilled" in sent) && !/reasoningFilled/.test(z11d.hits[z11d.hits.length - 1].body),
+        "z11d5) the fill marker never reaches the wire (" + JSON.stringify(Object.keys(sent)) + ")"
+      );
+      const histZ11d = await (await api(baseZ11d, "/api/history?limit=1", { method: "GET" })).json();
+      const rowZ11d = (histZ11d.entries || [])[0] || {};
+      assert(
+        rowZ11d.wireParams && rowZ11d.wireParams.reasoningFilled === 2,
+        "z11d6) /api/history surfaces how many turns were filled (wireParams=" + JSON.stringify(rowZ11d.wireParams) + ")"
+      );
+      // control: thinking disabled -> the guard must not fire
+      await api(baseZ11d, "/v1/chat/completions", { body: { model: "p11d", messages, thinking: { type: "disabled" }, tools: toolDefs } });
+      const sentOff = JSON.parse(z11d.hits[z11d.hits.length - 1].body);
+      assert(
+        !("reasoning_content" in sentOff.messages[1]) && sentOff.messages[5].reasoning_content === undefined,
+        "z11d7) control: thinking disabled -> payload untouched (" + JSON.stringify(sentOff.messages[1]) + ")"
+      );
+      // control: no tools -> nothing to round-trip, payload untouched
+      await api(baseZ11d, "/v1/chat/completions", { body: { model: "p11d", messages, thinking: { type: "enabled" } } });
+      const sentNoTools = JSON.parse(z11d.hits[z11d.hits.length - 1].body);
+      assert(
+        !("reasoning_content" in sentNoTools.messages[1]) && !("reasoning_content" in sentNoTools.messages[5]),
+        "z11d8) control: no tools -> payload untouched (" + JSON.stringify(sentNoTools.messages[1]) + ")"
+      );
+    } finally {
+      childZ11d.kill();
+      z11d.srv.close();
+      await rm(dirZ11d, { recursive: true, force: true });
+    }
+  }
+
   // z12) validation + empty 404: unknown strategy defaults; preset whose model
   //      ref is dropped -> 404 "preset '<id>' has no valid models".
   {

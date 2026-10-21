@@ -1949,6 +1949,10 @@ function extractWireParams(payload) {
   const out = {};
   if (p.thinking && typeof p.thinking === "object") out.thinking = String(p.thinking.type || "?");
   if (p.reasoning_effort != null) out.reasoning_effort = String(p.reasoning_effort);
+  // Set by buildPayload's thinking+tools round-trip guard: how many assistant
+  // tool-call turns had `reasoning_content` filled in because the client left
+  // it off. Non-zero explains a request the upstream used to reject. 2026-10-21.
+  if (p.reasoningFilled) out.reasoningFilled = p.reasoningFilled;
   if (p.max_tokens != null) out.max_tokens = p.max_tokens;
   if (p.temperature != null) out.temperature = p.temperature;
   if (Array.isArray(p.tools) && p.tools.length) out.tools = p.tools.length;
@@ -3268,6 +3272,36 @@ function buildPayload(body, cfg, preset, model, deployment, backend) {
   // `parameters` that declares no type is repaired to an object schema. See
   // normalizeToolParameters for why the repair exists and what it refuses to touch.
   if (Array.isArray(out.tools)) out.tools = out.tools.map(normalizeToolParameters);
+  // Round-trip guard for thinking mode with tools (2026-10-21). Upstream
+  // (DeepSeek via any front end) requires the CoT of every assistant tool-call
+  // turn to be echoed back once the request carries `tools`, and rejects the
+  // WHOLE request when one is missing: "The `reasoning_content` in the
+  // thinking mode must be passed back to the API" (400, no tokens generated,
+  // and by design a client error so the router does not fail over). Clients
+  // legitimately have nothing to echo when a step produced no reasoning, and
+  // they answer that by leaving the field off entirely - which the upstream
+  // reads as "not passed back". Fill "" (an explicit "this turn had no CoT"),
+  // and copy a `reasoning`-keyed turn across for clients that use that name.
+  // Only assistant turns that actually call tools need it; plain answers and
+  // turns that already carry reasoning are left byte-identical.
+  const thinkingOn = out.thinking
+    ? out.thinking.type === "enabled"
+    : out.reasoning_effort != null; // effort without a thinking block implies on
+  if (thinkingOn && Array.isArray(out.tools) && out.tools.length && Array.isArray(out.messages)) {
+    let filled = 0;
+    out.messages = out.messages.map((m) => {
+      if (!m || m.role !== "assistant" || !Array.isArray(m.tool_calls) || !m.tool_calls.length) return m;
+      const rc = typeof m.reasoning_content === "string" ? m.reasoning_content : null;
+      const r = typeof m.reasoning === "string" ? m.reasoning : null;
+      if (rc !== null) return m; // "" is already explicit; real CoT wins
+      if (r !== null && r.trim() !== "") { filled++; return { ...m, reasoning_content: r }; }
+      filled++;
+      return { ...m, reasoning_content: "" };
+    });
+    // Same diagnostic contract as thinkingStripped: readable on the history
+    // row, never on the wire (JSON.stringify skips non-enumerable keys).
+    if (filled) Object.defineProperty(out, "reasoningFilled", { value: filled, enumerable: false });
+  }
   return out;
 }
 
