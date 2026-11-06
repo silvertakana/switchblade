@@ -3341,18 +3341,30 @@ function normalizeToolParameters(tool) {
 // then classifies as a non-retryable client error and charges to the request.
 // The rule is explicit rather than a bare || chain because an empty or
 // whitespace-only header is falsy but PRESENT, and a blank sessionKey would
-// fall through the chain unchanged. Fall back to the router's resolved session
-// key, then the same 'no-session' literal the resolver uses.
+// fall through the chain unchanged.
+//
+// It must also never be the literal "no-session": the Go gateway refuses that
+// exact value with a generic 429 "[overloaded]" (measured 0/21 successes over
+// four windows, against ~80% for any unique value in the same seconds), so
+// every session-less client - the Playground, plain curl - failed 100% of the
+// time while session-carrying clients succeeded. Anonymous callers have no
+// conversation identity to preserve, so mint a per-request id instead; routing
+// still uses sessionKey, so provider selection is unchanged.
 function sessionHeaderFor(incomingHeaders, sessionKey) {
   const raw = incomingHeaders && incomingHeaders["x-opencode-session"];
+  let value = null;
   if (typeof raw === "string") {
     const trimmed = raw.trim();
-    if (trimmed) return trimmed;
+    if (trimmed) value = trimmed;
   } else if (raw) {
-    return String(raw);
+    value = String(raw);
   }
-  const key = typeof sessionKey === "string" ? sessionKey.trim() : sessionKey;
-  return key || "no-session";
+  if (!value) {
+    const key = typeof sessionKey === "string" ? sessionKey.trim() : sessionKey;
+    if (key && key !== "no-session") value = key;
+  }
+  if (value && value !== "no-session") return value;
+  return "sb-" + crypto.randomUUID();
 }
 
 async function forward(req, cfg, backend, payload, incomingHeaders, stream, sessionKey, callerSignal) {

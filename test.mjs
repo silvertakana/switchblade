@@ -6573,9 +6573,14 @@ async function main() {
         assert(rec.ocSession === "sess-X", "zM7a) x-opencode-session = session key (x-session-affinity) (got " + rec.ocSession + ")");
         assert(rec.ua && !rec.ua.toLowerCase().startsWith("node"), "zM7b) user-agent is identifiable, not Node default (got " + rec.ua + ")");
 
+        // The Go gateway refuses the literal "no-session" with 429 [overloaded]
+        // (0/21 measured, vs ~80% for unique values), so an anonymous request
+        // that resolved no session key must be minted a per-request id instead.
+        const sbRe = /^sb-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
         await api(baseM7, "/v1/chat/completions", { body: { model: "mf", messages: [] } });
         rec = srvM7.hits[srvM7.hits.length - 1];
-        assert(rec.ocSession === "no-session", "zM7c) no client session -> x-opencode-session no-session (got " + rec.ocSession + ")");
+        assert(sbRe.test(rec.ocSession || ""), "zM7c) no client session -> upstream gets a minted sb-<uuid>, never 'no-session' (got " + rec.ocSession + ")");
+        const firstAnon = rec.ocSession;
 
         await api(baseM7, "/v1/chat/completions", { body: { model: "mf", messages: [] }, headers: { "x-opencode-session": "client-oc" } });
         rec = srvM7.hits[srvM7.hits.length - 1];
@@ -6585,7 +6590,15 @@ async function main() {
         assert(rec.ocSession === "sess-X", "zM7e) blank client x-opencode-session is replaced by the session key, never forwarded blank (got " + JSON.stringify(rec.ocSession) + ")");
         await api(baseM7, "/v1/chat/completions", { body: { model: "mf", messages: [] }, headers: { "x-opencode-session": "   " } });
         rec = srvM7.hits[srvM7.hits.length - 1];
-        assert(rec.ocSession === "no-session", "zM7f) whitespace-only client x-opencode-session falls back to no-session (got " + JSON.stringify(rec.ocSession) + ")");
+        assert(sbRe.test(rec.ocSession || ""), "zM7f) whitespace-only client x-opencode-session is minted, never 'no-session' (got " + JSON.stringify(rec.ocSession) + ")");
+
+        await api(baseM7, "/v1/chat/completions", { body: { model: "mf", messages: [] } });
+        rec = srvM7.hits[srvM7.hits.length - 1];
+        assert(sbRe.test(rec.ocSession || "") && rec.ocSession !== firstAnon, "zM7g) each anonymous request gets its own session id (first " + firstAnon + ", second " + rec.ocSession + ")");
+
+        await api(baseM7, "/v1/chat/completions", { body: { model: "mf", messages: [] }, headers: { "x-opencode-session": "no-session" } });
+        rec = srvM7.hits[srvM7.hits.length - 1];
+        assert(sbRe.test(rec.ocSession || ""), "zM7h) an explicit 'no-session' client header is rewritten, never forwarded upstream (got " + JSON.stringify(rec.ocSession) + ")");
       } finally {
         childM7.kill();
         srvM7.srv.close();
@@ -8311,33 +8324,42 @@ async function main() {
       );
     }
   }
-  // ---- forwarding: x-opencode-session is never blank ------------------------
+  // ---- forwarding: x-opencode-session is never blank or "no-session" -------
   // OpenCode Go answers a blank x-opencode-session with 400 MissingSessionID,
   // which the router classifies as a non-retryable client error and charges to
   // the request. An empty or whitespace-only client header must be REPLACED,
-  // and a blank resolved session key must not leak through as a blank header -
-  // the guard is enforced here, not left to the falsiness of a || chain (an
-  // empty string and a single space are both things a client can send).
+  // and a blank resolved session key must not leak through as a blank header.
+  // The literal "no-session" must never reach the gateway either: it is refused
+  // with 429 [overloaded] (0/21 measured), so anonymous callers are minted a
+  // per-request sb-<uuid> instead.
   {
+    const MINTED = /^sb-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
     const shCases = [
       ["recSession1", { "x-opencode-session": "" }, "sess-A", "sess-A"],
       ["recSession2", { "x-opencode-session": "   " }, "sess-A", "sess-A"],
-      ["recSession3", { "x-opencode-session": "" }, "", "no-session"],
-      ["recSession4", { "x-opencode-session": "   " }, "", "no-session"],
+      ["recSession3", { "x-opencode-session": "" }, "", MINTED],
+      ["recSession4", { "x-opencode-session": "   " }, "", MINTED],
       ["recSession5", { "x-opencode-session": "client-oc" }, "sess-A", "client-oc"],
       ["recSession6", { "x-opencode-session": "  padded-key  " }, "sess-A", "padded-key"],
       ["recSession7", {}, "sess-A", "sess-A"],
-      ["recSession8", {}, "", "no-session"],
-      ["recSession9", { "x-opencode-session": "no-session" }, "", "no-session"],
+      ["recSession8", {}, "", MINTED],
+      ["recSession9", { "x-opencode-session": "no-session" }, "", MINTED],
+      ["recSession10", { "x-opencode-session": "no-session" }, "sess-A", MINTED],
+      ["recSession11", {}, "no-session", MINTED],
     ];
     for (const [id, headers, sessionKey, want] of shCases) {
       const got = SRV.sessionHeaderFor(headers, sessionKey);
+      const ok = want instanceof RegExp ? want.test(got || "") : got === want;
       assert(
-        got === want,
-        id + ") sessionHeaderFor(" + JSON.stringify(headers) + ", " + JSON.stringify(sessionKey) + ") must be " + JSON.stringify(want) +
-          " - a blank x-opencode-session (empty or whitespace) must be replaced, and the session-key fallback must itself be non-blank; got " + JSON.stringify(got)
+        ok,
+        id + ") sessionHeaderFor(" + JSON.stringify(headers) + ", " + JSON.stringify(sessionKey) + ") must be " +
+          (want instanceof RegExp ? "a minted sb-<uuid>" : JSON.stringify(want)) +
+          " - a blank x-opencode-session (empty or whitespace) must be replaced, the session-key fallback must itself be non-blank, and the literal 'no-session' must never be forwarded; got " + JSON.stringify(got)
       );
     }
+    const a = SRV.sessionHeaderFor({}, "");
+    const b = SRV.sessionHeaderFor({}, "");
+    assert(a !== b, "recSession12) two anonymous calls must not share a minted session id (got " + a + " twice)");
   }
 
   // ---- config editor: merge-preserve contract (index.html) -------------------
