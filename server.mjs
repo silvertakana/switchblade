@@ -3687,6 +3687,10 @@ async function handleChat(req, res, cfg, bodyText) {
   // Built once per request rather than per attempt: the payload builder and the
   // deployment read both need it, and `modelDeployments` re-resolves the entry.
   const backendById = backendsById(cfg);
+  // Retry tallies for the TERMINAL row: a failed request that burned retries must
+  // report them, not 0 (the per-attempt counters below are scoped to one candidate).
+  let requestRetries = 0;
+  let requestRetryWaitedMs = 0;
   for (let poolIndex = 0; poolIndex < pool.length; poolIndex++) {
     const attempt = pool[poolIndex];
     if (deadAccounts.has(attempt.backend)) continue; // this request already lost that account
@@ -3761,8 +3765,19 @@ async function handleChat(req, res, cfg, bodyText) {
       if (bookRoute) bookRoute.dispatchSeq = attempt.dispatchSeq;
       const bookAccount = health.get(attempt.backend);
       if (bookAccount) bookAccount.dispatchSeq = attempt.dispatchSeq;
+      const dispatchStarted = Date.now();
       result = await forward(req, cfg, backend, payload, req.headers, stream, sessionKey, callerAbort.signal);
+      const dispatchElapsed = Date.now() - dispatchStarted;
       const admissionRefusal = !!result.err && isAdmissionRefusal(result.err.status, result.err.body);
+      // A connect or header timeout already burned the backend's whole connect
+      // budget: retrying the SAME provider queues the identical large prefill
+      // behind the same wall and multiplies the client's wait (45 s x retries).
+      // Fail over instead; only fast transport failures are worth retrying here.
+      const slowConnect = !!(
+        result.err &&
+        (result.err.stage === "connect" || result.err.stage === "header_timeout") &&
+        dispatchElapsed > 15000
+      );
       // Admission control is the one failure the upstream itself says to retry,
       // and it is cheap to retry: measured ~50% admitted per attempt, so a few
       // fast attempts turn "cell busy" into a served turn. It therefore retries
@@ -3774,6 +3789,7 @@ async function handleChat(req, res, cfg, bodyText) {
       if (
         result.err &&
         isRetryableError(result.err.status, result.err.body) &&
+        !slowConnect &&
         retries < capThisAttempt &&
         (admissionRefusal || !hasEligibleAlternative())
       ) {
@@ -3791,6 +3807,8 @@ async function handleChat(req, res, cfg, bodyText) {
       }
       break;
     }
+    requestRetries += retries;
+    requestRetryWaitedMs += retryWaitedMs;
     const attemptRec = {
       backend: attempt.backend,
       upstream: attempt.upstream || provider.upstream || null,
@@ -3986,7 +4004,7 @@ async function handleChat(req, res, cfg, bodyText) {
   const lastKind = lastErr ? classify(lastErr.status, lastErr.body, lastErr.errorBodyState) : null;
   const explainedClient = lastKind === "client" && !!lastErr;
   const finalStatus = explainedClient ? (lastErr.status || 400) : 503;
-  const failEntry = applyCost(newHistoryEntry({ t: detailT, callId, model: modelId, backend: lastTried ? lastTried.backend : "none", stream, status: finalStatus, latencyMs, session: sessionKey, routedModel: c.ordered[0] ? c.ordered[0].model : null, selectionReason, fallbackCount, cacheMayBeCold: fallbackCount > 0, ...capAttemptsSummary(attemptsSummary), errorKind: lastKind }), cfg);
+  const failEntry = applyCost(newHistoryEntry({ t: detailT, callId, model: modelId, backend: lastTried ? lastTried.backend : "none", stream, status: finalStatus, latencyMs, session: sessionKey, routedModel: c.ordered[0] ? c.ordered[0].model : null, selectionReason, fallbackCount, cacheMayBeCold: fallbackCount > 0, retries: requestRetries, retryWaitedMs: requestRetryWaitedMs, ...capAttemptsSummary(attemptsSummary), errorKind: lastKind }), cfg);
   recordHistory(failEntry);
   recordAnalytics(failEntry);
   // A caller who left is not provider exhaustion, so it must not raise the operator alert.
