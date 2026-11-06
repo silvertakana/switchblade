@@ -3385,7 +3385,7 @@ async function main() {
       SRV.sessionPreferenceKey("scopeA", "s1", "m") !== SRV.sessionPreferenceKey("scopeA", "s1", "m2"),
       "zSess4b) the logical model is part of the key"
     );
-    assert(SRV.sessionPreferenceKey("scopeA", "no-session", "m") === null, "zSess4c) no-session callers get no pin");
+    assert(SRV.sessionPreferenceKey("scopeA", null, "m") === null, "zSess4c) no-session callers get no pin");
     assert(
       SRV.authScopeOf({ headers: { authorization: "Bearer abc" } }) !== SRV.authScopeOf({ headers: { authorization: "Bearer def" } }),
       "zSess4d) different credentials get different scopes"
@@ -6733,15 +6733,19 @@ async function main() {
       }
     }
 
-    // zM7) Console Go compliance: upstream requests carry x-opencode-session
-    //      (client header wins, else the resolved session key) and an
-    //      identifiable user-agent instead of Node's default.
+    // zM7) Provider-declared identity field: upstream requests carry
+    //      x-opencode-session only because this backend declares it (a backend
+    //      without the block gets no such header), and an identifiable
+    //      user-agent instead of Node's default.
     {
       const srvM7 = mockBackend("sess-p", {});
       const portM7 = await listen(srvM7.srv);
       const cfgM7 = {
         port: 0, prefix: "/v1", masterKeyEnv: null,
-        backends: [{ id: "sess-p", baseURL: `http://${HOST}:${portM7}`, apiKeyEnv: "KEY_SESS_P" }],
+        backends: [{
+          id: "sess-p", baseURL: `http://${HOST}:${portM7}`, apiKeyEnv: "KEY_SESS_P",
+          session: { field: "header:x-opencode-session", affinity: true, whenMissing: "affinity" },
+        }],
         models: { "mf": { providers: [{ backend: "sess-p", upstream: "u" }] } },
         backoff: BO,
       };
@@ -6752,9 +6756,9 @@ async function main() {
         assert(rec.ocSession === "sess-X", "zM7a) x-opencode-session = session key (x-session-affinity) (got " + rec.ocSession + ")");
         assert(rec.ua && !rec.ua.toLowerCase().startsWith("node"), "zM7b) user-agent is identifiable, not Node default (got " + rec.ua + ")");
 
-        // The Go gateway refuses the literal "no-session" with 429 [overloaded]
-        // (0/21 measured, vs ~80% for unique values), so an anonymous request
-        // that resolved no session key must be minted a per-request id instead.
+        // Absence is null internally: an anonymous request must get a minted
+        // sb-<uuid>, never the old "no-session" sentinel (the literal was never
+        // refused; sending it was a routing problem, not a gateway rule).
         const sbRe = /^sb-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
         await api(baseM7, "/v1/chat/completions", { body: { model: "mf", messages: [] } });
         rec = srvM7.hits[srvM7.hits.length - 1];
@@ -6777,12 +6781,89 @@ async function main() {
 
         await api(baseM7, "/v1/chat/completions", { body: { model: "mf", messages: [] }, headers: { "x-opencode-session": "no-session" } });
         rec = srvM7.hits[srvM7.hits.length - 1];
-        assert(sbRe.test(rec.ocSession || ""), "zM7h) an explicit 'no-session' client header is rewritten, never forwarded upstream (got " + JSON.stringify(rec.ocSession) + ")");
+        assert(rec.ocSession === "no-session", "zM7h) an explicit 'no-session' client header is a normal client value and is forwarded verbatim (got " + JSON.stringify(rec.ocSession) + ")");
       } finally {
         childM7.kill();
         srvM7.srv.close();
         await rm(dirM7, { recursive: true, force: true });
       }
+    }
+  }
+
+  // zM8) Provider-declared session field end to end: only declared backends
+  //      receive the header, a client value gives affinity, anonymous calls
+  //      spread and mint, body fields are injected into a clone, and omit
+  //      strips the field.
+  {
+    const srvSA = mockBackend("sess-a", {});
+    const srvSB = mockBackend("sess-b", {});
+    const srvSC = mockBackend("sess-c", {});
+    const srvSD = mockBackend("sess-d", {});
+    const srvSE = mockBackend("sess-e", {});
+    const pSA = await listen(srvSA.srv), pSB = await listen(srvSB.srv);
+    const pSC = await listen(srvSC.srv), pSD = await listen(srvSD.srv), pSE = await listen(srvSE.srv);
+    const cfgM8 = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "sess-a", baseURL: `http://${HOST}:${pSA}`, apiKeyEnv: "KEY_SA", session: { field: "header:x-opencode-session", whenMissing: "affinity" } },
+        { id: "sess-b", baseURL: `http://${HOST}:${pSB}`, apiKeyEnv: "KEY_SB", session: { field: "header:x-opencode-session", whenMissing: "affinity" } },
+        { id: "sess-c", baseURL: `http://${HOST}:${pSC}`, apiKeyEnv: "KEY_SC" },
+        { id: "sess-d", baseURL: `http://${HOST}:${pSD}`, apiKeyEnv: "KEY_SD", session: { field: "body:session_id", whenMissing: "affinity" } },
+        { id: "sess-e", baseURL: `http://${HOST}:${pSE}`, apiKeyEnv: "KEY_SE", session: { field: "body:session_id", whenMissing: "omit" } },
+      ],
+      models: {
+        m8: { providers: [{ backend: "sess-a", upstream: "u" }, { backend: "sess-b", upstream: "u" }], affinityPool: 2 },
+        m8c: { providers: [{ backend: "sess-c", upstream: "u" }], affinityPool: 1 },
+        m8d: { providers: [{ backend: "sess-d", upstream: "u" }], affinityPool: 1 },
+        m8e: { providers: [{ backend: "sess-e", upstream: "u" }], affinityPool: 1 },
+      },
+      backoff: BO,
+    };
+    const hM8 = await startRouterCfg(cfgM8, "KEY_SA=k\nKEY_SB=k\nKEY_SC=k\nKEY_SD=k\nKEY_SE=k\n");
+    try {
+      // A client-supplied provider field is both the wire value and the key.
+      const seen = new Set();
+      for (let i = 0; i < 4; i++) {
+        const r = await api(hM8.base, "/v1/chat/completions", { body: { model: "m8", messages: [] }, headers: { "x-opencode-session": "stable-1" } });
+        seen.add(r.headers.get("x-router-backend"));
+      }
+      assert(seen.size === 1, "zM8a) the same client session id stays on one backend (got " + JSON.stringify([...seen]) + ")");
+      const hist = await (await api(hM8.base, "/api/history?limit=1", { method: "GET" })).json();
+      const hrow = hist.entries && hist.entries[0];
+      assert(hrow && hrow.session === "stable-1" && hrow.sessionSource === "header:x-opencode-session", "zM8b) history names the source field (got " + JSON.stringify(hrow && { session: hrow.session, sessionSource: hrow.sessionSource }) + ")");
+      assert(hrow && hrow.wireSessionField === "header:x-opencode-session" && hrow.wireSessionSource === "client" && /^[0-9a-f]{8}$/.test(hrow.wireSessionHash || ""), "zM8c) history records the wire field, source, and hash (got " + JSON.stringify(hrow && { f: hrow.wireSessionField, s: hrow.wireSessionSource, h: hrow.wireSessionHash }) + ")");
+
+      // A backend with no declaration must not receive the client's header.
+      await api(hM8.base, "/v1/chat/completions", { body: { model: "m8c", messages: [] }, headers: { "x-opencode-session": "leak-test", "x-session-affinity": "leak-affinity" } });
+      assert(srvSC.hits.length === 1 && srvSC.hits[0].ocSession === null, "zM8d) an undeclared backend gets no x-opencode-session (got " + JSON.stringify(srvSC.hits[0] && srvSC.hits[0].ocSession) + ")");
+
+      // Anonymous requests spread instead of hashing one sentinel bucket, and
+      // each gets its own minted wire id.
+      const sbRe = /^sb-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+      const anonBackends = new Set();
+      for (let i = 0; i < 20; i++) {
+        const r = await api(hM8.base, "/v1/chat/completions", { body: { model: "m8", messages: [] } });
+        anonBackends.add(r.headers.get("x-router-backend"));
+      }
+      const anonIds = [...srvSA.hits, ...srvSB.hits].map((h) => h.ocSession).filter((v) => v && v.startsWith("sb-"));
+      assert(anonBackends.size >= 2, "zM8e) anonymous requests spread across backends (hit " + JSON.stringify([...anonBackends]) + ")");
+      assert(anonIds.length >= 20 && anonIds.every((v) => sbRe.test(v)) && new Set(anonIds).size === anonIds.length, "zM8f) every anonymous request mints a distinct sb-<uuid> (got " + anonIds.length + " ids, " + new Set(anonIds).size + " distinct)");
+
+      // A body field is written into a copy of the payload, and omit removes it.
+      await api(hM8.base, "/v1/chat/completions", { body: { model: "m8d", messages: [], session_id: "body-1" } });
+      const body1 = JSON.parse(srvSD.hits[0].body);
+      assert(body1.session_id === "body-1" && srvSD.hits[0].ocSession === null, "zM8g) body:session_id is forwarded verbatim with no header (got " + JSON.stringify({ id: body1.session_id, oc: srvSD.hits[0].ocSession }) + ")");
+      await api(hM8.base, "/v1/chat/completions", { body: { model: "m8d", messages: [] } });
+      const body2 = JSON.parse(srvSD.hits[1].body);
+      assert(sbRe.test(body2.session_id || ""), "zM8h) an anonymous body field is minted (got " + JSON.stringify(body2.session_id) + ")");
+
+      await api(hM8.base, "/v1/chat/completions", { body: { model: "m8e", messages: [], session_id: "drop-me" } });
+      const body3 = JSON.parse(srvSE.hits[0].body);
+      assert(!("session_id" in body3), "zM8i) whenMissing=omit strips the body field (got " + JSON.stringify(body3) + ")");
+    } finally {
+      hM8.child.kill();
+      for (const s of [srvSA, srvSB, srvSC, srvSD, srvSE]) s.srv.close();
+      await rm(hM8.dir, { recursive: true, force: true });
     }
   }
 
@@ -8503,42 +8584,109 @@ async function main() {
       );
     }
   }
-  // ---- forwarding: x-opencode-session is never blank or "no-session" -------
-  // OpenCode Go answers a blank x-opencode-session with 400 MissingSessionID,
-  // which the router classifies as a non-retryable client error and charges to
-  // the request. An empty or whitespace-only client header must be REPLACED,
-  // and a blank resolved session key must not leak through as a blank header.
-  // The literal "no-session" must never reach the gateway either: it is refused
-  // with 429 [overloaded] (0/21 measured), so anonymous callers are minted a
-  // per-request sb-<uuid> instead.
+  // ---- session identity resolution (provider-declared field) ---------------
+  // Absence is null, never a sentinel. The wire writer only touches a field a
+  // backend declares, and the client's own value wins over the affinity key.
   {
     const MINTED = /^sb-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-    const shCases = [
-      ["recSession1", { "x-opencode-session": "" }, "sess-A", "sess-A"],
-      ["recSession2", { "x-opencode-session": "   " }, "sess-A", "sess-A"],
-      ["recSession3", { "x-opencode-session": "" }, "", MINTED],
-      ["recSession4", { "x-opencode-session": "   " }, "", MINTED],
-      ["recSession5", { "x-opencode-session": "client-oc" }, "sess-A", "client-oc"],
-      ["recSession6", { "x-opencode-session": "  padded-key  " }, "sess-A", "padded-key"],
-      ["recSession7", {}, "sess-A", "sess-A"],
-      ["recSession8", {}, "", MINTED],
-      ["recSession9", { "x-opencode-session": "no-session" }, "", MINTED],
-      ["recSession10", { "x-opencode-session": "no-session" }, "sess-A", MINTED],
-      ["recSession11", {}, "no-session", MINTED],
-    ];
-    for (const [id, headers, sessionKey, want] of shCases) {
-      const got = SRV.sessionHeaderFor(headers, sessionKey);
-      const ok = want instanceof RegExp ? want.test(got || "") : got === want;
-      assert(
-        ok,
-        id + ") sessionHeaderFor(" + JSON.stringify(headers) + ", " + JSON.stringify(sessionKey) + ") must be " +
-          (want instanceof RegExp ? "a minted sb-<uuid>" : JSON.stringify(want)) +
-          " - a blank x-opencode-session (empty or whitespace) must be replaced, the session-key fallback must itself be non-blank, and the literal 'no-session' must never be forwarded; got " + JSON.stringify(got)
-      );
-    }
-    const a = SRV.sessionHeaderFor({}, "");
-    const b = SRV.sessionHeaderFor({}, "");
-    assert(a !== b, "recSession12) two anonymous calls must not share a minted session id (got " + a + " twice)");
+    const req = { headers: { "x-session-affinity": "sess-A", "x-opencode-session": "client-oc" } };
+    const body = { session_id: "body-sess", user: "u-1" };
+
+    const keyNone = SRV.resolveSessionIdentity({ headers: {} }, {}, ["header:x-session-affinity", "header:x-session-id", "body:session_id", "body:sessionId", "body:user"]);
+    assert(keyNone.key === null && keyNone.source === null, "recSession1) no source -> null key, never 'no-session'");
+
+    const keyAff = SRV.resolveSessionIdentity(req, body, ["header:x-session-affinity"]);
+    assert(keyAff.key === "sess-A" && keyAff.source === "header:x-session-affinity", "recSession2) header source wins and reports its source");
+
+    const keyBody = SRV.resolveSessionIdentity({ headers: {} }, body, ["body:session_id"]);
+    assert(keyBody.key === "body-sess" && keyBody.source === "body:session_id", "recSession3) body source resolves");
+
+    const wireClient = SRV.resolveSessionWire({ session: { field: "header:x-opencode-session" } }, req, body, "sess-A");
+    assert(wireClient.value === "client-oc" && wireClient.source === "client", "recSession4) client value wins");
+
+    const wireAffinity = SRV.resolveSessionWire({ session: { field: "header:x-opencode-session" } }, { headers: { "x-session-affinity": "sess-A" } }, {}, "sess-A");
+    assert(wireAffinity.value === "sess-A" && wireAffinity.source === "affinity", "recSession5) missing client value reuses the affinity key");
+
+    const wireMintA = SRV.resolveSessionWire({ session: { field: "header:x-opencode-session" } }, { headers: {} }, {}, null);
+    const wireMintB = SRV.resolveSessionWire({ session: { field: "header:x-opencode-session" } }, { headers: {} }, {}, null);
+    assert(MINTED.test(wireMintA.value) && MINTED.test(wireMintB.value) && wireMintA.value !== wireMintB.value, "recSession6) two anonymous calls get different minted ids");
+    assert(wireMintA.source === "minted", "recSession7) the source reports minted");
+
+    const wireOmit = SRV.resolveSessionWire({ session: { field: "body:session_id", whenMissing: "omit" } }, { headers: {} }, body, "sess-A");
+    assert(wireOmit.value === null && wireOmit.source === "omit", "recSession8) omit sends nothing even when the client supplied a value");
+
+    const wireMintMode = SRV.resolveSessionWire({ session: { field: "header:x-opencode-session", whenMissing: "mint" } }, { headers: {} }, {}, "sess-A");
+    assert(MINTED.test(wireMintMode.value) && wireMintMode.value !== "sess-A", "recSession9) whenMissing=mint ignores the affinity key");
+
+    const noDecl = SRV.resolveSessionWire({}, req, body, "sess-A");
+    assert(noDecl === null, "recSession10) a backend with no declaration writes no identity field");
+
+    assert(SRV.parseSessionField("header:__proto__") === null && SRV.parseSessionField("header:x y") === null && SRV.parseSessionField("body:__proto__") === null, "recSession10b) unsafe or invalid field names are rejected");
+    assert(SRV.parseSessionField("HEADER:X-Session-Id").name === "x-session-id", "recSession10c) header names are case-normalized");
+
+    const invalid = SRV.resolveSessionWire({ session: { field: "header:x-opencode-session" } }, { headers: {} }, {}, "bad\nkey");
+    assert(MINTED.test(invalid.value), "recSession11) an affinity key with a control character is not written as a header");
+
+    // Affinity source construction: explicit list first, declared fields appended
+    // and deduped, body fallbacks only when no explicit list was given.
+    const cfgSrc = { backends: [
+      { id: "a", session: { field: "header:x-opencode-session" } },
+      { id: "b", session: { field: "body:session_key", affinity: false } },
+      { id: "c", session: { field: "header:x-session-affinity" } },
+    ] };
+    const sources = SRV.sessionSourcesFor(cfgSrc);
+    assert(sources[0] === "header:x-session-affinity" && sources[1] === "header:x-session-id" && sources.includes("header:x-opencode-session"), "recSession12) declared fields join the default list");
+    assert(!sources.includes("body:session_key"), "recSession13) affinity:false keeps the field wire-only");
+    assert(sources.filter((s) => s === "header:x-session-affinity").length === 1, "recSession14) sources are deduped");
+
+    const explicit = SRV.sessionSourcesFor({ sessionAffinity: { sources: ["body:user", "header:x-session-affinity"] }, backends: [{ id: "a", session: { field: "header:x-opencode-session" } }] });
+    assert(explicit[0] === "body:user" && explicit[1] === "header:x-session-affinity" && !explicit.includes("body:session_id"), "recSession15) an explicit list wins and suppresses implicit body fallbacks");
+    assert(explicit.includes("header:x-opencode-session"), "recSession16) declared fields still append after an explicit list");
+
+    // The credential is the sharing boundary for exclusion memory; the session
+    // component is null (not a magic string) when the request carries no key.
+    assert(SRV.sessionScopeOf("auth", null) === SRV.sessionScopeOf("auth", null) && SRV.sessionScopeOf("auth", null) !== null, "recSession17) no key still has a per-credential scope");
+    assert(SRV.sessionScopeOf("auth", null) !== SRV.sessionScopeOf("other", null), "recSession17b) different credentials never share an exclusion scope");
+    assert(SRV.sessionExclusionKey(null, { model: "m", backend: "b", upstream: "u" }) === null, "recSession18) a defensive null scope produces no exclusion key");
+    assert(SRV.sessionPreferenceKey("auth", null, "m") === null, "recSession19) no key -> no pin");
+    assert(SRV.beginSessionRequest("auth", null, "m") === null, "recSession20) no key -> no preference token");
+
+    // A deterministic rng proves the anonymous branch spreads instead of hashing
+    // a sentinel: two different rolls pick two different primaries.
+    const cCfg = { backends: [{ id: "a" }, { id: "b" }], models: { m: { providers: [{ backend: "a", upstream: "u" }, { backend: "b", upstream: "u" }], affinityPool: 2 } } };
+    const c0 = SRV.candidates(cCfg, "m", null, () => 0.0);
+    const c1 = SRV.candidates(cCfg, "m", null, () => 0.99);
+    assert(c0.primary.backend === "a" && c1.primary.backend === "b", "recSession21) anonymous primary is random, not a fixed hash bucket");
+    const k0 = SRV.candidates(cCfg, "m", "fixed", () => 0.99);
+    const k1 = SRV.candidates(cCfg, "m", "fixed", () => 0.0);
+    assert(k0.primary.backend === k1.primary.backend, "recSession22) a real session key still hashes deterministically");
+
+    // Validation is config-first: a typo must fail the save, not silently leave
+    // a backend without its provider identity.
+    process.env.K_SA = "x";
+    const baseSc = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "sa", baseURL: "http://127.0.0.1:1", apiKeyEnv: "K_SA", session: { field: "header:x-opencode-session", affinity: true, whenMissing: "affinity", mintPrefix: "oc-" } }],
+      models: { m: { providers: [{ backend: "sa", upstream: "u" }], affinityPool: 1 } },
+      presets: { p: { strategy: "affinity", models: ["m"] } },
+    };
+    const okV = SRV.validateConfig(baseSc, baseSc);
+    assert(okV.errors.length === 0, "recSession23) a valid session declaration passes validation (" + JSON.stringify(okV.errors) + ")");
+    const badField = { ...baseSc, backends: [{ ...baseSc.backends[0], session: { field: "nonsense" } }] };
+    assert(SRV.validateConfig(badField, badField).errors.some((e) => e.path === "backends[0].session.field"), "recSession24) an unparseable field is a save error");
+    const badWhen = { ...baseSc, backends: [{ ...baseSc.backends[0], session: { field: "header:x", whenMissing: "sometimes" } }] };
+    assert(SRV.validateConfig(badWhen, badWhen).errors.some((e) => e.path === "backends[0].session.whenMissing"), "recSession25) an unknown whenMissing is a save error");
+    const badPrefix = { ...baseSc, backends: [{ ...baseSc.backends[0], session: { field: "header:x", mintPrefix: "0123456789abcdefg" } }] };
+    assert(SRV.validateConfig(badPrefix, badPrefix).errors.some((e) => e.path === "backends[0].session.mintPrefix"), "recSession26) an overlong mintPrefix is a save error");
+    const badAffinity = { ...baseSc, backends: [{ ...baseSc.backends[0], session: { field: "header:x", affinity: "yes" } }] };
+    assert(SRV.validateConfig(badAffinity, badAffinity).errors.some((e) => e.path === "backends[0].session.affinity"), "recSession27) a non-boolean affinity is a save error");
+    const unknownKey = { ...baseSc, backends: [{ ...baseSc.backends[0], session: { field: "header:x", future: 1 } }] };
+    assert(SRV.validateConfig(unknownKey, unknownKey).warnings.some((w) => w.path === "backends[0].session"), "recSession28) an unknown session key warns, never refuses");
+    const badSources = { ...baseSc, sessionAffinity: { sources: ["header:x", "bad"] } };
+    assert(SRV.validateConfig(badSources, badSources).errors.some((e) => e.path === "sessionAffinity.sources[1]"), "recSession29) an invalid affinity source is a save error");
+    const unknownSa = { ...baseSc, sessionAffinity: { sources: ["header:x"], future: true } };
+    assert(SRV.validateConfig(unknownSa, unknownSa).warnings.some((w) => w.path === "sessionAffinity"), "recSession30) an unknown sessionAffinity key warns");
+    delete process.env.K_SA;
   }
 
   // ---- config editor: merge-preserve contract (index.html) -------------------

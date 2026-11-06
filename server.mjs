@@ -307,7 +307,23 @@ function envNames() {
 const KNOWN_BACKEND_KEYS = new Set([
   "id", "baseURL", "apiKeyEnv", "params", "dropParams",
   "connectTimeoutMs", "idleTimeoutMs", "translateDeveloperRole", "timeoutMs", "model",
+  "session",
 ]);
+
+// A backend may declare the single field its provider uses to identify a
+// conversation. The same field is read for routing affinity and written on the
+// wire, so a provider with a private session header (or body key) needs config,
+// not a router code path. `affinity` decides whether the field also joins the
+// affinity source list; `whenMissing` decides what to send when the client did
+// not provide a usable value.
+const KNOWN_SESSION_KEYS = new Set(["field", "affinity", "whenMissing", "mintPrefix"]);
+const SESSION_VALUE_MAX = 256;
+const SESSION_MINT_PREFIX_MAX = 16;
+// Field names end up as object keys on the outgoing header/payload maps. `__proto__`
+// would run the prototype setter instead of writing a field, and a header name that
+// is not an HTTP token would make fetch throw; both are config errors, not wires.
+const SESSION_FIELD_DENY = new Set(["__proto__", "constructor", "prototype"]);
+const HEADER_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9a-z]+$/i;
 
 // v3 model keys. The dialect/typed fields live per deployment in v3, but a model
 // still carries `params`/`retry`/`meta` and the optional `exposed` flag, and the
@@ -432,6 +448,33 @@ function validateConfig(candidate, current, opts) {
         }
       });
     }
+    // The identity field is read by both config shapes, so it is validated
+    // outside the v3-only allowlist above.
+    backends.forEach((b, i) => {
+      if (!b || typeof b !== "object") return;
+      const at = `backends[${i}].session`;
+      const s = b.session;
+      if (s === undefined) return;
+      if (!s || typeof s !== "object" || Array.isArray(s)) {
+        err(at, "must be an object");
+        return;
+      }
+      if (!parseSessionField(s.field)) {
+        err(at + ".field", "field must be 'header:<name>' or 'body:<key>'");
+      }
+      if (s.affinity !== undefined && typeof s.affinity !== "boolean") {
+        err(at + ".affinity", "affinity must be a boolean");
+      }
+      if (s.whenMissing !== undefined && s.whenMissing !== "affinity" && s.whenMissing !== "mint" && s.whenMissing !== "omit") {
+        err(at + ".whenMissing", "whenMissing must be 'affinity', 'mint', or 'omit'");
+      }
+      if (s.mintPrefix !== undefined && (typeof s.mintPrefix !== "string" || s.mintPrefix.length > SESSION_MINT_PREFIX_MAX || /[\u0000-\u001f\u007f]/.test(s.mintPrefix))) {
+        err(at + ".mintPrefix", `mintPrefix must be a string of at most ${SESSION_MINT_PREFIX_MAX} printable characters`);
+      }
+      for (const k of Object.keys(s)) {
+        if (!KNOWN_SESSION_KEYS.has(k)) warn(at, `unrecognized session key '${k}'; the router ignores it`);
+      }
+    });
   }
 
   // ---- models ----
@@ -612,10 +655,30 @@ function validateConfig(candidate, current, opts) {
 
   const known = new Set([
     "port", "prefix", "host", "masterKeyEnv", "uiPasswordEnv", "backends", "models", "presets",
-    "params", "backoff", "pricing", "missCapture", "alerts", "analytics", "relay",
+    "params", "backoff", "pricing", "missCapture", "alerts", "analytics", "relay", "sessionAffinity",
   ]);
   for (const key of Object.keys(candidate)) {
     if (!known.has(key)) warn(key, "unrecognized top-level key; the router ignores it");
+  }
+
+  const sa = candidate.sessionAffinity;
+  if (sa !== undefined) {
+    if (!sa || typeof sa !== "object" || Array.isArray(sa)) {
+      err("sessionAffinity", "must be an object");
+    } else {
+      if (sa.sources !== undefined) {
+        if (!Array.isArray(sa.sources)) {
+          err("sessionAffinity.sources", "sources must be an array");
+        } else {
+          sa.sources.forEach((s, i) => {
+            if (!parseSessionField(s)) err(`sessionAffinity.sources[${i}]`, "must be 'header:<name>' or 'body:<key>'");
+          });
+        }
+      }
+      for (const k of Object.keys(sa)) {
+        if (k !== "sources") warn("sessionAffinity", `unrecognized key '${k}'; the router ignores it`);
+      }
+    }
   }
 
   return finish();
@@ -713,13 +776,15 @@ function modelDeployments(m, id, backendById) {
 // never receives live traffic by hash. Weights that are not integers >= 1 are
 // treated as 1 (the validator reports the type; the read must not refuse to
 // route over it).
-function orderDeployments(deps, sessionKey) {
+function orderDeployments(deps, sessionKey, rng = Math.random) {
   const primaries = deps.filter((d) => !d.backupOnly);
   const backups = deps.filter((d) => d.backupOnly);
   if (!primaries.length) return [...deps];
   const weights = primaries.map((d) => (Number.isInteger(d.weight) && d.weight >= 1 ? d.weight : 1));
   const total = weights.reduce((s, w) => s + w, 0);
-  const h = hashStr(sessionKey) % total;
+  // No session is no bucket: spreading anonymous callers randomly is the whole
+  // point, and hashing a sentinel is how every one of them landed on one account.
+  const h = sessionKey == null ? Math.floor(rng() * total) : hashStr(sessionKey) % total;
   let acc = 0;
   let pick = 0;
   for (let i = 0; i < weights.length; i++) {
@@ -1135,8 +1200,13 @@ function routeBackoffMs(fails, cfg) {
 // two clients that happen to send the same x-session-affinity cannot see or clear
 // each other's exclusions - the spec's "different authentication scopes with
 // identical session IDs must not share state".
+//
+// An absent session is null, not a magic string. The credential stays part of the
+// key, so the same caller keeps its exclusion memory while a different credential
+// never shares it. (The affinity hash treats null differently: no key spreads
+// randomly rather than hashing every anonymous caller into one bucket.)
 function sessionScopeOf(authScope, sessionKey) {
-  return crypto.createHash("sha256").update(JSON.stringify([authScope, sessionKey || "no-session"])).digest("hex");
+  return crypto.createHash("sha256").update(JSON.stringify([authScope, sessionKey == null ? null : sessionKey])).digest("hex");
 }
 
 // An opaque rejection excludes ONE physical route for ONE caller/session/resolved
@@ -1145,11 +1215,13 @@ function sessionScopeOf(authScope, sessionKey) {
 // evidence that model B will be refused too. Route HEALTH stays shared across models
 // (zScope1/zScope2) - only this caller-scoped exclusion narrows.
 function sessionExclusionKey(exclScope, attempt) {
+  if (!exclScope) return null;
   return crypto.createHash("sha256").update(JSON.stringify([exclScope, attempt.model, attempt.backend, attempt.upstream])).digest("hex");
 }
 
 // Lazy expiry: an elapsed exclusion is dropped on sight rather than swept.
 function isSessionExcluded(exclScope, attempt, now) {
+  if (!exclScope) return false;
   const key = sessionExclusionKey(exclScope, attempt);
   const e = SESSION_EXCLUSIONS.get(key);
   if (!e) return false;
@@ -1222,10 +1294,11 @@ function ownsAccountSettlement(attempt) {
 }
 
 // An opaque rejection excludes the route for the CALLER that saw it, for that
-// caller's session and that resolved model. Requests with no session id get a
-// client-scoped "no-session" bucket rather than no memory at all: without one, the
-// same anonymous caller re-offers the refusing provider on every single call.
+// caller's session and that resolved model. A request with no session has no
+// scope: recording it under a sentinel would let one anonymous caller poison
+// every anonymous caller's next request.
 function excludeRouteForSession(exclScope, attempt) {
+  if (!exclScope) return null;
   const key = sessionExclusionKey(exclScope, attempt);
   SESSION_EXCLUSIONS.set(key, { blockedUntil: Date.now() + OPAQUE_EXCLUSION_MS, generation: nextGeneration(), routeKey: routeKey(attempt) });
   return key;
@@ -1524,10 +1597,11 @@ function authScopeOf(req) {
   return crypto.createHash("sha256").update(m[1].trim()).digest("hex").slice(0, 16);
 }
 
-// 'no-session' is a shared bucket, so pinning it would make every anonymous caller
-// follow whichever one succeeded last. Those callers get no pin at all.
+// A session that resolved no key has no conversation identity to preserve, so it
+// gets no pin: a sentinel would make every anonymous caller follow whichever one
+// succeeded last.
 function sessionPreferenceKey(authScope, sessionKey, logicalModel) {
-  if (!sessionKey || sessionKey === "no-session") return null;
+  if (!sessionKey) return null;
   return crypto.createHash("sha256").update(JSON.stringify([authScope, sessionKey, logicalModel])).digest("hex");
 }
 
@@ -1954,6 +2028,14 @@ function newHistoryEntry(f) {
     genMs: f.genMs ?? 0,                         // generation time: stream duration, or total - ttft for non-stream
     tps: f.tps ?? 0,                             // completion tokens per second (derived)
     session: f.session,
+    // Which declared source produced the affinity key (null = no key), and what
+    // the serving/last attempt actually put on the wire. The wire value itself is
+    // not stored twice: the hash lets two rows be compared without another copy
+    // of a client identifier.
+    sessionSource: f.sessionSource ?? null,
+    wireSessionField: f.wireSessionField ?? null,
+    wireSessionSource: f.wireSessionSource ?? null,
+    wireSessionHash: f.wireSessionHash ?? null,
     routedModel: f.routedModel ?? null,          // resolved model id (success: serving attempt; failure: first candidate; null: none)
     wireParams: f.wireParams ?? null,            // redacted summary of the params actually sent upstream (for explaining reasoning on/off per row)
     retries: f.retries ?? 0,                     // number of retry attempts performed on the serving provider (0 = none)
@@ -2800,14 +2882,136 @@ function normalizeConfig(cfg) {
 
 // ---- routing ---------------------------------------------------------------
 
-function sessionKeyOf(req, body) {
-  const h = req.headers;
-  return (
-    h["x-session-affinity"] ||
-    h["x-session-id"] ||
-    (body && (body.session_id || body.sessionId || body.user)) ||
-    "no-session"
-  );
+// A session field is one of two things: an HTTP header (`header:<name>`) or a
+// top-level JSON body key (`body:<key>`). One syntax, so config, validation, the
+// affinity source list, and the wire writer cannot drift apart.
+function parseSessionField(spec) {
+  if (typeof spec !== "string") return null;
+  const sep = spec.indexOf(":");
+  if (sep < 1) return null;
+  const where = spec.slice(0, sep).toLowerCase();
+  const name = spec.slice(sep + 1).trim();
+  if (!name) return null;
+  const lower = name.toLowerCase();
+  if (SESSION_FIELD_DENY.has(lower)) return null;
+  if (where === "header") {
+    if (!HEADER_NAME_RE.test(name)) return null;
+    return { in: "header", name: lower };
+  }
+  if (where === "body") return { in: "body", name };
+  return null;
+}
+
+// The router never invents a sentinel for "no session": absence is null. A client
+// that literally sends the old sentinel is just a client value and is forwarded.
+function normalizeSessionValue(raw, where) {
+  if (typeof raw === "number" || typeof raw === "boolean") raw = String(raw);
+  if (typeof raw !== "string") return null;
+  const value = raw.trim();
+  if (!value || value.length > SESSION_VALUE_MAX) return null;
+  // A header value with a control character is a header-injection primitive; a
+  // body value with one is a broken identifier. Both are treated as absent, so
+  // the caller falls through to the affinity key or a mint.
+  if (/[\u0000-\u001f\u007f]/.test(value)) return null;
+  if (where === "header" && !/^[\x20-\x7e]+$/.test(value)) return null;
+  return value;
+}
+
+function readSessionSource(req, body, source) {
+  const field = parseSessionField(source);
+  if (!field) return null;
+  let raw;
+  if (field.in === "header") {
+    raw = req && req.headers ? req.headers[field.name] : undefined;
+  } else {
+    raw = body && typeof body === "object" ? body[field.name] : undefined;
+  }
+  if (Array.isArray(raw)) raw = raw[0];
+  return normalizeSessionValue(raw, field.in);
+}
+
+const DEFAULT_SESSION_SOURCES = ["header:x-session-affinity", "header:x-session-id"];
+const DEFAULT_BODY_SESSION_SOURCES = ["body:session_id", "body:sessionId", "body:user"];
+const SESSION_SOURCES_CACHE = new WeakMap();
+
+// The affinity source list is the ONE place a provider's private field enters
+// routing. An explicit top-level list wins; otherwise the historic headers come
+// first, then every backend's declared field (unless it opted out with
+// `affinity: false`), then the historic body keys. Appending the declared fields
+// is what makes a new provider "just work": one backend block, no router change.
+function buildSessionSources(cfg) {
+  const hasExplicit = !!(cfg && cfg.sessionAffinity && Array.isArray(cfg.sessionAffinity.sources));
+  const base = hasExplicit ? cfg.sessionAffinity.sources : DEFAULT_SESSION_SOURCES;
+  const declared = [];
+  for (const b of (cfg && cfg.backends) || []) {
+    if (!b || typeof b !== "object" || !b.session || typeof b.session !== "object") continue;
+    if (b.session.affinity === false) continue;
+    if (parseSessionField(b.session.field)) declared.push(b.session.field);
+  }
+  const fallbacks = hasExplicit ? [] : DEFAULT_BODY_SESSION_SOURCES;
+  const seen = new Set();
+  const out = [];
+  for (const spec of [...base, ...declared, ...fallbacks]) {
+    const field = parseSessionField(spec);
+    if (!field) continue;
+    const normalized = field.in + ":" + field.name;
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    out.push(normalized);
+  }
+  return out;
+}
+
+function sessionSourcesFor(cfg) {
+  if (!cfg || typeof cfg !== "object") return [];
+  let out = SESSION_SOURCES_CACHE.get(cfg);
+  if (!out) {
+    out = buildSessionSources(cfg);
+    SESSION_SOURCES_CACHE.set(cfg, out);
+  }
+  return out;
+}
+
+// Resolve the affinity key ONCE per request, independent of which provider is
+// tried. The source travels with the key so history can say which field matched.
+function resolveSessionIdentity(req, body, sources) {
+  for (const source of sources || []) {
+    const value = readSessionSource(req, body, source);
+    if (value) return { key: value, source };
+  }
+  return { key: null, source: null };
+}
+
+function sessionKeyOf(req, body, sources) {
+  const list = sources || [...DEFAULT_SESSION_SOURCES, ...DEFAULT_BODY_SESSION_SOURCES];
+  return resolveSessionIdentity(req, body, list).key;
+}
+
+// What this backend's wire sees. The client's own value wins; otherwise the
+// declaration chooses between the resolved affinity key and a fresh id. The
+// returned object never carries the value into history - only its source and a
+// short hash (see sessionValueHash).
+function resolveSessionWire(backend, req, body, affinityKey) {
+  const decl = backend && backend.session;
+  if (!decl || typeof decl !== "object") return null;
+  const field = parseSessionField(decl.field);
+  if (!field) return null;
+  const spec = field.in + ":" + field.name;
+  if (decl.whenMissing === "omit") return { field: spec, source: "omit", value: null };
+  const client = readSessionSource(req, body, spec);
+  if (client) return { field: spec, source: "client", value: client };
+  if (decl.whenMissing !== "mint") {
+    const key = normalizeSessionValue(affinityKey, field.in);
+    if (key) return { field: spec, source: "affinity", value: key };
+  }
+  const rawPrefix = typeof decl.mintPrefix === "string" ? decl.mintPrefix : "sb-";
+  const prefix = rawPrefix.replace(/[\u0000-\u001f\u007f]/g, "").slice(0, SESSION_MINT_PREFIX_MAX);
+  return { field: spec, source: "minted", value: prefix + crypto.randomUUID() };
+}
+
+function sessionValueHash(value) {
+  if (!value) return null;
+  return crypto.createHash("sha256").update(String(value)).digest("hex").slice(0, 8);
 }
 
 function hashStr(s) {
@@ -2953,7 +3157,7 @@ function candidates(cfg, requestedId, sessionKey, rng = Math.random) {
   } else {
     // affinity (default)
     const pool = Math.min(preset.affinityPool || 1, modelIds.length);
-    const primaryIdx = hashStr(sessionKey) % pool;
+    const primaryIdx = sessionKey == null ? Math.floor(rng() * pool) : hashStr(sessionKey) % pool;
     orderedModels = [modelIds[primaryIdx], ...modelIds.filter((_, i) => i !== primaryIdx)];
   }
 
@@ -2976,10 +3180,10 @@ function candidates(cfg, requestedId, sessionKey, rng = Math.random) {
     const providers = modelDeployments(m, mid, backendById);
     if (providers.length === 0) continue;
     const providerOrder = Array.isArray(m.deployments)
-      ? orderDeployments(providers, sessionKey)
+      ? orderDeployments(providers, sessionKey, rng)
       : (() => {
           const pool = Math.min(modelPool(m), providers.length);
-          const primaryIdx = hashStr(sessionKey) % pool;
+          const primaryIdx = sessionKey == null ? Math.floor(rng() * pool) : hashStr(sessionKey) % pool;
           return [providers[primaryIdx], ...providers.filter((_, i) => i !== primaryIdx)];
         })();
     const perDeployment = Array.isArray(m.deployments);
@@ -3218,6 +3422,7 @@ function attemptOutcome(a) {
     errorBodyBytes: a.errorBodyBytes ?? 0,
     cooldownScope: a.cooldownScope || null,
     nextAvailableAt: a.nextAvailableAt ?? null,
+    wire: a.wire || null,
     requestIds: a.requestIds && Object.keys(a.requestIds).length ? a.requestIds : null,
   };
 }
@@ -3371,38 +3576,18 @@ function normalizeToolParameters(tool) {
 
 // ---- request forwarding ----------------------------------------------------
 
-// The session header we send upstream must be non-empty: OpenCode Go answers a
-// blank/absent x-opencode-session with 400 MissingSessionID, which the router
-// then classifies as a non-retryable client error and charges to the request.
-// The rule is explicit rather than a bare || chain because an empty or
-// whitespace-only header is falsy but PRESENT, and a blank sessionKey would
-// fall through the chain unchanged.
+// The wire identity is provider-declared, never hardcoded: a backend's `session`
+// block names one field (header or body) and the router writes it only for that
+// backend. A backend with no declaration gets no identity field at all.
 //
-// It must also never be the literal "no-session": the Go gateway refuses that
-// exact value with a generic 429 "[overloaded]" (measured 0/21 successes over
-// four windows, against ~80% for any unique value in the same seconds), so
-// every session-less client - the Playground, plain curl - failed 100% of the
-// time while session-carrying clients succeeded. Anonymous callers have no
-// conversation identity to preserve, so mint a per-request id instead; routing
-// still uses sessionKey, so provider selection is unchanged.
-function sessionHeaderFor(incomingHeaders, sessionKey) {
-  const raw = incomingHeaders && incomingHeaders["x-opencode-session"];
-  let value = null;
-  if (typeof raw === "string") {
-    const trimmed = raw.trim();
-    if (trimmed) value = trimmed;
-  } else if (raw) {
-    value = String(raw);
-  }
-  if (!value) {
-    const key = typeof sessionKey === "string" ? sessionKey.trim() : sessionKey;
-    if (key && key !== "no-session") value = key;
-  }
-  if (value && value !== "no-session") return value;
-  return "sb-" + crypto.randomUUID();
-}
-
-async function forward(req, cfg, backend, payload, incomingHeaders, stream, sessionKey, callerSignal) {
+// The client's own value wins. Otherwise `whenMissing` decides: `affinity` reuses
+// the resolved key (stable upstream conversation), `mint` always gets a fresh
+// sb-<uuid> (no upstream cell affinity), and `omit` sends nothing.
+//
+// The old literal "no-session" was never refused (that diagnosis was wrong); with
+// absence represented as null it is not generated either, and a client that
+// sends it deliberately is forwarded as a normal value.
+async function forward(req, cfg, backend, payload, incomingHeaders, stream, sessionKey, callerSignal, body) {
   const key = process.env[backend.apiKeyEnv];
   const upstream = backend.baseURL.replace(/\/$/, "") + "/chat/completions";
 
@@ -3410,12 +3595,8 @@ async function forward(req, cfg, backend, payload, incomingHeaders, stream, sess
     "content-type": "application/json",
     authorization: `Bearer ${key}`,
     accept: stream ? "text/event-stream" : "application/json",
-    // Console Go refuses service without a session id (400 MissingSessionID)
-    // and OpenCode Go's docs require an identifiable client UA for abuse
-    // monitoring. Prefer the client's own session header, else reuse the
-    // router's resolved session key (x-session-affinity -> x-session-id ->
-    // user -> no-session) so per-conversation routing/caching still works.
-    "x-opencode-session": sessionHeaderFor(incomingHeaders, sessionKey),
+    // Providers that monitor abuse want an identifiable client. This is a router
+    // header, not a provider identity: no backend-name special-casing.
     "user-agent": "switchblade/1.0",
   };
   // Forward prompt-cache headers verbatim.
@@ -3423,7 +3604,26 @@ async function forward(req, cfg, backend, payload, incomingHeaders, stream, sess
     if (incomingHeaders[h]) outHeaders[h] = incomingHeaders[h];
   }
 
-  const payloadText = JSON.stringify(payload);
+  // Resolve once for this dispatch. A body field is injected into a CLONE: the
+  // payload is shared across retries and attempts, and one provider's write must
+  // not leak into another's.
+  const wire = resolveSessionWire(backend, req, body, sessionKey);
+  let wirePayload = payload;
+  if (wire) {
+    const field = parseSessionField(wire.field);
+    if (field && field.in === "header") {
+      if (wire.value) outHeaders[field.name] = wire.value;
+    } else if (field && field.in === "body") {
+      wirePayload = { ...payload };
+      if (wire.value == null) delete wirePayload[field.name];
+      else wirePayload[field.name] = wire.value;
+    }
+  }
+  const wireMeta = wire
+    ? { field: wire.field, source: wire.source, hash: sessionValueHash(wire.value) }
+    : null;
+
+  const payloadText = JSON.stringify(wirePayload);
 
   // Debug wire format: log the exact outgoing request body (redacted - never
   // print key values; the payload holds messages + params only) so operators
@@ -3475,7 +3675,7 @@ async function forward(req, cfg, backend, payload, incomingHeaders, stream, sess
     err.stage = callerSignal && callerSignal.aborted
       ? "caller_aborted"
       : connectController.signal.aborted ? "header_timeout" : "connect";
-    return { err };
+    return { err, wire: wireMeta };
   }
   clearTimeout(connectTimer); // headers arrived: the wall clock no longer applies to the body
 
@@ -3490,9 +3690,9 @@ async function forward(req, cfg, backend, payload, incomingHeaders, stream, sess
     err.errorBodyState = eb.errorBodyState;
     err.errorBodyBytes = eb.errorBodyBytes;
     err.requestIds = redactIds(correlationIdsOf(upstreamRes.headers), cfg, req);
-    return { err, statusFromUpstream: upstreamRes.status };
+    return { err, statusFromUpstream: upstreamRes.status, wire: wireMeta };
   }
-  return { res: upstreamRes };
+  return { res: upstreamRes, wire: wireMeta };
 }
 
 // ---- HTTP handlers ---------------------------------------------------------
@@ -3513,11 +3713,18 @@ async function handleChat(req, res, cfg, bodyText) {
     return writeError(res, e);
   }
 
-  const sessionKey = sessionKeyOf(req, body);
+  // Resolve the affinity key ONCE, before any provider is chosen. The key is a
+  // request-level fact (which declared source matched), not a per-provider one:
+  // every attempt of this request hashes to the same order, and the wire writer
+  // can reuse the key when a provider declares `whenMissing: "affinity"`.
+  const sessionIdentity = resolveSessionIdentity(req, body, sessionSourcesFor(cfg));
+  const sessionKey = sessionIdentity.key;
+  const sessionSource = sessionIdentity.source;
   // Two scopes from one request, deliberately separate: the RAW session key drives
   // affinity hashing and is forwarded upstream, while the hashed exclusion scope is
   // who may be excluded from which resolution. Keeping them apart is what puts the
   // credential INTO the opaque-rejection bucket without putting it in a header.
+  // The exclusion scope keeps the credential boundary; the affinity hash does not.
   const authScope = authScopeOf(req);
   const exclScope = sessionScopeOf(authScope, sessionKey);
   // One call id per incoming request, shared by the history entry, the detail
@@ -3603,7 +3810,7 @@ async function handleChat(req, res, cfg, bodyText) {
     // has no automatic recovery, so the header is omitted rather than guessed.
     const recoveryMs = nearestRecoveryMs(c.ordered, exclScope, now);
     if (recoveryMs !== null) res.setHeader("Retry-After", String(Math.max(1, Math.ceil(recoveryMs / 1000))));
-    const entry = applyCost(newHistoryEntry({ t: detailT, callId, model: modelId, backend: "none", stream, status: 503, latencyMs, session: sessionKey, routedModel: c.ordered[0] ? c.ordered[0].model : null, errorKind: null }), cfg);
+    const entry = applyCost(newHistoryEntry({ t: detailT, callId, model: modelId, backend: "none", stream, status: 503, latencyMs, session: sessionKey ?? "no-session", sessionSource, routedModel: c.ordered[0] ? c.ordered[0].model : null, errorKind: null }), cfg);
     recordHistory(entry);
     recordAnalytics(entry);
     // A session-scoped exclusion is not an outage: alert only when something is
@@ -3652,6 +3859,9 @@ async function handleChat(req, res, cfg, bodyText) {
 
   let lastErr = null;
   let lastTried = null;
+  // The wire identity of the last dispatch, kept for the terminal row when every
+  // attempt fails. It carries only { field, source, hash } - never the raw value.
+  let lastWire = null;
   // Failed-attempt tallies: the terminal message may only claim that EVERY
   // provider rejected the request unexplained when that is literally what
   // happened. If an earlier provider failed WITH an explanation (a 500, say) and
@@ -3766,7 +3976,7 @@ async function handleChat(req, res, cfg, bodyText) {
       const bookAccount = health.get(attempt.backend);
       if (bookAccount) bookAccount.dispatchSeq = attempt.dispatchSeq;
       const dispatchStarted = Date.now();
-      result = await forward(req, cfg, backend, payload, req.headers, stream, sessionKey, callerAbort.signal);
+      result = await forward(req, cfg, backend, payload, req.headers, stream, sessionKey, callerAbort.signal, body);
       const dispatchElapsed = Date.now() - dispatchStarted;
       const admissionRefusal = !!result.err && isAdmissionRefusal(result.err.status, result.err.body);
       // A connect or header timeout already burned the backend's whole connect
@@ -3820,12 +4030,14 @@ async function handleChat(req, res, cfg, bodyText) {
       // endpoint, so an upstream echoing a credential is never written at all.
       errorBody: result.err ? (result.err.body ? redactSecrets(result.err.body, cfg, req) : (result.err.body || null)) : null,
       retry: typeof attempt.retry === "number" ? attempt.retry : (attempt.attemptIndex != null ? attempt.attemptIndex : null),
+      wire: result.wire || null,
     };
     // Always record the attempt in the deep-dive store; oversized bodies are
     // stored bounded (see boundedPayload) so the panel never silently 404s.
     recordDetail(detailT, callId, captureDetail ? payload : boundedPayload(payload), attemptRec);
     if (result.err) {
       lastErr = result.err;
+      lastWire = result.wire || null;
       const errKind = classify(result.err.status, result.err.body, result.err.errorBodyState);
       // A caller who left before any header is not a provider failure: the attempt is charged
       // nothing, and with nobody left to serve there is no failover to attempt either.
@@ -3850,6 +4062,7 @@ async function handleChat(req, res, cfg, bodyText) {
         retries,
         cooldownScope: scope.cooldownScope,
         nextAvailableAt: scope.nextAvailableAt,
+        wire: result.wire || null,
         requestIds: result.err.requestIds || null,
       }));
       // An EXPLAINED client error is the caller's payload, so it would fail
@@ -3926,6 +4139,7 @@ async function handleChat(req, res, cfg, bodyText) {
         retries,
         cooldownScope: uScope.cooldownScope,
         nextAvailableAt: uScope.nextAvailableAt,
+        wire: result.wire || null,
         requestIds: null,
       }));
     }
@@ -3942,7 +4156,11 @@ async function handleChat(req, res, cfg, bodyText) {
       promptCacheMissTokens: metrics.promptCacheMissTokens,
       genMs: metrics.genMs ?? 0,
       tps: genSec > 0 && (metrics.completionTokens || 0) > 0 ? Math.round((metrics.completionTokens / genSec) * 10) / 10 : 0,
-      session: sessionKey,
+      session: sessionKey ?? "no-session",
+      sessionSource,
+      wireSessionField: result.wire ? result.wire.field : null,
+      wireSessionSource: result.wire ? result.wire.source : null,
+      wireSessionHash: result.wire ? result.wire.hash : null,
       routedModel: attempt.model,
       wireParams: extractWireParams(payload),
       retries,
@@ -4004,7 +4222,7 @@ async function handleChat(req, res, cfg, bodyText) {
   const lastKind = lastErr ? classify(lastErr.status, lastErr.body, lastErr.errorBodyState) : null;
   const explainedClient = lastKind === "client" && !!lastErr;
   const finalStatus = explainedClient ? (lastErr.status || 400) : 503;
-  const failEntry = applyCost(newHistoryEntry({ t: detailT, callId, model: modelId, backend: lastTried ? lastTried.backend : "none", stream, status: finalStatus, latencyMs, session: sessionKey, routedModel: c.ordered[0] ? c.ordered[0].model : null, selectionReason, fallbackCount, cacheMayBeCold: fallbackCount > 0, retries: requestRetries, retryWaitedMs: requestRetryWaitedMs, ...capAttemptsSummary(attemptsSummary), errorKind: lastKind }), cfg);
+  const failEntry = applyCost(newHistoryEntry({ t: detailT, callId, model: modelId, backend: lastTried ? lastTried.backend : "none", stream, status: finalStatus, latencyMs, session: sessionKey ?? "no-session", sessionSource, wireSessionField: lastWire ? lastWire.field : null, wireSessionSource: lastWire ? lastWire.source : null, wireSessionHash: lastWire ? lastWire.hash : null, routedModel: c.ordered[0] ? c.ordered[0].model : null, selectionReason, fallbackCount, cacheMayBeCold: fallbackCount > 0, retries: requestRetries, retryWaitedMs: requestRetryWaitedMs, ...capAttemptsSummary(attemptsSummary), errorKind: lastKind }), cfg);
   recordHistory(failEntry);
   recordAnalytics(failEntry);
   // A caller who left is not provider exhaustion, so it must not raise the operator alert.
@@ -5811,4 +6029,4 @@ if (isMain) {
 
 export { claimAttempt, releaseAttempt, ineligibility, health, ROUTES };
 export { structuralViewForValidation as validationSubjectOf };
-export { backoffFor, sessionHeaderFor, noteAccountOutage, markSuccess, ACCOUNT_OUTAGE_ROUTES, classify, readUpstreamError, terminalChatError, redactSecrets, capAttemptsSummary, attemptOutcome, candidates, touchSessionPreference, evictSessionPreferences, SESSION_PREFS, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, noteCacheMiss, resetAlertCooldowns, computeCost, writeConfigAtomic, routeKey, routeBackoffMs, authScopeOf, sessionPreferenceKey, beginSessionRequest, orderSessionProviders, rememberProvider, sessionPreferenceStats, clearSessionPreferences, validateConfig, convertLegacyConfig };
+export { backoffFor, sessionSourcesFor, buildSessionSources, resolveSessionIdentity, resolveSessionWire, sessionKeyOf, sessionScopeOf, sessionExclusionKey, parseSessionField, sessionValueHash, noteAccountOutage, markSuccess, ACCOUNT_OUTAGE_ROUTES, classify, readUpstreamError, terminalChatError, redactSecrets, capAttemptsSummary, attemptOutcome, candidates, touchSessionPreference, evictSessionPreferences, SESSION_PREFS, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, noteCacheMiss, resetAlertCooldowns, computeCost, writeConfigAtomic, routeKey, routeBackoffMs, authScopeOf, sessionPreferenceKey, beginSessionRequest, orderSessionProviders, rememberProvider, sessionPreferenceStats, clearSessionPreferences, validateConfig, convertLegacyConfig };

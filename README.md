@@ -125,8 +125,7 @@ longer references the route. `/admin/reset-health` is an operator override, so i
 layer that can hold a request off a provider: account cooling, route cooldowns,
 session exclusions, the account-outage window, and the learned preferences. A
 reset that left route cooldowns behind would report "healthy" while still
-refusing to route. Callers whose session key resolves to
-`no-session` get no preference at all.
+refusing to route. Callers with no session key get no preference at all.
 
 Manual cools (from the UI or `POST /admin/backend`) are **sticky**: they never
 participate in a fallback and are never cleared by a success. Only the Uncool

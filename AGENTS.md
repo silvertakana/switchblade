@@ -41,7 +41,7 @@ Strategies (preset level): **affinity** (default, session-sticky spreading), **f
 | File | Role |
 |---|---|
 | `server.mjs` | The whole router (~1660 lines). Starts only when run as a script; exports the internals used by tests. |
-| `test.mjs` | Mock test suite — **357 passing assertions**. Spawns real `server.mjs` children on temp configs against in-process mock backends. No keys, no network. |
+| `test.mjs` | Mock test suite — **887 passing assertions**. Spawns real `server.mjs` children on temp configs against in-process mock backends. No keys, no network. |
 | `config.json` | MIRROR of the live homelab config (`/app/config.server.json`) for local dev and reference; **hot-reloads via `fs.watch` (~300 ms)** — no restart for schema/backend/model/preset/backoff changes. Validate JSON before saving. Editing it is not a deploy: provider/config changes are made on the homelab over SSH. |
 | `.env` | API keys (gitignored). Read once at startup; a restart is needed after edits. Never commit. Superseded per-name by the managed `secrets.json` (see Env editor). |
 | `.env.example` | Placeholder key names (`KEY=` only — CI fails if any example has a value). |
@@ -84,14 +84,14 @@ No build step exists. No lint or format tooling is configured (zero-dependency m
 ## Testing Instructions
 
 ```bash
-npm test                    # node test.mjs -> expect "357 passed, 0 failed"
+npm test                    # node test.mjs -> expect "887 passed, 0 failed"
 node --check server.mjs     # syntax check (CI also checks test.mjs)
 ```
 
 - The suite **spins up mock backends plus router instances on temp configs — no real keys, no network**. Safe to run anytime, even while the production router is live on 8787 (test children bind port 0).
 - Coverage: health, non-stream + SSE streaming, session affinity, failover/weighted selection, sticky + timed manual cools, fallback exclusion, dialect handling (dropParams/paramMap/developer-role), synthesis from both legacy eras, layered-params merge order and precedence, preset-of-presets nesting (expansion, cycles, ordering), per-model retry/backoff budgets, cache tri-state, history `routedModel`, timeout failover, reasoning-key relay (`reasoning`/`reasoning_content`).
 - **Every behavior change ships with a test in `test.mjs`** (project rule, README Contributing). The legacy (`y*`) and three-layer (`z*`) blocks import `server.mjs` internals; integration blocks spawn the real server as a child.
-- Known environment quirk: the child-port banner capture can transiently crash with `TypeError: fetch failed ... bad port` (observed once 2026-08-22); a plain re-run passes 357/357. Do not treat a single crash as a regression — re-run first.
+- Known environment quirk: the child-port banner capture can transiently crash with `TypeError: fetch failed ... bad port` (observed once 2026-08-22); a plain re-run passes 887/887. Do not treat a single crash as a regression — re-run first.
 - Known hygiene quirk: the suite leaks its `lmr-test-*` temp dir behind each run (a child can still hold the directory when cleanup runs on Windows); they are tiny (tens of KB) and accumulate in `%TEMP%`. Cosmetic, not a failure.
 
 ## Config Contract (load-bearing — read `DESIGN-3LAYER.md` before touching)
@@ -141,7 +141,7 @@ Every request gets a short stable `callId` returned in the `x-router-backend`/`x
 - **Empty pool** -> 503 `all available backends are cooling (N manually cooled - uncool to restore)`.
 - **Upstream URL construction (exact)**: `backend.baseURL.replace(/\/$/, "") + "/chat/completions"` (trailing slash stripped).
 - **`/v1/models` safety property**: the same ids must always appear in the same order; consumers (opencode.jsonc, dsh) depend on it.
-- Session key resolution: `x-session-affinity` header -> `x-session-id` -> request `user` -> `no-session`.
+- Session key resolution: explicit `sessionAffinity.sources`, else `x-session-affinity` header -> `x-session-id` header -> every declared backend `session.field` -> request body `session_id` / `sessionId` / `user`; no match is `null` (random primary, no pin), never a sentinel. A backend's `session` block also names the field written upstream for that provider.
 
 ## Code Style
 
@@ -192,7 +192,7 @@ No build step — `server.mjs` runs directly on the system Node (22+/25).
 ## Pull Request Guidelines
 
 - **Commit messages**: Conventional Commits — `feat:`, `fix:`, `refactor:`, `perf:` (see `git log`). One logical change per commit.
-- **Before pushing**: `node test.mjs` must pass 357/357 and `node --check server.mjs` must pass. CI re-checks on Node 22/24/25 plus secret scan.
+- **Before pushing**: `node test.mjs` must pass 887/887 and `node --check server.mjs` must pass. CI re-checks on Node 22/24/25 plus secret scan.
 - **Project rules (README Contributing)**: keep it zero-dependency (no new npm packages without a strong reason); every behavior change ships with a test in `test.mjs`; the config contract and its synthesis paths are load-bearing — change them only with a documented design note (update `DESIGN-3LAYER.md`).
 
 ## Troubleshooting

@@ -66,7 +66,9 @@ Non-goals: multi-tenancy; any change to the served API shape (`/v1/chat/completi
 }
 ```
 
-`backends[]` — unchanged concept and JSON key: `id` (unique), `baseURL`, `apiKeyEnv`; optional `timeoutMs`, `translateDeveloperRole`, `params` (object), `dropParams` (string array, platform-wide). Legacy-only `model` field remains readable during the bridge era, removed at legacy cleanup.
+`backends[]` — unchanged concept and JSON key: `id` (unique), `baseURL`, `apiKeyEnv`; optional `timeoutMs`, `translateDeveloperRole`, `params` (object), `dropParams` (string array, platform-wide), and `session` (provider identity, below). Legacy-only `model` field remains readable during the bridge era, removed at legacy cleanup.
+
+Provider-declared session identity: a provider's own conversation field is named once in config, never in a router code path. `backends[].session` is `{ field, affinity?, whenMissing?, mintPrefix? }`; `field` is `header:<name>` or `body:<top-level-key>`. `affinity` (default true) adds the field to the affinity source list, `false` keeps it wire-only. `whenMissing` is `affinity` (default; reuse the resolved key), `mint` (always a fresh `<mintPrefix><uuid>`), or `omit` (send nothing); `mintPrefix` defaults `sb-`. A backend with no declaration sends no identity field. The client's own value wins; a blank or invalid value falls through to `whenMissing`. The top-level `sessionAffinity.sources` list, when present, replaces the default affinity headers; declared backend fields still append, and the implicit body fallbacks (`session_id`, `sessionId`, `user`) apply only when no explicit list is given. No match is `null`, not a sentinel.
 
 `models{}` — key is the served model id. Value:
 
@@ -96,7 +98,7 @@ Removed concepts: `affinityPool` (replaced by primaries vs `backupOnly`), preset
 
 ### Routing semantics
 
-- Primaries = deployments with `backupOnly` false. Session affinity picks the primary: `hashStr(sessionKeyOf(req)) % primaries.length` — `sessionKeyOf` and `hashStr` (`server.mjs:1558-1570`) are unchanged. Order-compatibility is conditional: for a model whose live `affinityPool` is present and equals its provider count, v3's candidate order is byte-identical to today's for the same session key (pinned by existing tests); conversion of `affinityPool` N < provider count reproduces today's order by marking `providers[N..]` `backupOnly: true`; an absent `affinityPool` (today: strict declared order, pool 1) deliberately becomes load-balanced, and the converter emits a warning naming each such model (zero instances in the repo mirror — all 20 live models set the field explicitly).
+- Primaries = deployments with `backupOnly` false. Session affinity picks the primary: `hashStr(sessionKey) % primaries.length` for a real key; a request with no key draws a uniform random primary per request, so anonymous traffic has no shared bucket. `hashStr` (`server.mjs:1558-1570`) is unchanged. Order-compatibility is conditional: for a model whose live `affinityPool` is present and equals its provider count, v3's candidate order is byte-identical to today's for the same session key (pinned by existing tests); conversion of `affinityPool` N < provider count reproduces today's order by marking `providers[N..]` `backupOnly: true`; an absent `affinityPool` (today: strict declared order, pool 1) deliberately becomes load-balanced, and the converter emits a warning naming each such model (zero instances in the repo mirror — all 20 live models set the field explicitly).
 - The weighted pick is sticky, not rotating: the primary index is derived from the same session hash mapped through the cumulative `weight` intervals of the primaries in config order, so a session key always resolves to the same primary; when every weight is 1 this is exactly `hash % primaries.length`. This replaces the preset-level `weighted` strategy.
 - Attempt list per request: affinity-ordered primaries, then `backupOnly` deployments in config order, expanded through preset nesting as today.
 - Dedup per request: each `(backend, upstream)` pair is tried at most once. After a 5xx, timeout, or transport failure from a backend, that backend's remaining deployments are skipped for the current request only (per-request backend skip — FreeLLMAPI's pattern), instead of burning a hop per deployment.
@@ -142,9 +144,9 @@ Health state splits into two maps:
   it is not eligible, and the map keeps at most 10,000 entries with LRU eviction. The
   pin is dropped on failure, on route removal, on an operator cool/uncool/reset (an
   explicit routing decision must never be overruled by learned preference), and on
-  process restart, which loses the table. Callers with the shared `no-session` key
-  get no pin at all, because one anonymous caller's experience must not steer every
-  other caller. A pin never reorders models and never undoes backend dedup.
+  process restart, which loses the table. Callers with no session key get no pin at
+  all, because one anonymous caller's experience must not steer every other caller.
+  A pin never reorders models and never undoes backend dedup.
 - `/health` gains a `deployments[]` array per backend entry (id, upstream, state, fails, lastError, manual). `POST /admin/backend` body extends to `{id, upstream?, action: "cool"|"uncool", forMs?}`: without `upstream` it targets account-wide state as today; with `upstream` it targets one deployment.
 - History/detail attempt entries add `upstream` alongside the existing `backend` field (additive).
 

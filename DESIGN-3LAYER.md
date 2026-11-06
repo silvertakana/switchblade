@@ -126,14 +126,19 @@ Design decisions worth stating plainly:
   "prefix": "/v1",
   "masterKeyEnv": null,               // OPTIONAL: env var NAME holding the chat/admin master key
   "uiPasswordEnv": null,              // OPTIONAL: env var NAME holding the dashboard password (LMR_UI_PASSWORD)
+  "sessionAffinity": {                // OPTIONAL: replaces the default affinity header list
+    "sources": ["header:x-session-affinity", "header:session-id"]
+  },
   "params": {                         // OPTIONAL global defaults, lowest layer
     "temperature": 0.7
   },
   "backends": [
     { "id": "go-primary", "baseURL": "https://opencode.ai/zen/go/v1",
-      "apiKeyEnv": "OPENCODE_GO_KEY" },
+      "apiKeyEnv": "OPENCODE_GO_KEY",
+      "session": { "field": "header:x-opencode-session" } },  // provider identity
     { "id": "go-alt", "baseURL": "https://opencode.ai/zen/go/v1",
-      "apiKeyEnv": "OPENCODE_GO_ALT_KEY" },
+      "apiKeyEnv": "OPENCODE_GO_ALT_KEY",
+      "session": { "field": "header:x-opencode-session" } },
     { "id": "direct", "baseURL": "https://api.deepseek.com/v1",
       "apiKeyEnv": "DEEPSEEK_API_KEY",
       "translateDeveloperRole": true,          // FIELD, special-cased (not a param)
@@ -197,6 +202,14 @@ Design decisions worth stating plainly:
   default), `translateDeveloperRole`, `dropParams` remain legal backend fields.
   New optional `params` object (real request params only; `model` inside any
   params layer is ignored with a warning).
+  New optional `session` declaration: `{ field, affinity?, whenMissing?, mintPrefix? }`.
+  `field` is `header:<name>` or `body:<top-level-key>`. `affinity` (default true)
+  adds the field to the affinity source list; `affinity: false` keeps it
+  wire-only. `whenMissing` is `affinity` (default; reuse the resolved key),
+  `mint` (always a fresh `<mintPrefix><uuid>`), or `omit` (send nothing).
+  `mintPrefix` defaults `sb-`. A backend with no `session` sends no identity
+  field. The client's own value always wins; a blank or invalid value falls
+  through to `whenMissing`.
   New optional timeout pair (also legal at top level):
   `timeoutMs`/`connectTimeoutMs` bound only the HEADER wait (TTFT), default
   45s; `idleTimeoutMs` bounds SILENCE during the body (stall detection),
@@ -213,6 +226,10 @@ Design decisions worth stating plainly:
   Optional per-provider `params`, `dropParams` (array), `paramMap` (object).
 - `models[id].affinityPool`: default 1. Number of providers sessions spread
   across (same arithmetic as the old preset-level affinityPool).
+- Top-level `sessionAffinity.sources`: OPTIONAL ordered list of field specs
+  (`header:<name>` / `body:<key>`) replacing the default affinity headers.
+  Declared backend fields still append; the implicit body fallbacks
+  (`session_id`, `sessionId`, `user`) apply only when no explicit list is given.
 - `models[id].params`, `models[id].meta`: optional.
 - `presets[id].models[]`: strings or `{model, weight}` objects (weight only
   matters for `weighted`; default 1, must be > 0). MUST reference existing
@@ -285,15 +302,20 @@ Request flow:
    `model_not_found`.
 3. Preset level: build the ordered candidate MODEL list per strategy:
    - affinity: pool = min(affinityPool || 1, models.length); primary =
-     models[hash(sessionKey) % pool]; ordered = [primary, ...rest declared].
+     sessionKey == null ? models[floor(rng() * pool)] : models[hash(sessionKey) % pool];
+     ordered = [primary, ...rest declared].
    - failover: declared order.
    - weighted: weighted-random primary over models (rng injectable for tests);
      ordered = [pick, ...rest weight desc, declared tiebreak (stable sort)].
 4. Model level: for each model in the preset's ordered list (in order), build
    the ordered PROVIDER list: pool = min(model.affinityPool || 1,
-   providers.length); primary = providers[hash(sessionKey) % pool]; ordered =
-   [primary, ...rest declared]. Flatten all models' provider lists in model
-   order into one attempt list of `{model, backend, upstream}`.
+   providers.length); primary = sessionKey == null
+   ? providers[floor(rng() * pool)] : providers[hash(sessionKey) % pool];
+   ordered = [primary, ...rest declared]. Flatten all models' provider lists in
+   model order into one attempt list of `{model, backend, upstream}`.
+   A request with no session key has no bucket: its primary is drawn uniformly
+   per request (rng injectable for tests), so anonymous traffic spreads instead
+   of piling onto one account. A real key hashes exactly as before.
 5. Dedup the flattened list by backend id (first occurrence wins, keeping that
    occurrence's model+upstream).
 6. Session preference: the route this (credential, session, logical model)
@@ -337,11 +359,36 @@ Session-affinity hashing (`hashStr`, sha256 readUInt32BE), the health registry
 history: UNCHANGED. This is a hard requirement: for an identical effective
 config, the same session key must hash to the same primary backend as before.
 
-Session key resolution (priority order): `x-session-affinity` header,
-`x-session-id` header, then the request body's `session_id` / `sessionId` /
-`user`, then the constant `no-session`. The two body session spellings let a
-client that identifies its conversation in the chat-completions body (instead
-of via headers) still get per-session affinity; the hash itself is unchanged.
+Session key resolution (priority order): an explicit `sessionAffinity.sources`
+list when configured; otherwise the `x-session-affinity` header, the
+`x-session-id` header, every declared `backends[].session.field` with `affinity`
+not false, then the request body's `session_id` / `sessionId` / `user`. No match
+is `null`, not a sentinel: a request with no key picks a random primary per
+request (see the routing steps) and gets no session pin or exclusion bucket.
+The two body session spellings let a client that identifies its conversation in
+the chat-completions body (instead of via headers) still get per-session
+affinity; the hash itself is unchanged for an identical key.
+
+### Provider-declared session identity
+
+A provider's own session field is configuration, not a router special case. The
+same declaration supplies both halves: the field joins the affinity source list
+(unless `affinity: false`), and the wire writer emits it only for that backend.
+The client's own value wins; otherwise `whenMissing` chooses between the
+resolved affinity key, a fresh minted id, or silence. A body field is written
+into a per-attempt copy of the payload, so one provider's field never leaks
+into another's retry.
+
+```jsonc
+{ "id": "go-primary", "baseURL": "https://opencode.ai/zen/go/v1",
+  "apiKeyEnv": "OPENCODE_GO_KEY",
+  "session": { "field": "header:x-opencode-session", "whenMissing": "affinity" } }
+```
+
+OpenCode Go is one instance of this contract, not a code path: deleting the
+`session` block stops the header entirely, and a provider that uses a JSON body
+key declares `body:<key>` instead. The old `no-session` constant is never
+generated; a client that sends it deliberately is a normal value.
 
 ---
 
@@ -454,8 +501,7 @@ only inside its own logical-model group, it is skipped the moment it is not
 eligible, and the map holds at most 10,000 entries with LRU eviction. It is
 dropped on failure, on route removal, on an operator cool/uncool/reset (an explicit
 routing decision must never be overruled by learned preference), and on process
-restart, which loses the table. Callers on the shared no-session key get no pin at
-all.
+restart, which loses the table. Callers with no session key get no pin at all.
 
 **The two scopes.** A ROUTE is one physical `(backend, upstream)` pair. Route
 state is shared by every logical model that aliases that pair, and separate
@@ -479,10 +525,10 @@ wrong.
 whose body carries no explanation is `upstream_rejection`: it has no evidence
 that the payload was at fault, so it fails over, and it excludes that route for
 that SESSION only for 30s. The exclusion is keyed by session + physical route,
-so two models aliasing one route share it. Callers with the shared
-`no-session` key get no exclusion (and no preference), because pinning or
-excluding a shared bucket would apply one anonymous caller's experience to
-every other.
+so two models aliasing one route share it. A caller with no session key gets no
+preference (no pin); its exclusions are keyed by credential + logical model +
+physical route, so the same client keeps its 30s memory while a different
+credential never shares it.
 
 **Strict eligibility.** An attempt is eligible only when its account health, its
 shared route health, the applicable session exclusion, and recovery-lease
