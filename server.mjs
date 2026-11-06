@@ -783,11 +783,43 @@ function upstreamExplanation(bodyText) {
   }
 }
 
+// OpenCode Go admission control. The gateway refuses a turn when the serving
+// cell has no room for it and says "the cell is at capacity; retry shortly".
+// Two error codes carry it (prefill_cap_refused and ttft_admission_refused) and
+// the upstream may wrap them in more than one HTTP status: the OpenCode client
+// has seen them arrive as 400 and reports them as a dead turn, while the router
+// has only ever seen 429. Either way the refusal is transient and per-request -
+// resending the identical turn succeeds (measured 2026-11-06: ~50% of attempts
+// admitted, success within a handful of retries) - so it must never be treated
+// as a client-payload error, an account fault, or a reason to park the account.
+const ADMISSION_REFUSAL = /prefill_cap_refused|ttft_admission_refused|the cell is at capacity/i;
+// A refusal is transient roughly half the time on the next attempt, so the retry
+// budget is a handful of FAST attempts rather than one long sleep on the hint
+// ("after N s" ranged 2-59 s): the cell frees between attempts far sooner than
+// that hint suggests. Two retries before failing over keeps a session from
+// waiting on a sick provider; the last eligible provider gets the whole budget.
+// Deliberately independent of the model's `retry` block - losing a turn to a
+// busy cell is not acceptable, so this path cannot be disabled by config drift.
+const ADMISSION_RETRIES = 4;
+const ADMISSION_RETRIES_BEFORE_FAILOVER = 2;
+const ADMISSION_BASE_MS = 500;
+const ADMISSION_MAX_MS = 4000;
+const ADMISSION_TOTAL_MS = 20000;
+function isAdmissionRefusal(status, bodyText) {
+  if (status === 401 || status === 402 || status === 403) return false; // account is dead, not busy
+  if (/GoUsageLimitError/i.test(bodyText || "")) return false; // weekly pin, retrying cannot help
+  return ADMISSION_REFUSAL.test(bodyText || "");
+}
+
 function classify(status, bodyText, errorBodyState = "present") {
   if (status === 429) {
     if (/GoUsageLimitError/i.test(bodyText || "")) return "weekly";
     return "rate";
   }
+  // Admission control is capacity, not the payload: it must fail over and be
+  // retried (as "rate"), even when the upstream wraps it in a 400/422 that the
+  // block below would otherwise attribute to the caller.
+  if (isAdmissionRefusal(status, bodyText)) return "rate";
   if (status === 401 || status === 403) return "auth";
   if (status >= 500) return "server";
   if (status === 0) return "server"; // network error
@@ -823,6 +855,9 @@ function isRetryableError(status, bodyText, errorBodyState = "present") {
   // An unexplained rejection has no evidence that retrying the SAME provider
   // helps - the identical payload is sent again - so fail over instead.
   if (kind === "upstream_rejection") return false;
+  // Admission control says, in its own words, to retry shortly. Retrying the
+  // same cell is the documented remedy and measured to work.
+  if (isAdmissionRefusal(status, bodyText)) return true;
   if (status === 429) return /overload/i.test(bodyText || "");
   if (status === 502 || status === 503 || status === 504) return true;
   if (status === 0) return true; // network error
@@ -3727,10 +3762,27 @@ async function handleChat(req, res, cfg, bodyText) {
       const bookAccount = health.get(attempt.backend);
       if (bookAccount) bookAccount.dispatchSeq = attempt.dispatchSeq;
       result = await forward(req, cfg, backend, payload, req.headers, stream, sessionKey, callerAbort.signal);
-      if (result.err && isRetryableError(result.err.status, result.err.body) && retries < maxRetries && !hasEligibleAlternative()) {
+      const admissionRefusal = !!result.err && isAdmissionRefusal(result.err.status, result.err.body);
+      // Admission control is the one failure the upstream itself says to retry,
+      // and it is cheap to retry: measured ~50% admitted per attempt, so a few
+      // fast attempts turn "cell busy" into a served turn. It therefore retries
+      // even while other candidates exist, but only a couple of times before
+      // failing over - a session pinned to a genuinely sick provider costs more
+      // than it saves. Once nothing else is eligible it gets the full budget.
+      const retryCap = admissionRefusal ? Math.max(maxRetries, ADMISSION_RETRIES) : maxRetries;
+      const capThisAttempt = admissionRefusal && hasEligibleAlternative() ? Math.min(retryCap, ADMISSION_RETRIES_BEFORE_FAILOVER) : retryCap;
+      if (
+        result.err &&
+        isRetryableError(result.err.status, result.err.body) &&
+        retries < capThisAttempt &&
+        (admissionRefusal || !hasEligibleAlternative())
+      ) {
         const retryCount = retries + 1;
-        const waitMs = Math.min(retryBaseMs * retryMult ** (retryCount - 1), retryMaxMs);
-        const budgetExceeded = retryWaitedMs + waitMs > retryTotalMs;
+        const waitMs = admissionRefusal
+          ? Math.min(ADMISSION_BASE_MS * 2 ** (retryCount - 1), ADMISSION_MAX_MS)
+          : Math.min(retryBaseMs * retryMult ** (retryCount - 1), retryMaxMs);
+        const budget = admissionRefusal ? Math.max(retryTotalMs, ADMISSION_TOTAL_MS) : retryTotalMs;
+        const budgetExceeded = retryWaitedMs + waitMs > budget;
         if (budgetExceeded) break;
         retries = retryCount;
         retryWaitedMs += waitMs;
@@ -3760,10 +3812,15 @@ async function handleChat(req, res, cfg, bodyText) {
       // A caller who left before any header is not a provider failure: the attempt is charged
       // nothing, and with nobody left to serve there is no failover to attempt either.
       const callerAborted = result.err.stage === "caller_aborted";
+      // Admission control is capacity, not an account fault: the same account
+      // serves other requests (and likely this one on the next attempt), so
+      // parking it for the usual 30 s would turn one busy cell into an empty
+      // pool for every caller. Retries above are the backoff.
+      const admissionRefusal = !callerAborted && isAdmissionRefusal(result.err.status, result.err.body);
       failedAttempts++;
       if (errKind === "upstream_rejection") opaqueFailures++;
-      if (!callerAborted) noteAttemptFailure(cfg, attempt, exclScope, result.err.status, result.err.body, result.err.errorBodyState, result.err.stage || null);
-      const scope = callerAborted ? { cooldownScope: null, nextAvailableAt: null } : cooldownScopeOf(attempt, errKind);
+      if (!callerAborted && !admissionRefusal) noteAttemptFailure(cfg, attempt, exclScope, result.err.status, result.err.body, result.err.errorBodyState, result.err.stage || null);
+      const scope = callerAborted || admissionRefusal ? { cooldownScope: null, nextAvailableAt: null } : cooldownScopeOf(attempt, errKind);
       attemptsSummary.push(attemptOutcome({
         attempt,
         status: result.err.status,

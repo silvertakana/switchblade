@@ -5577,6 +5577,185 @@ async function main() {
     }
   }
 
+  // z22b) an OpenCode Go admission refusal is retried on the SAME provider and
+  //       the turn is served. The upstream itself says "retry shortly", the
+  //       refusal is transient, and the model has NO retry block here: the
+  //       admission budget must not depend on config.
+  {
+    let hits = 0;
+    const admSrv = http.createServer(async (req, res) => {
+      for await (const _ of req) { /* drain */ }
+      hits++;
+      if (hits <= 2) {
+        res.writeHead(429, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { type: "server_error", message: "Upstream request failed: [prefill_cap_refused] the cell is at capacity; retry shortly (after 30 s)" } }));
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: "mock", object: "chat.completion", choices: [{ message: { role: "assistant", content: "ok" } }] }));
+    });
+    const z22bPort = await listen(admSrv);
+    const cfgZ22b = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "z22badm", baseURL: `http://${HOST}:${z22bPort}`, apiKeyEnv: "KEY_Z22BADM" }],
+      models: { "m22b": { providers: [{ backend: "z22badm", upstream: "u22b" }], affinityPool: 1 } },
+      presets: { "p22b": { strategy: "affinity", models: ["m22b"] } },
+      backoff: BO,
+    };
+    const { child: childZ22b, base: baseZ22b, dir: dirZ22b } = await startRouterCfg(cfgZ22b, "KEY_Z22BADM=k\n");
+    try {
+      const rr = await fetch(baseZ22b + "/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer local-master" },
+        body: JSON.stringify({ model: "p22b", messages: [] }),
+        signal: AbortSignal.timeout(15000),
+      });
+      await rr.text();
+      assert(
+        rr.status === 200 && hits === 3,
+        "z22b) admission refusal is retried on the same provider until the cell admits (status=" + rr.status + ", hits=" + hits + ")"
+      );
+    } finally {
+      childZ22b.kill();
+      admSrv.close();
+      await rm(dirZ22b, { recursive: true, force: true });
+    }
+  }
+
+  // z22c) failover stays first for admission refusals, but the LAST eligible
+  //       provider gets the full admission budget: the first provider is hit
+  //       1 + 2 times, the second 1 + 4 times, and neither is cooled afterwards
+  //       (a busy cell must not empty the pool for every other caller).
+  {
+    let hitsA = 0;
+    let hitsB = 0;
+    const mkAdm = (which) => http.createServer(async (req, res) => {
+      for await (const _ of req) { /* drain */ }
+      if (which === "a") hitsA++; else hitsB++;
+      res.writeHead(429, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { type: "server_error", message: "Upstream request failed: [ttft_admission_refused] the cell is at capacity; retry shortly (after 5 s)" } }));
+    });
+    const srvA = mkAdm("a");
+    const srvB = mkAdm("b");
+    const z22cPorts = await Promise.all([listen(srvA), listen(srvB)]);
+    const cfgZ22c = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "z22cA", baseURL: `http://${HOST}:${z22cPorts[0]}`, apiKeyEnv: "KEY_Z22CA" },
+        { id: "z22cB", baseURL: `http://${HOST}:${z22cPorts[1]}`, apiKeyEnv: "KEY_Z22CB" },
+      ],
+      models: { "m22c": { providers: [{ backend: "z22cA", upstream: "u22c" }, { backend: "z22cB", upstream: "u22c" }], affinityPool: 1 } },
+      presets: { "p22c": { strategy: "affinity", models: ["m22c"] } },
+      backoff: BO,
+    };
+    const { child: childZ22c, base: baseZ22c, dir: dirZ22c } = await startRouterCfg(cfgZ22c, "KEY_Z22CA=k\nKEY_Z22CB=k\n");
+    try {
+      const rr = await fetch(baseZ22c + "/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer local-master" },
+        body: JSON.stringify({ model: "p22c", messages: [] }),
+        signal: AbortSignal.timeout(30000),
+      });
+      await rr.text();
+      const health = await (await fetch(baseZ22c + "/health")).json();
+      const stateOf = (id) => (health.backends.find((b) => b.id === id) || {}).state;
+      assert(
+        rr.status === 503 && hitsA === 3 && hitsB === 5,
+        "z22c) admission retries are bounded before failover (2) and full on the last provider (4) (status=" + rr.status + ", hitsA=" + hitsA + ", hitsB=" + hitsB + ")"
+      );
+      assert(
+        stateOf("z22cA") !== "cooling" && stateOf("z22cB") !== "cooling",
+        "z22c2) a capacity refusal must not cool the account (A=" + stateOf("z22cA") + ", B=" + stateOf("z22cB") + ")"
+      );
+    } finally {
+      childZ22c.kill();
+      srvA.close(); srvB.close();
+      await rm(dirZ22c, { recursive: true, force: true });
+    }
+  }
+
+  // z22d) the same admission refusal wrapped in a 400 is capacity, not a
+  //       payload bug: it must be retried instead of aborting the turn as a
+  //       client error (the OpenCode client has seen exactly this shape).
+  {
+    let hits = 0;
+    const srv = http.createServer(async (req, res) => {
+      for await (const _ of req) { /* drain */ }
+      hits++;
+      if (hits === 1) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { type: "server_error", message: "Upstream request failed: [prefill_cap_refused] the cell is at capacity; retry shortly (after 5 s)" } }));
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: "mock", object: "chat.completion", choices: [{ message: { role: "assistant", content: "ok" } }] }));
+    });
+    const z22dPort = await listen(srv);
+    const cfgZ22d = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "z22d", baseURL: `http://${HOST}:${z22dPort}`, apiKeyEnv: "KEY_Z22D" }],
+      models: { "m22d": { providers: [{ backend: "z22d", upstream: "u22d" }], affinityPool: 1 } },
+      presets: { "p22d": { strategy: "affinity", models: ["m22d"] } },
+      backoff: BO,
+    };
+    const { child: childZ22d, base: baseZ22d, dir: dirZ22d } = await startRouterCfg(cfgZ22d, "KEY_Z22D=k\n");
+    try {
+      const rr = await fetch(baseZ22d + "/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer local-master" },
+        body: JSON.stringify({ model: "p22d", messages: [] }),
+        signal: AbortSignal.timeout(15000),
+      });
+      await rr.text();
+      assert(
+        rr.status === 200 && hits === 2,
+        "z22d) an admission refusal wrapped in a 400 is retried, not returned as a client error (status=" + rr.status + ", hits=" + hits + ")"
+      );
+    } finally {
+      childZ22d.kill();
+      srv.close();
+      await rm(dirZ22d, { recursive: true, force: true });
+    }
+  }
+
+  // z22e) a weekly usage pin is NOT admission control: it must never be retried
+  //       (retrying cannot succeed) even though it also arrives as a 429.
+  {
+    let hits = 0;
+    const srv = http.createServer(async (req, res) => {
+      for await (const _ of req) { /* drain */ }
+      hits++;
+      res.writeHead(429, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { type: "GoUsageLimitError", message: "Weekly usage limit reached. Resets in 3 days." } }));
+    });
+    const z22ePort = await listen(srv);
+    const cfgZ22e = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "z22e", baseURL: `http://${HOST}:${z22ePort}`, apiKeyEnv: "KEY_Z22E" }],
+      models: { "m22e": { providers: [{ backend: "z22e", upstream: "u22e" }], affinityPool: 1 } },
+      presets: { "p22e": { strategy: "affinity", models: ["m22e"] } },
+      backoff: BO,
+    };
+    const { child: childZ22e, base: baseZ22e, dir: dirZ22e } = await startRouterCfg(cfgZ22e, "KEY_Z22E=k\n");
+    try {
+      const rr = await fetch(baseZ22e + "/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer local-master" },
+        body: JSON.stringify({ model: "p22e", messages: [] }),
+        signal: AbortSignal.timeout(15000),
+      });
+      await rr.text();
+      assert(
+        rr.status !== 200 && hits === 1,
+        "z22e) a weekly usage pin is never retried (status=" + rr.status + ", hits=" + hits + ")"
+      );
+    } finally {
+      childZ22e.kill();
+      srv.close();
+      await rm(dirZ22e, { recursive: true, force: true });
+    }
+  }
+
   // z23) wall-clock kill removed: a slow-but-alive SSE stream that runs LONGER
   //      than timeoutMs is no longer cut mid-body. The old AbortSignal.timeout
   //      aborted the whole fetch (headers + body) at the wall clock, so a 150ms
