@@ -11446,6 +11446,120 @@ async function main() {
     }
   }
 
+  // zUpRej1) A provider-side rejection wearing a 400/422 must not be blamed on the caller. The
+  //   Go gateway answers a model its cell cannot serve with {"error":{"type":"server_error",
+  //   "message":"Upstream request failed: Model is unavailable."}}. The router read "the body
+  //   explains itself" as "the caller's fault", so the row recorded status 400, errorKind
+  //   "client", decision "client_error", cooldownScope null: it blamed the caller, cooled
+  //   nothing and never reached a provider that could serve the turn (measured 2026-11-07 on
+  //   deepseek-v4.1-flash-free and glm-5.3-flash-free). The ROUTE is what cannot serve it, so
+  //   the request fails over and nothing is charged.
+  {
+    let urAHits = 0;
+    const srvUrA = http.createServer(async (req, res) => {
+      for await (const _ of req) { /* drain */ }
+      urAHits++;
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { type: "server_error", message: "Upstream request failed: Model is unavailable." } }));
+    });
+    const urB = mockBackend("urB", {});
+    const portsUr = await Promise.all([listen(srvUrA), listen(urB.srv)]);
+    urB.port = portsUr[1];
+    const cfgUr = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "urA", baseURL: "http://" + HOST + ":" + portsUr[0], apiKeyEnv: "KEY_URA" },
+        { id: "urB", baseURL: "http://" + HOST + ":" + urB.port, apiKeyEnv: "KEY_URB" },
+      ],
+      // affinityPool 1 pins declared order, so urA is always tried first and the failover path
+      // is actually exercised (a larger pool can start the session hash at urB and pass without
+      // ever attempting a failover).
+      models: { mUr: { providers: [{ backend: "urA", upstream: "uUrGone" }, { backend: "urB", upstream: "uUrOk" }], affinityPool: 1 } },
+      presets: { pUr: { strategy: "failover", models: ["mUr"] } },
+      backoff: { ...BO, serverBaseMs: 60000, serverMaxMs: 300000 },
+    };
+    const hUr = await startRouterCfg(cfgUr, "KEY_URA=k\nKEY_URB=k\n");
+    try {
+      const rr = await api(hUr.base, "/v1/chat/completions", { body: { model: "pUr", messages: [] } });
+      const bodyUr = await rr.json();
+      const servedUr = bodyUr && bodyUr.choices && bodyUr.choices[0] && bodyUr.choices[0].message && bodyUr.choices[0].message.content;
+      assert(
+        rr.status === 200 && servedUr === "mock:urB" && urAHits === 1 && urB.hits.length === 1,
+        "zUpRej1a) a 400 whose body says server_error fails over instead of aborting the request (status=" + rr.status + ", aHits=" + urAHits + ", bHits=" + urB.hits.length + ", served=" + JSON.stringify(servedUr) + ")"
+      );
+      const histUr = await (await api(hUr.base, "/api/history?limit=5", { method: "GET" })).json();
+      const entryUr = (histUr.entries || []).find((x) => x.callId === rr.headers.get("x-router-call"));
+      const sumUr = entryUr && Array.isArray(entryUr.attemptsSummary) ? entryUr.attemptsSummary : [];
+      assert(
+        sumUr.length === 2 && sumUr[0].backend === "urA" && sumUr[0].status === 400 && sumUr[0].kind === "upstream_rejection" &&
+          sumUr[0].decision === "failover" && sumUr[1].backend === "urB" && sumUr[1].decision === "success",
+        "zUpRej1b) the refusing route is recorded as an upstream_rejection failover, not a client_error (" + JSON.stringify(sumUr.map((x) => [x.backend, x.status, x.kind, x.decision])) + ")"
+      );
+      const hhUr = await (await api(hUr.base, "/health", { method: "GET" })).json();
+      const acctUr = hhUr.backends.find((b) => b.id === "urA");
+      const rowUr = (hhUr.routes || []).find((x) => x.backend === "urA" && x.upstream === "uUrGone");
+      assert(
+        sumUr.length > 0 && sumUr[0].cooldownScope === "session" && sumUr[0].nextAvailableAt === null &&
+          !!acctUr && acctUr.state === "healthy" && (!rowUr || rowUr.state !== "cooling"),
+        "zUpRej1c) it is the route's problem, so the scope is the session and neither the account nor the route is cooled (scope=" + (sumUr[0] && sumUr[0].cooldownScope) + ", acct=" + (acctUr && acctUr.state) + ", route=" + (rowUr && rowUr.state) + ")"
+      );
+    } finally {
+      hUr.child.kill();
+      srvUrA.close(); urB.srv.close();
+      await rm(hUr.dir, { recursive: true, force: true });
+    }
+  }
+
+  // zUpRej2) The other direction, and why an explicit error TYPE outranks the wording: a real
+  //   validation failure keeps its 400 and stops at the first provider. The same gateway emits
+  //   "Upstream request failed: [invalid_request_error] Invalid schema ..." for a payload it
+  //   rejects, and failing that over would replay the identical rejection on every provider and
+  //   turn a bad request into a 503.
+  {
+    let urCHits = 0;
+    const srvUrC = http.createServer(async (req, res) => {
+      for await (const _ of req) { /* drain */ }
+      urCHits++;
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { type: "invalid_request_error", message: "Upstream request failed: [invalid_request_error] messages[0].role must be user or assistant" } }));
+    });
+    const urD = mockBackend("urD", {});
+    const portsUc = await Promise.all([listen(srvUrC), listen(urD.srv)]);
+    urD.port = portsUc[1];
+    const cfgUc = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "urC", baseURL: "http://" + HOST + ":" + portsUc[0], apiKeyEnv: "KEY_URC" },
+        { id: "urD", baseURL: "http://" + HOST + ":" + urD.port, apiKeyEnv: "KEY_URD" },
+      ],
+      models: { mUc: { providers: [{ backend: "urC", upstream: "uUc" }, { backend: "urD", upstream: "uUd" }], affinityPool: 1, retry: { maxRetries: 3, baseMs: 10, maxMs: 50 } } },
+      presets: { pUc: { strategy: "failover", models: ["mUc"] } },
+      backoff: { ...BO, serverBaseMs: 60000, serverMaxMs: 300000 },
+    };
+    const hUc = await startRouterCfg(cfgUc, "KEY_URC=k\nKEY_URD=k\n");
+    try {
+      const rr = await api(hUc.base, "/v1/chat/completions", { body: { model: "pUc", messages: [] } });
+      const bodyUc = await rr.json();
+      assert(
+        rr.status === 400 && !!bodyUc && !!bodyUc.error && bodyUc.error.type === "invalid_request_error" && urCHits === 1 && urD.hits.length === 0,
+        "zUpRej2a) an invalid_request_error body keeps its 400, its real status and no failover (status=" + rr.status + ", type=" + (bodyUc && bodyUc.error && bodyUc.error.type) + ", aHits=" + urCHits + ", bHits=" + urD.hits.length + ")"
+      );
+      const hhUc = await (await api(hUc.base, "/health", { method: "GET" })).json();
+      const acctUc = hhUc.backends.find((b) => b.id === "urC");
+      const rowUc = (hhUc.routes || []).find((x) => x.backend === "urC" && x.upstream === "uUc");
+      const histUc = await (await api(hUc.base, "/api/history?limit=5", { method: "GET" })).json();
+      const entryUc = (histUc.entries || []).find((x) => x.callId === rr.headers.get("x-router-call"));
+      assert(
+        !!acctUc && acctUc.state === "healthy" && (!rowUc || rowUc.state !== "cooling") && !!entryUc && entryUc.errorKind === "client",
+        "zUpRej2b) an explained validation failure cools nothing (acct=" + (acctUc && acctUc.state) + ", route=" + (rowUc && rowUc.state) + ", kind=" + (entryUc && entryUc.errorKind) + ")"
+      );
+    } finally {
+      hUc.child.kill();
+      srvUrC.close(); urD.srv.close();
+      await rm(hUc.dir, { recursive: true, force: true });
+    }
+  }
+
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
 }

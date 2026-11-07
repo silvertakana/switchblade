@@ -849,6 +849,35 @@ function upstreamExplanation(bodyText) {
   }
 }
 
+// A provider-side rejection wearing a 400/422. OpenCode Go answers a model its cell cannot
+// serve with {"error":{"type":"server_error","message":"Upstream request failed: Model is
+// unavailable."}} - an EXPLANATION, but not one that blames the payload. Reading "explained"
+// as "the caller's fault" recorded those calls as client errors (status 400, errorKind
+// "client", decision "client_error", cooldownScope null), so the router blamed the caller,
+// cooled nothing, and never failed over to a provider that could serve it (measured
+// 2026-11-07: deepseek-v4.1-flash-free and glm-5.3-flash-free, while the same keys served
+// paid and free models alike). A server-owned error TYPE, or the gateway's own "Model is
+// unavailable" / "Upstream request failed" wording, is evidence about the ROUTE.
+//
+// An explicit error TYPE outranks the wording, in BOTH directions: the same gateway also
+// emits "type":"invalid_request_error" with a message starting "Upstream request failed:
+// [invalid_request_error] Invalid schema ...", and that one IS the caller's payload -
+// failing over would only replay the identical rejection on every provider.
+const PROVIDER_SIDE_ERROR_TYPES = new Set(["server_error", "upstream_error", "api_error"]);
+const PROVIDER_SIDE_ERROR_MESSAGE = /Model is unavailable|Upstream request failed/i;
+function providerSideRejection(bodyText) {
+  const text = String(bodyText || "").trim();
+  if (!text) return false;
+  let value = null;
+  try { value = JSON.parse(text); } catch { value = null; }
+  if (value && typeof value === "object") {
+    const err = value.error && typeof value.error === "object" ? value.error : null;
+    const type = [err && err.type, value.type].find((t) => typeof t === "string" && t.trim());
+    if (type) return PROVIDER_SIDE_ERROR_TYPES.has(type.trim().toLowerCase());
+  }
+  return PROVIDER_SIDE_ERROR_MESSAGE.test(text);
+}
+
 // OpenCode Go admission control. The gateway refuses a turn when the serving
 // cell has no room for it and says "the cell is at capacity; retry shortly".
 // Two error codes carry it (prefill_cap_refused and ttft_admission_refused) and
@@ -915,6 +944,10 @@ function classify(status, bodyText, errorBodyState = "present") {
     // instead of aborting the whole request, and they cool the dry account.
     // "insufficient balance" is DeepSeek's direct-API wording for exactly this.
     if (/insufficient (credits|quota|balance|funds)|insufficient_quota|insufficient_balance|out of credits|no credits|billing error|payment required/i.test(bodyText || "")) return "billing";
+    // A rejection the PROVIDER owns, dressed in a payload status (see providerSideRejection).
+    // This route cannot serve the model, which is what "upstream_rejection" means: fail over,
+    // do not retry the same route, and cool no account.
+    if (providerSideRejection(bodyText)) return "upstream_rejection";
     // Explained = the upstream blames the payload, so the backend is fine and
     // the request stops. Unexplained = "upstream_rejection": no evidence the
     // payload was at fault, so fail over instead of aborting (2026-10-07: an
