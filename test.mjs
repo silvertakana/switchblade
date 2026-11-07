@@ -11560,6 +11560,207 @@ async function main() {
     }
   }
 
+  // zQFree3) A weekly pin is a PAYMENT allowance, so it governs only the routes that spend it.
+  //   Measured 2026-11-07: go-primary and go-alt sat pinned "weekly" with every deployment
+  //   cooling 6.7 days out, while direct calls with the same three keys returned 200 for
+  //   beam-free and crouton-alpha-free (usage cost 0, billing_source "go"). One paid route's
+  //   429 must not take the account's free models down with it - and the free model answering
+  //   200 must not retire the pin that the paid routes still need.
+  {
+    let qfPaidHits = 0, qfFreeHits = 0, qfGoneHits = 0;
+    const srvQf = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      const body = Buffer.concat(chunks).toString("utf8");
+      if (body.includes("uQfPaid")) {
+        qfPaidHits++;
+        res.writeHead(429, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "GoUsageLimitError: weekly usage limit reached. Resets in 3 days" } }));
+        return;
+      }
+      if (body.includes("uQfGone")) {
+        qfGoneHits++;
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { type: "server_error", message: "Upstream request failed: Model is unavailable." } }));
+        return;
+      }
+      qfFreeHits++;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: "mock", object: "chat.completion", choices: [{ message: { role: "assistant", content: "ok:qfFree" } }] }));
+    });
+    const portQf = await listen(srvQf);
+    const cfgQf = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "qfAcct", baseURL: "http://" + HOST + ":" + portQf, apiKeyEnv: "KEY_QF" }],
+      models: {
+        qfPaid: { providers: [{ backend: "qfAcct", upstream: "uQfPaid" }], affinityPool: 1, meta: { pricing: { inputPerM: 2, outputPerM: 8 } } },
+        qfFree: { providers: [{ backend: "qfAcct", upstream: "uQfFree" }], affinityPool: 1, meta: { pricing: { inputPerM: 0, outputPerM: 0 } } },
+        qfGone: { providers: [{ backend: "qfAcct", upstream: "uQfGone" }], affinityPool: 1, meta: { pricing: { inputPerM: 0, outputPerM: 0 } } },
+      },
+      presets: {
+        pQfPaid: { strategy: "affinity", models: ["qfPaid"] },
+        pQfFree: { strategy: "affinity", models: ["qfFree"] },
+        pQfGone: { strategy: "affinity", models: ["qfGone"] },
+      },
+      // A REAL weekly pin (7 days), so the cooldown cannot lapse inside the test.
+      backoff: { ...BO, serverBaseMs: 60000, serverMaxMs: 300000, weeklyDefaultMs: 604800000 },
+    };
+    const hQf = await startRouterCfg(cfgQf, "KEY_QF=k\n");
+    try {
+      const paid = await api(hQf.base, "/v1/chat/completions", { body: { model: "pQfPaid", messages: [] } });
+      await paid.text();
+      const hhQf = await (await api(hQf.base, "/health", { method: "GET" })).json();
+      const acctQf = hhQf.backends.find((b) => b.id === "qfAcct");
+      assert(
+        paid.status === 503 && qfPaidHits === 1 && !!acctQf && acctQf.state === "cooling" &&
+          !!acctQf.lastError && acctQf.lastError.kind === "weekly" && acctQf.nextAvailableAtMs > Date.now() + 6 * 24 * 3600 * 1000,
+        "zQFree3a) a weekly 429 on the paid route pins the account for the week (status=" + paid.status + ", kind=" + (acctQf && acctQf.lastError && acctQf.lastError.kind) + ", days=" + (acctQf ? ((acctQf.nextAvailableAtMs - Date.now()) / 86400000).toFixed(1) : "?") + ")"
+      );
+      // The pin governs the ALLOWANCE, not the account: the same backend's free model serves.
+      const free = await api(hQf.base, "/v1/chat/completions", { body: { model: "pQfFree", messages: [] } });
+      const freeBody = await free.json();
+      assert(
+        free.status === 200 && !!freeBody && !!freeBody.choices && freeBody.choices[0].message.content === "ok:qfFree" && qfFreeHits === 1,
+        "zQFree3b) a quota-free route on the pinned account serves immediately (status=" + free.status + ", hits=" + qfFreeHits + ", body=" + JSON.stringify(freeBody).slice(0, 120) + ")"
+      );
+      const hhQf2 = await (await api(hQf.base, "/health", { method: "GET" })).json();
+      const acctQf2 = hhQf2.backends.find((b) => b.id === "qfAcct");
+      assert(
+        !!acctQf2 && acctQf2.state === "cooling" && !!acctQf2.lastError && acctQf2.lastError.kind === "weekly",
+        "zQFree3c) the free model's 200 does not retire the paid weekly pin (acct=" + (acctQf2 && acctQf2.state) + ", kind=" + (acctQf2 && acctQf2.lastError && acctQf2.lastError.kind) + ")"
+      );
+      const depQf = (acctQf2 && Array.isArray(acctQf2.deployments)) ? acctQf2.deployments : [];
+      const paidDep = depQf.find((x) => x.upstream === "uQfPaid");
+      const freeDep = depQf.find((x) => x.upstream === "uQfFree");
+      assert(
+        !!paidDep && paidDep.state === "cooling" && !!freeDep && freeDep.state !== "cooling",
+        "zQFree3d) /health reports the pin on the paid route and NOT on the free one (" + JSON.stringify(depQf.map((x) => [x.upstream, x.state])) + ")"
+      );
+      // A free route may still FAIL on its own merits (the model is gone upstream). That is
+      // route evidence, and it must not rewrite the pin's kind or close the free routes again.
+      const gone = await api(hQf.base, "/v1/chat/completions", { body: { model: "pQfGone", messages: [] } });
+      await gone.text();
+      const hhQf3 = await (await api(hQf.base, "/health", { method: "GET" })).json();
+      const acctQf3 = hhQf3.backends.find((b) => b.id === "qfAcct");
+      const freeAgain = await api(hQf.base, "/v1/chat/completions", { body: { model: "pQfFree", messages: [] } });
+      const freeAgainBody = await freeAgain.json();
+      assert(
+        gone.status === 503 && qfGoneHits === 1 && !!acctQf3 && !!acctQf3.lastError && acctQf3.lastError.kind === "weekly" &&
+          freeAgain.status === 200 && qfFreeHits === 2 && freeAgainBody.choices[0].message.content === "ok:qfFree",
+        "zQFree3e) a free route's own rejection leaves the weekly pin in force and the free routes still eligible (" +
+          JSON.stringify({ gone: gone.status, kind: acctQf3 && acctQf3.lastError && acctQf3.lastError.kind, freeAgain: freeAgain.status, freeHits: qfFreeHits }) + ")"
+      );
+    } finally {
+      hQf.child.kill();
+      srvQf.close();
+      await rm(hQf.dir, { recursive: true, force: true });
+    }
+  }
+
+  // zQFree4) The exemption is not immunity: a quota-free route that genuinely fails still cools
+  //   from its own evidence, so routing cannot get permanently stuck on a broken free route.
+  {
+    let qf500Hits = 0;
+    const srvQf500 = http.createServer(async (req, res) => {
+      for await (const _ of req) { /* drain */ }
+      qf500Hits++;
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { type: "server_error", message: "upstream exploded" } }));
+    });
+    const portQf500 = await listen(srvQf500);
+    const cfgQf500 = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "qf500", baseURL: "http://" + HOST + ":" + portQf500, apiKeyEnv: "KEY_QF500" }],
+      models: { qf500m: { providers: [{ backend: "qf500", upstream: "uQf500" }], affinityPool: 1, meta: { pricing: { inputPerM: 0, outputPerM: 0 } } } },
+      presets: { pQf500: { strategy: "affinity", models: ["qf500m"] } },
+      backoff: { ...BO, serverBaseMs: 60000, serverMaxMs: 300000 },
+    };
+    const hQf500 = await startRouterCfg(cfgQf500, "KEY_QF500=k\n");
+    try {
+      const first500 = await api(hQf500.base, "/v1/chat/completions", { body: { model: "pQf500", messages: [] } });
+      await first500.text();
+      const hh500 = await (await api(hQf500.base, "/health", { method: "GET" })).json();
+      const row500 = (hh500.routes || []).find((x) => x.backend === "qf500" && x.upstream === "uQf500");
+      assert(
+        first500.status === 503 && !!row500 && row500.state === "cooling" && row500.fails === 1 &&
+          row500.lastErrorKind === "server" && row500.retryInMs > 0,
+        "zQFree4a) a quota-free route that answers 500 cools from its own evidence (row=" + JSON.stringify(row500 && { state: row500.state, fails: row500.fails, kind: row500.lastErrorKind, retryInMs: row500.retryInMs }) + ")"
+      );
+      const second500 = await api(hQf500.base, "/v1/chat/completions", { body: { model: "pQf500", messages: [] } });
+      await second500.text();
+      assert(
+        second500.status === 503 && qf500Hits === 1,
+        "zQFree4b) the cooled free route is not dispatched again while its cooldown runs (status=" + second500.status + ", hits=" + qf500Hits + ")"
+      );
+    } finally {
+      hQf500.child.kill();
+      srvQf500.close();
+      await rm(hQf500.dir, { recursive: true, force: true });
+    }
+  }
+
+  // zQFree5) A dead credential is NOT a payment fact: auth cooling still takes down every route
+  //   of the backend, quota-free ones included.
+  {
+    let qfAuthPaidHits = 0, qfAuthFreeHits = 0;
+    const srvQfAuth = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      const body = Buffer.concat(chunks).toString("utf8");
+      if (body.includes("uQfAuthPaid")) {
+        qfAuthPaidHits++;
+        res.writeHead(401, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { type: "authentication_error", message: "invalid api key" } }));
+        return;
+      }
+      qfAuthFreeHits++;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: "mock", object: "chat.completion", choices: [{ message: { role: "assistant", content: "ok:qfAuthFree" } }] }));
+    });
+    const portQfAuth = await listen(srvQfAuth);
+    const cfgQfAuth = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "qfAuth", baseURL: "http://" + HOST + ":" + portQfAuth, apiKeyEnv: "KEY_QFAUTH" }],
+      models: {
+        qfAuthPaid: { providers: [{ backend: "qfAuth", upstream: "uQfAuthPaid" }], affinityPool: 1, meta: { pricing: { inputPerM: 2, outputPerM: 8 } } },
+        qfAuthFree: { providers: [{ backend: "qfAuth", upstream: "uQfAuthFree" }], affinityPool: 1, meta: { pricing: { inputPerM: 0, outputPerM: 0 } } },
+      },
+      presets: {
+        pQfAuthPaid: { strategy: "affinity", models: ["qfAuthPaid"] },
+        pQfAuthFree: { strategy: "affinity", models: ["qfAuthFree"] },
+      },
+      backoff: { ...BO, serverBaseMs: 60000, serverMaxMs: 300000 },
+    };
+    const hQfAuth = await startRouterCfg(cfgQfAuth, "KEY_QFAUTH=k\n");
+    try {
+      const paidAuth = await api(hQfAuth.base, "/v1/chat/completions", { body: { model: "pQfAuthPaid", messages: [] } });
+      await paidAuth.text();
+      const freeAuth = await api(hQfAuth.base, "/v1/chat/completions", { body: { model: "pQfAuthFree", messages: [] } });
+      await freeAuth.text();
+      const hhAuth = await (await api(hQfAuth.base, "/health", { method: "GET" })).json();
+      const acctAuth = hhAuth.backends.find((b) => b.id === "qfAuth");
+      const authDep = (acctAuth && Array.isArray(acctAuth.deployments)) ? acctAuth.deployments : [];
+      const freeAuthDep = authDep.find((x) => x.upstream === "uQfAuthFree");
+      assert(
+        paidAuth.status === 503 && qfAuthPaidHits === 1 && !!acctAuth && acctAuth.state === "cooling" &&
+          !!acctAuth.lastError && acctAuth.lastError.kind === "auth",
+        "zQFree5a) a 401 cools the account as auth (status=" + paidAuth.status + ", kind=" + (acctAuth && acctAuth.lastError && acctAuth.lastError.kind) + ")"
+      );
+      assert(
+        freeAuth.status === 503 && freeAuth.headers.get("x-router-backend") === "none" && qfAuthFreeHits === 0,
+        "zQFree5b) auth cooling still refuses the quota-free route locally (status=" + freeAuth.status + ", backend=" + freeAuth.headers.get("x-router-backend") + ", upstreamHits=" + qfAuthFreeHits + ")"
+      );
+      assert(
+        !!freeAuthDep && freeAuthDep.state === "cooling",
+        "zQFree5c) /health reports the account block on the free route too (" + JSON.stringify(authDep.map((x) => [x.upstream, x.state])) + ")"
+      );
+    } finally {
+      hQfAuth.child.kill();
+      srvQfAuth.close();
+      await rm(hQfAuth.dir, { recursive: true, force: true });
+    }
+  }
+
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
 }

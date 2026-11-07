@@ -1075,6 +1075,10 @@ function markSuccess(id, attempt) {
   // A manual cool is a user decision: a success must NEVER clear it. Only the
   // Uncool button (or expiry of a timed manual cool) restores the backend.
   if (h && h.state === "cooling" && h.lastError && h.lastError.kind === "manual") return;
+  // Same rule for a PAYMENT pin on a route that spends none of the allowance: a free model
+  // answering 200 says nothing about the paid allowance, and clearing the pin here would
+  // re-open the paid routes the pin exists to close, one free-model turn at a time.
+  if (h && h.state === "cooling" && attempt && !accountCoolApplies(attempt, h)) return;
   // A usable completion is current proof that the ACCOUNT is answering, so it retires the
   // distinct-route outage evidence that would otherwise escalate on the next unrelated
   // failure. Only a CURRENT completion may do it: one that owns the account row and is not
@@ -1351,6 +1355,41 @@ function routeKey(attempt) {
   return JSON.stringify([attempt.backend, attempt.upstream]);
 }
 
+// A route whose model costs NOTHING upstream. An account-wide weekly/billing pin is a PAYMENT
+// allowance and governs only the routes that spend it: measured 2026-11-07, go-primary and
+// go-alt sat pinned "weekly" with every deployment cooling 6.7 days out, while direct calls
+// with the same three keys returned 200 for beam-free and crouton-alpha-free (cost 0,
+// billing_source "go"). An account-wide payment cool that takes the working free models down
+// with it is over-broad, so a quota-free route is exempt from it - and ONLY from it: an AUTH
+// fault is a dead credential, which kills the free models just as dead.
+//
+// Derived at config load from meta.pricing: a route is quota-free when at least one model
+// entry listing it prices BOTH directions at exactly 0. A free route that really fails still
+// cools from its own evidence (its own 429/500), so nothing here becomes permanently sticky.
+const QUOTA_FREE_ROUTES = new Set(); // routeKey
+const PAYMENT_COOL_KINDS = new Set(["weekly", "billing"]);
+
+function rebuildQuotaFreeRoutes(cfg) {
+  QUOTA_FREE_ROUTES.clear();
+  const byId = backendsById(cfg);
+  for (const [id, m] of Object.entries((cfg && cfg.models) || {})) {
+    const pricing = m && m.meta ? m.meta.pricing : null;
+    if (!pricing || typeof pricing !== "object") continue;
+    if (pricing.inputPerM !== 0 || pricing.outputPerM !== 0) continue;
+    for (const p of modelDeployments(m, id, byId)) QUOTA_FREE_ROUTES.add(JSON.stringify([p.backend, p.upstream]));
+  }
+}
+
+// Does this ACCOUNT-wide cool govern this ROUTE? A weekly or billing pin is a payment fact, so
+// a route that spends none of the allowance keeps serving while the pin is in force. Every
+// other class - auth above all - is the credential or the endpoint talking, and applies to the
+// whole account.
+function accountCoolApplies(dep, h) {
+  const kind = h && h.lastError ? h.lastError.kind : null;
+  if (!PAYMENT_COOL_KINDS.has(kind)) return true;
+  return !QUOTA_FREE_ROUTES.has(routeKey(dep));
+}
+
 function routeBackoffMs(fails, cfg) {
   return backoffFor("server", cfg, Math.max(1, fails));
 }
@@ -1408,7 +1447,7 @@ const PROBE_FLOOR_MS = 5000;
 // provider, not about who is asking.
 function routeUsableForLiveness(dep, now) {
   const h = health.get(dep.backend);
-  if (h && h.state === "cooling" && h.nextAvailableAt > now) return false;
+  if (h && h.state === "cooling" && h.nextAvailableAt > now && accountCoolApplies(dep, h)) return false;
   if (manualRouteBlocked(dep, now)) return false;
   const r = ROUTES.get(routeKey(dep));
   if (routeHasHistory(r) && r.nextAvailableAt > now) return false;
@@ -1576,7 +1615,9 @@ function leaseHolds(lease, kind, row) {
 // probes this dispatch already owns; callers with no lease get the strict answer.
 function ineligibility(attempt, exclScope, now, lease = null) {
   const h = health.get(attempt.backend);
-  if (h && h.state === "cooling") {
+  // An account block the route is not evidence about (a payment pin against a quota-free
+  // route) is not consulted at all - neither its deadline nor its probe.
+  if (h && h.state === "cooling" && accountCoolApplies(attempt, h)) {
     if (!isUsableCurrently(attempt.backend, now)) {
       return h.lastError && h.lastError.kind === "manual" ? "manual" : "account_cooling";
     }
@@ -1661,8 +1702,13 @@ function noteAttemptFailure(cfg, attempt, exclScope, status, bodyText, errorBody
   if (kind === "client") return kind;
   if (kind === "upstream_rejection") {
     excludeRouteForSession(exclScope, attempt);
-    if (ownsAccountSettlement(attempt)) {
-      const h = health.get(attempt.backend) || { state: "healthy", fails: 0, backoffMs: 0 };
+    // The last error is recorded for visibility, but a COOLING row is never overwritten: its
+    // kind is what decides who the cooldown governs (a manual block is not a rejection, and a
+    // weekly/billing pin has to keep exempting the account's quota-free routes). Rewriting it
+    // here re-closed exactly the routes the payment pin must not reach, for the whole pin.
+    const acctRow = health.get(attempt.backend);
+    if (ownsAccountSettlement(attempt) && (!acctRow || acctRow.state !== "cooling")) {
+      const h = acctRow || { state: "healthy", fails: 0, backoffMs: 0 };
       h.lastError = { status, kind, body: (bodyText || "").slice(0, 300) };
       health.set(attempt.backend, h);
     }
@@ -5644,6 +5690,8 @@ async function loadConfig() {
   }
   ensureBackends(cfg);
   pruneRoutes(cfg);
+  // Who the payment pins govern, re-derived for the config now in force (see QUOTA_FREE_ROUTES).
+  rebuildQuotaFreeRoutes(cfg);
   return cfg;
 }
 
@@ -5681,23 +5729,29 @@ function server() {
           // failure of its own is still refused while its account is cooling, and a row
           // claiming "healthy" there would be a lie about routing. lastErrorKind is
           // deliberately the ROUTE's own kind - what the route itself last failed with.
+          // The same rule in reverse for a payment pin and a quota-free route: that route is
+          // still routable (see QUOTA_FREE_ROUTES), so reporting it cooling would be the
+          // mirror-image lie.
           deployments: routeRows
             .filter((r) => r.backend === b.id)
-            .map((r) => ({
-              id: b.id,
-              upstream: r.upstream,
-              state: accountCooling || r.state === "cooling" ? "cooling" : r.state,
-              models: r.models,
-              fails: r.fails,
-              nextAvailableAtMs: accountCooling ? (h.nextAvailableAt || 0) : r.nextAvailableAtMs,
-              retryInMs: accountCooling ? Math.max(0, (h.nextAvailableAt || 0) - now) : r.retryInMs,
-              probeInFlight: accountCooling ? !!h.probeInFlight : r.probeInFlight,
-              lastErrorKind: r.lastErrorKind,
-              lastStatus: r.lastStatus,
-              manual: accountCooling
-                ? !!(h.lastError && h.lastError.kind === "manual")
-                : (r.state === "cooling" && r.lastErrorKind === "manual"),
-            })),
+            .map((r) => {
+              const accountBlocked = accountCooling && accountCoolApplies({ backend: b.id, upstream: r.upstream }, h);
+              return {
+                id: b.id,
+                upstream: r.upstream,
+                state: accountBlocked || r.state === "cooling" ? "cooling" : r.state,
+                models: r.models,
+                fails: r.fails,
+                nextAvailableAtMs: accountBlocked ? (h.nextAvailableAt || 0) : r.nextAvailableAtMs,
+                retryInMs: accountBlocked ? Math.max(0, (h.nextAvailableAt || 0) - now) : r.retryInMs,
+                probeInFlight: accountBlocked ? !!h.probeInFlight : r.probeInFlight,
+                lastErrorKind: r.lastErrorKind,
+                lastStatus: r.lastStatus,
+                manual: accountBlocked
+                  ? !!(h.lastError && h.lastError.kind === "manual")
+                  : (r.state === "cooling" && r.lastErrorKind === "manual"),
+              };
+            }),
         };
       });
       res.writeHead(200, { "content-type": "application/json" });

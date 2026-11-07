@@ -28,7 +28,9 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 // resilience work (z40a-b, z41a-b, z42a-b ship with it) plus zFence2d restated against the new
 // header-timeout contract.
 // 901 -> 906 is the provider-side 400 rule (zUpRej1a-c, zUpRej2a-b), added without deleting any.
-const SUITE_FLOOR = 906;
+// 906 -> 916 is the quota-free exemption from an account-wide payment pin (zQFree3a-e, zQFree4a-b,
+// zQFree5a-c), likewise added without deleting any.
+const SUITE_FLOOR = 916;
 
 // Sanity floor for the S5 id scan: the suite carries far more ids than this,
 // so a count below the floor means the extractor broke, not that the ids went
