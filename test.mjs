@@ -5615,9 +5615,14 @@ async function main() {
       models: {
         "m22": {
           providers: [{ backend: "z22bad", upstream: "u22" }], affinityPool: 1,
-          // maxRetries high, but totalMs budget tiny: after first retry (wait 40ms)
-          // the second retry's wait would blow the 60ms budget -> stop retrying.
-          retry: { maxRetries: 5, baseMs: 40, maxMs: 200, multiplier: 2, totalMs: 60 },
+          // maxRetries high, but the budget stops the retries mid-way: the first
+          // retry waits 40ms and fits, the second waits 400ms and cannot.
+          // The waits are spaced by a steep multiplier so the outcome no longer
+          // depends on how long the first attempt took: with a 60ms budget and a
+          // 40ms step, a first attempt that took 25ms instead of 5ms already
+          // consumed the room for the retry and the test failed at random
+          // (observed 2026-11-08 on two full-suite runs).
+          retry: { maxRetries: 5, baseMs: 40, maxMs: 1000, multiplier: 10, totalMs: 200 },
         },
       },
       presets: { "p22": { strategy: "affinity", models: ["m22"] } },
