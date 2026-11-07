@@ -87,7 +87,7 @@ const SECRETS_HISTORY_DIR = join(dirname(SECRETS_PATH), "secrets.history");
 const MAX_ENV_SNAPSHOTS = 20;
 // Names consumed once at module load; changing them changes which files the
 // process reads, so the UI must say "next start" instead of "live".
-const STARTUP_ONLY_VARS = new Set(["ROUTER_CONFIG", "ROUTER_ENV", "ROUTER_HISTORY", "ROUTER_KEYS_FILE", "ROUTER_SECRETS", "NODE_OPTIONS"]);
+const STARTUP_ONLY_VARS = new Set(["ROUTER_CONFIG", "ROUTER_ENV", "ROUTER_HISTORY", "ROUTER_KEYS_FILE", "ROUTER_SECRETS", "ROUTER_HEALTH_STATE", "NODE_OPTIONS"]);
 // Real environment at boot: these names are platform-owned and the UI never
 // overrides them. Snapshotted in main() before loadEnv()/loadSecrets() run.
 const SHELL_ENV_NAMES = new Set();
@@ -724,6 +724,7 @@ function markHealthy(id, origin) {
     ANALYTICS.expiredNotified.delete(id);
   }
   health.set(id, { state: "healthy", nextAvailableAt: 0, fails: 0, backoffMs: 0, lastError: null, generation: nextGeneration(), probeInFlight: false });
+  persistHealthSoon();
 }
 
 // Read a model's deployment list as provider-shaped entries. The v3 read OWNS
@@ -1025,6 +1026,7 @@ function markFailure(cfg, id, status, bodyText) {
   h.probeInFlight = false;
   health.set(id, h);
   if (!wasCoolingActive) recordCoolingEvent({ backend: id, action: "cool", kind, manual: false });
+  persistHealthSoon();
 }
 
 function markSuccess(id, attempt) {
@@ -1062,10 +1064,103 @@ function resetAllHealth() {
   SESSION_EXCLUSIONS.clear();
   ACCOUNT_OUTAGE_ROUTES.clear();
   for (const id of health.keys()) markHealthy(id, "reset");
+  forgetHealthState(); // the override must not be replayed by the next boot
 }
 // dashboard needs to explain WHY a backend was down: failure cool (with the
 // classified kind), lazy expiry at request time, success clearing, admin
 // uncool, and reset-health. Newest first, capped at 500 rows.
+
+// ---- durable cooldown state -------------------------------------------------
+//
+// Health lived only in memory, so every restart forgave every cooldown. After the 2026-11-07
+// 18:15 redeploy the two weekly-pinned accounts came back looking healthy and had to be
+// re-earned by real traffic, one failed turn at a time - a deploy opened exactly the window the
+// deploy was supposed to close. The state is tiny, changes rarely, and is written beside the
+// history file on the same durable volume.
+//
+// Only what a restart cannot re-derive is stored: rows that are still cooling, or still carrying
+// a failure streak. An expired cooldown is deliberately dropped - a restart is not a reason to
+// remember a deadline that has already passed.
+const HEALTH_STATE_PATH = process.env.ROUTER_HEALTH_STATE ||
+  join(dirname(process.env.ROUTER_HISTORY || join(dirname(CONFIG_PATH), "router-history.jsonl")), "router-health.json");
+const HEALTH_STATE_CAP = 500;
+const HEALTH_SAVE_MS = 250;
+let healthSaveTimer = null;
+
+function healthStateSnapshot(now = Date.now()) {
+  const out = { version: 1, savedAt: now, backends: [], routes: [] };
+  for (const [id, h] of health) {
+    if (!h || h.state !== "cooling" || !(h.nextAvailableAt > now)) continue;
+    out.backends.push({ id, fails: h.fails || 0, backoffMs: h.backoffMs || 0, nextAvailableAt: h.nextAvailableAt, lastError: h.lastError || null });
+    if (out.backends.length >= HEALTH_STATE_CAP) break;
+  }
+  for (const [key, r] of ROUTES) {
+    if (!routeHasHistory(r) || !((r.nextAvailableAt || 0) > now)) continue;
+    out.routes.push({ key, fails: r.fails || 0, timeoutHits: r.timeoutHits || 0, nextAvailableAt: r.nextAvailableAt, lastErrorKind: r.lastErrorKind || null, lastStatus: r.lastStatus ?? null, lastError: r.lastError || null });
+    if (out.routes.length >= HEALTH_STATE_CAP) break;
+  }
+  return out;
+}
+
+// Debounced: a burst of failures writes once, not once per request. A failed write is never
+// allowed to break routing - the file is a head start for the NEXT boot, not a precondition for
+// serving this request - so it is reported and dropped.
+// Imported by the test suite, the module drives these same internals in-process: a health
+// mutation there must not drop a state file next to whatever directory the tests ran from.
+function runningAsScript() {
+  return !!(process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href);
+}
+
+function persistHealthSoon(delay = HEALTH_SAVE_MS) {
+  if (!runningAsScript()) return;
+  if (healthSaveTimer) return;
+  healthSaveTimer = setTimeout(() => {
+    healthSaveTimer = null;
+    try {
+      writeConfigAtomic(healthStateSnapshot(), HEALTH_STATE_PATH);
+    } catch (e) {
+      console.error(`[${new Date().toISOString()}] health state not persisted: ${e && e.message}`);
+    }
+  }, delay);
+  if (typeof healthSaveTimer.unref === "function") healthSaveTimer.unref();
+}
+
+// An operator override outranks the file: reset-health clears every layer, so it must clear the
+// one a restart would replay.
+function forgetHealthState() {
+  if (healthSaveTimer) { clearTimeout(healthSaveTimer); healthSaveTimer = null; }
+  try { unlinkSync(HEALTH_STATE_PATH); } catch { /* nothing stored */ }
+}
+
+// Restored at boot, BEFORE the first request. Entries the current config no longer declares are
+// dropped, and every restored row gets a fresh generation so a settlement held from the previous
+// process can never match it.
+function restoreHealthState(cfg) {
+  let raw;
+  try { raw = readFileSync(HEALTH_STATE_PATH, "utf8"); } catch { return 0; }
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch { return 0; }
+  if (!parsed || parsed.version !== 1) return 0;
+  const now = Date.now();
+  const ids = new Set((cfg.backends || []).map((b) => b.id));
+  const byId = backendsById(cfg);
+  const declared = new Set();
+  for (const [mid, m] of Object.entries(cfg.models || {})) {
+    for (const p of modelDeployments(m, mid, byId)) declared.add(JSON.stringify([p.backend, p.upstream]));
+  }
+  let n = 0;
+  for (const row of Array.isArray(parsed.backends) ? parsed.backends : []) {
+    if (!row || typeof row.id !== "string" || !ids.has(row.id) || !(row.nextAvailableAt > now)) continue;
+    health.set(row.id, { state: "cooling", fails: row.fails || 0, backoffMs: row.backoffMs || 0, nextAvailableAt: row.nextAvailableAt, lastError: row.lastError || null, generation: nextGeneration(), probeInFlight: false });
+    n++;
+  }
+  for (const row of Array.isArray(parsed.routes) ? parsed.routes : []) {
+    if (!row || typeof row.key !== "string" || !declared.has(row.key) || !(row.nextAvailableAt > now)) continue;
+    ROUTES.set(row.key, { generation: nextGeneration(), fails: row.fails || 0, timeoutHits: row.timeoutHits || 0, nextAvailableAt: row.nextAvailableAt, probeInFlight: false, lastErrorKind: row.lastErrorKind || null, lastStatus: row.lastStatus ?? null, lastError: row.lastError || null });
+    n++;
+  }
+  return n;
+}
 
 const COOLING_EVENTS = []; // newest at head: {t, backend, action, kind, manual}
 const COOLING_EVENT_CAP = 500;
@@ -1333,6 +1428,7 @@ function markRouteTimeout(attempt, status, bodyText) {
   r.probeInFlight = false;
   ROUTES.set(key, r);
   if (!wasCooling) recordCoolingEvent({ backend: attempt.backend, action: "cool", kind: "timeout", manual: false, scope: "route" });
+  persistHealthSoon();
   return r;
 }
 
@@ -1361,6 +1457,7 @@ function markRouteFailure(cfg, attempt, status, bodyText, kind) {
   r.probeInFlight = false;
   ROUTES.set(key, r);
   if (!wasCoolingActive) recordCoolingEvent({ backend: attempt.backend, action: "cool", kind, manual: false, scope: "route" });
+  persistHealthSoon();
   // Only a real HTTP 5xx is evidence about the ACCOUNT. A relay cut, a stalled or empty
   // 200 cools this route - the relay really is unfit - but it says nothing about the
   // account's other routes, so feeding it to the distinct-route heuristic declares an
@@ -1379,6 +1476,7 @@ function markRouteSuccess(attempt) {
   r.nextAvailableAt = 0;
   r.probeInFlight = false;
   r.generation = nextGeneration();
+  persistHealthSoon();
 }
 
 // Settlement ownership. Every attempt books itself as the current writer of its route and
@@ -3933,7 +4031,7 @@ async function handleChat(req, res, cfg, bodyText) {
     // has no automatic recovery, so the header is omitted rather than guessed.
     const recoveryMs = nearestRecoveryMs(c.ordered, exclScope, now);
     if (recoveryMs !== null) res.setHeader("Retry-After", String(Math.max(1, Math.ceil(recoveryMs / 1000))));
-    const entry = applyCost(newHistoryEntry({ t: detailT, callId, model: modelId, backend: "none", stream, status: 503, latencyMs, session: sessionKey ?? "no-session", sessionSource, routedModel: c.ordered[0] ? c.ordered[0].model : null, errorKind: null }), cfg);
+    const entry = applyCost(newHistoryEntry({ t: detailT, callId, model: modelId, backend: "none", stream, status: 503, latencyMs, session: sessionKey ?? "no-session", sessionSource, routedModel: c.ordered[0] ? c.ordered[0].model : null, errorKind: "no_eligible_provider" }), cfg);
     recordHistory(entry);
     recordAnalytics(entry);
     // A session-scoped exclusion is not an outage: alert only when something is
@@ -4347,8 +4445,11 @@ async function handleChat(req, res, cfg, bodyText) {
   // must never be trusted as the provider explaining itself.
   const lastKind = lastErr ? classify(lastErr.status, lastErr.body, lastErr.errorBodyState) : null;
   const explainedClient = lastKind === "client" && !!lastErr;
-  const finalStatus = explainedClient ? (lastErr.status || 400) : 503;
-  const failEntry = applyCost(newHistoryEntry({ t: detailT, callId, model: modelId, backend: lastTried ? lastTried.backend : "none", stream, status: finalStatus, latencyMs, session: sessionKey ?? "no-session", sessionSource, wireSessionField: lastWire ? lastWire.field : null, wireSessionSource: lastWire ? lastWire.source : null, wireSessionHash: lastWire ? lastWire.hash : null, routedModel: c.ordered[0] ? c.ordered[0].model : null, selectionReason, fallbackCount, cacheMayBeCold: fallbackCount > 0, retries: requestRetries, retryWaitedMs: requestRetryWaitedMs, ...capAttemptsSummary(attemptsSummary), errorKind: lastKind }), cfg);
+  // 499 for a caller who left: no answer was possible because nobody was waiting for one, and
+  // recording that as a 503 made every abandonment look like provider exhaustion in the history,
+  // the stats and the error counts an operator triages.
+  const finalStatus = callerGone ? 499 : explainedClient ? (lastErr.status || 400) : 503;
+  const failEntry = applyCost(newHistoryEntry({ t: detailT, callId, model: modelId, backend: lastTried ? lastTried.backend : "none", stream, status: finalStatus, latencyMs, session: sessionKey ?? "no-session", sessionSource, wireSessionField: lastWire ? lastWire.field : null, wireSessionSource: lastWire ? lastWire.source : null, wireSessionHash: lastWire ? lastWire.hash : null, routedModel: c.ordered[0] ? c.ordered[0].model : null, selectionReason, fallbackCount, cacheMayBeCold: fallbackCount > 0, retries: requestRetries, retryWaitedMs: requestRetryWaitedMs, ...capAttemptsSummary(attemptsSummary), errorKind: callerGone ? "client_cancelled" : lastKind }), cfg);
   recordHistory(failEntry);
   recordAnalytics(failEntry);
   // A caller who left is not provider exhaustion, so it must not raise the operator alert.
@@ -5908,6 +6009,7 @@ function server() {
           const forMs = typeof body.forMs === "number" && body.forMs > 0 ? body.forMs : null;
           MANUAL_ROUTES.set(rKey, { until: forMs ? Date.now() + forMs : Number.MAX_SAFE_INTEGER, since: Date.now() });
           recordCoolingEvent({ backend: id, action: "cool", kind: "manual", manual: true, scope: "route" });
+          persistHealthSoon();
         } else {
           MANUAL_ROUTES.delete(rKey);
           // The route row goes with it: the operator cleared the only reason it was
@@ -5941,6 +6043,7 @@ function server() {
         h.backoffMs = h.backoffMs || 0;
         h.lastError = { status: 0, kind: "manual", body: "manually cooled via UI" };
         health.set(id, h);
+        persistHealthSoon();
       } else {
         markHealthy(id, "uncool");
         // An uncool that leaves the backend's ROUTES cooling is a lie: /health would report
@@ -6098,6 +6201,10 @@ async function main() {
   loadEnv();
   loadSecrets();
   await loadConfig();
+  // Cooldowns survive the deploy that ships a fix: a restart must not open the very window the
+  // fix exists to close (2026-11-07 18:15: two weekly pins had to be re-earned by traffic).
+  const restoredRows = restoreHealthState(cfg);
+  if (restoredRows) console.error(`[${new Date().toISOString()}] restored ${restoredRows} cooldown row(s) from ${HEALTH_STATE_PATH}`);
   seedAnalytics(historyPath);
   watchF(CONFIG_PATH, () => {
     loadConfig().catch((e) => console.error("config reload failed:", e.message));

@@ -3609,6 +3609,19 @@ async function main() {
         upstreamReleased && bHits === 0 && acct && acct.state === "healthy" && rows.length === 1 && rows[0].state === "healthy" && rows[0].fails === 0,
         "zCancel1) a caller who leaves before any headers releases the upstream request, fails over nowhere, and charges no health (upstreamReleased=" + upstreamReleased + ", bHits=" + bHits + ", state=" + (acct ? acct.state : "?") + ", routes=" + JSON.stringify(rows) + ")"
       );
+      // ...and the durable row says so. Recorded as a 503 "server failure", every abandonment an
+      // agent makes (a stopped turn, a closed editor) inflated the error counts an operator
+      // triages and made provider exhaustion look more frequent than it is. 499 = "client closed".
+      let cancelRow = null;
+      for (let i = 0; i < 40 && !cancelRow; i++) {
+        const hist = await (await api(hCn.base, "/api/history?limit=5", { method: "GET" })).json();
+        cancelRow = (hist.entries || []).find((e) => e.status === 499) || null;
+        if (!cancelRow) await new Promise((r) => setTimeout(r, 100));
+      }
+      assert(
+        !!cancelRow && cancelRow.errorKind === "client_cancelled" && cancelRow.backend !== "none",
+        "zCancel1b) an abandoned call is recorded as 499 client_cancelled, never as a server error (row=" + JSON.stringify(cancelRow && { status: cancelRow.status, kind: cancelRow.errorKind, backend: cancelRow.backend }) + ")"
+      );
     } finally {
       hCn.child.kill(); srvA.close(); srvB.close();
       await rm(hCn.dir, { recursive: true, force: true });
@@ -5718,6 +5731,65 @@ async function main() {
       hZ42.child.kill();
       z42srv.close();
       await rm(hZ42.dir, { recursive: true, force: true });
+    }
+  }
+
+  // z43) Cooldowns survive a restart. They lived only in memory, so every deploy forgave them:
+  //      after the 2026-11-07 redeploy the two weekly-pinned accounts came back looking healthy
+  //      and had to be re-earned by real traffic, one failed turn at a time. The state is written
+  //      beside the history file, so a restart resumes the same provider state instead of
+  //      re-opening the window a deploy was supposed to close.
+  {
+    const z43bad = http.createServer((req, res) => {
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "route down" } }));
+    });
+    const z43good = mockBackend("z43good", {});
+    const z43ports = await Promise.all([listen(z43bad), listen(z43good.srv)]);
+    z43good.port = z43ports[1];
+    // TWO providers on purpose: a model's LAST usable route is clamped to the 5 s probe floor, so
+    // the failing route here keeps its full 120 s policy backoff and the persisted DEADLINE is
+    // what the assertion measures.
+    const cfgZ43 = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "z43bad", baseURL: `http://${HOST}:${z43ports[0]}`, apiKeyEnv: "KEY_Z43B" },
+        { id: "z43good", baseURL: `http://${HOST}:${z43good.port}`, apiKeyEnv: "KEY_Z43G" },
+      ],
+      models: { m43: { providers: [{ backend: "z43bad", upstream: "u43" }, { backend: "z43good", upstream: "u43g" }], affinityPool: 1 } },
+      presets: { p43: { strategy: "affinity", models: ["m43"] } },
+      backoff: { ...BO, serverBaseMs: 120000, serverMaxMs: 300000 },
+    };
+    const envZ43 = "KEY_Z43B=k\nKEY_Z43G=k\n";
+    const first = await startRouterCfg(cfgZ43, envZ43);
+    const healthFile = join(first.dir, "router-health.json");
+    let restarted = null;
+    try {
+      // Same state file for both children: the second process IS the restart.
+      first.child.kill();
+      await new Promise((r) => setTimeout(r, 300));
+      const h1 = await startRouterCfg(cfgZ43, envZ43, { ROUTER_HEALTH_STATE: healthFile });
+      try {
+        const rr = await api(h1.base, "/v1/chat/completions", { body: { model: "p43", messages: [] } });
+        await rr.text();
+        const routeOf = (hh) => (hh.routes || []).find((r) => r.backend === "z43bad" && r.upstream === "u43");
+        const before = routeOf(await (await api(h1.base, "/health", { method: "GET" })).json());
+        await new Promise((r) => setTimeout(r, 700)); // the debounced write lands
+        restarted = await startRouterCfg(cfgZ43, envZ43, { ROUTER_HEALTH_STATE: healthFile });
+        const after = routeOf(await (await api(restarted.base, "/health", { method: "GET" })).json());
+        assert(
+          before && before.state === "cooling" && before.fails === 1 && before.retryInMs > 60000 &&
+            after && after.state === "cooling" && after.fails === 1 && after.retryInMs > 60000,
+          "z43a) a cooldown in effect when the process dies is still in effect after it restarts, with its streak and its deadline (before=" + JSON.stringify(before && { state: before.state, fails: before.fails, retryInMs: before.retryInMs }) + ", after=" + JSON.stringify(after && { state: after.state, fails: after.fails, retryInMs: after.retryInMs }) + ")"
+        );
+      } finally {
+        h1.child.kill();
+      }
+    } finally {
+      if (restarted) restarted.child.kill();
+      z43bad.close(); z43good.srv.close();
+      await rm(first.dir, { recursive: true, force: true });
+      if (restarted) await rm(restarted.dir, { recursive: true, force: true });
     }
   }
 
