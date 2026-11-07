@@ -15,7 +15,7 @@
 import http from "node:http";
 import { readFileSync, statSync, watch as watchF, appendFileSync, renameSync, openSync, readSync, closeSync, readdirSync, unlinkSync, mkdirSync, writeFileSync } from "node:fs";
 import { readFile as readFileP, rename as renameP, writeFile as writeFileP } from "node:fs/promises";
-import { Readable, Transform } from "node:stream";
+import { PassThrough, Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -1550,9 +1550,32 @@ function ineligibility(attempt, exclScope, now, lease = null) {
   return null;
 }
 
+// How long a probe legitimately holds its row: it holds it until the attempt's own
+// connect/header deadline fires, so THAT is the wait to advertise. The old flat second
+// sent every client straight back into the same held row, one 503 at a time, while the
+// probe was still inside a 45-120 s connect budget.
+function probeBudgetMs(a, cfg) {
+  const b = cfg ? backendsById(cfg).get(a.backend) : null;
+  const budget = (b && (b.connectTimeoutMs ?? b.timeoutMs)) ?? cfg?.connectTimeoutMs ?? cfg?.timeoutMs ?? 45000;
+  return Number(budget) > 0 ? Number(budget) : 45000;
+}
+
+function probeWaitMs(a, cfg, now) {
+  const budget = probeBudgetMs(a, cfg);
+  let deadline = 0;
+  const h = health.get(a.backend);
+  if (h && h.probeInFlight) deadline = Math.max(deadline, (h.probeStartedAt || now) + budget);
+  const r = ROUTES.get(routeKey(a));
+  if (r && r.probeInFlight) deadline = Math.max(deadline, (r.probeStartedAt || now) + budget);
+  // No stamp (claimed before this change, or by an older build): assume a fresh probe
+  // rather than pretending it is about to finish.
+  if (!deadline) deadline = now + budget;
+  return Math.max(1000, deadline - now);
+}
+
 // Nearest finite moment at which some blocked candidate returns, or null when
 // nothing recovers on its own (every blocker is a manual cool).
-function nearestRecoveryMs(ordered, exclScope, now) {
+function nearestRecoveryMs(ordered, exclScope, now, cfg = null) {
   let best = null;
   for (const a of ordered) {
     const why = ineligibility(a, exclScope, now);
@@ -1568,9 +1591,9 @@ function nearestRecoveryMs(ordered, exclScope, now) {
       const e = SESSION_EXCLUSIONS.get(sessionExclusionKey(exclScope, a));
       if (e) at.push(e.blockedUntil);
     }
-    // Nothing recovers on its own while a probe is running, but it will settle
-    // shortly: advertise the shortest honest wait rather than no header at all.
-    if (why === "probe_in_flight") at.push(now + 1000);
+    // A probe recovers on its own the moment it settles, which is bounded by its own
+    // connect/header deadline - advertise that, not a flat second.
+    if (why === "probe_in_flight") at.push(now + probeWaitMs(a, cfg, now));
     for (const t of at) if (t > now && (best === null || t < best)) best = t;
   }
   return best === null ? null : best - now;
@@ -1634,6 +1657,7 @@ function claimAttempt(attempt, now) {
   if (h && h.state === "cooling" && h.nextAvailableAt <= now && (h.fails || 0) > 0) {
     if (h.probeInFlight) return null;
     h.probeInFlight = true;
+    h.probeStartedAt = now; // the probe holds this row until its own connect deadline fires
     token.accountClaim = true;
     token.accountGeneration = h.generation ?? null;
   }
@@ -1644,6 +1668,7 @@ function claimAttempt(attempt, now) {
       return null;
     }
     r.probeInFlight = true;
+    r.probeStartedAt = now;
     token.routeClaim = true;
     token.routeGeneration = r.generation;
   }
@@ -4029,7 +4054,7 @@ async function handleChat(req, res, cfg, bodyText) {
       : `no provider is currently eligible for this request (${Object.entries(blocked).map(([k, n]) => `${n} ${k.replace(/_/g, " ")}`).join(", ")})`;
     // Advertise the soonest automatic recovery. A pool held only by manual cools
     // has no automatic recovery, so the header is omitted rather than guessed.
-    const recoveryMs = nearestRecoveryMs(c.ordered, exclScope, now);
+    const recoveryMs = nearestRecoveryMs(c.ordered, exclScope, now, cfg);
     if (recoveryMs !== null) res.setHeader("Retry-After", String(Math.max(1, Math.ceil(recoveryMs / 1000))));
     const entry = applyCost(newHistoryEntry({ t: detailT, callId, model: modelId, backend: "none", stream, status: 503, latencyMs, session: sessionKey ?? "no-session", sessionSource, routedModel: c.ordered[0] ? c.ordered[0].model : null, errorKind: "no_eligible_provider" }), cfg);
     recordHistory(entry);
@@ -4229,7 +4254,13 @@ async function handleChat(req, res, cfg, bodyText) {
           ? Math.min(ADMISSION_BASE_MS * 2 ** (retryCount - 1), ADMISSION_MAX_MS)
           : Math.min(retryBaseMs * retryMult ** (retryCount - 1), retryMaxMs);
         const budget = admissionRefusal ? Math.max(retryTotalMs, ADMISSION_TOTAL_MS) : retryTotalMs;
-        const budgetExceeded = retryWaitedMs + waitMs > budget;
+        // totalMs caps the WHOLE retry loop, so it has to count the attempts themselves.
+        // Counting only the sleeps let a request spend 45 s inside one attempt, sleep its
+        // way through the rest of the budget, and still read as "inside budget" while the
+        // caller had been waiting for minutes. retryWaitedMs keeps meaning "time spent
+        // asleep" for the history row; the budget reads wall clock.
+        const spentMs = Date.now() - attemptStarted;
+        const budgetExceeded = spentMs + waitMs > budget;
         if (budgetExceeded) break;
         retries = retryCount;
         retryWaitedMs += waitMs;
@@ -4368,8 +4399,12 @@ async function handleChat(req, res, cfg, bodyText) {
       }));
     }
     const genSec = (metrics.genMs || 0) / 1000;
+    // The row records the status the CALLER got, not the upstream's. A relay cut before the
+    // first body byte now leaves as a real 502/504, and a row claiming 200 for that delivery
+    // would re-create the dishonesty this change removes (review finding 7).
+    const deliveredStatus = metrics.deliveredStatus ?? 200;
     const entry = applyCost(newHistoryEntry({
-      t: detailT, callId, model: modelId, backend: attempt.backend, stream, status: 200, latencyMs,
+      t: detailT, callId, model: modelId, backend: attempt.backend, stream, status: deliveredStatus, latencyMs,
       ttftMs: metrics.ttftMs ?? latencyMs,
       promptTokens: metrics.promptTokens ?? 0,
       completionTokens: metrics.completionTokens ?? 0,
@@ -4412,7 +4447,7 @@ async function handleChat(req, res, cfg, bodyText) {
     // Finalize the deep-dive detail record (attempt already recorded above) with
     // the response summary.
     finalizeDetail(detailT, {
-      status: 200,
+      status: deliveredStatus,
       ttftMs: metrics.ttftMs ?? latencyMs,
       latencyMs,
       genMs: metrics.genMs ?? 0,
@@ -4502,7 +4537,7 @@ async function handleChat(req, res, cfg, bodyText) {
   // Every terminal CHAT failure leaves through one builder: never empty, always
   // valid JSON, the provider's own words when it gave them (redacted and capped),
   // plus the ids an operator needs to chase the failure upstream.
-  const recoveryMs = explainedClient ? null : nearestRecoveryMs(c.ordered, exclScope, Date.now());
+  const recoveryMs = explainedClient ? null : nearestRecoveryMs(c.ordered, exclScope, Date.now(), cfg);
   const errBody = terminalChatError({
     upstream: typeof msg === "string" && msg ? msg : null,
     message: noExplanation,
@@ -4976,6 +5011,7 @@ async function relay(res, upstreamRes, stream, backendId, started, callId, idleT
   let promptCacheMissTokens = null; // raw miss tokens; null = not reported -> history derives from prompt - hit
   let preview = null;    // first content fragment, truncated to 200 chars
   let relayError = null; // set when the upstream body was cut mid-relay
+  let deliveredStatus = 200; // what the CALLER actually received: a pre-body cut is a real 502/504
   let hasContent = false;
   let hasReasoning = false;
   let hasToolCalls = false;
@@ -4996,7 +5032,10 @@ async function relay(res, upstreamRes, stream, backendId, started, callId, idleT
   const cap = (s) => (typeof s === "string" ? (s.length > 200 ? s.slice(0, 200) + "…" : s) : s);
   try {
     if (upstreamRes.headers.get("x-request-id")) headers["x-request-id"] = upstreamRes.headers.get("x-request-id");
-    res.writeHead(200, headers);
+    // SET the headers, never write them: Node flushes them with the first byte. The
+    // status line going out before a single byte of the answer was seen is exactly what
+    // made a cut relay indistinguishable from a clean 200 (review finding 7).
+    for (const [k, v] of Object.entries(headers)) res.setHeader(k, v);
     if (hasCacheHeader(upstreamRes)) cacheHit = true;
 
     if (stream && upstreamRes.body) {
@@ -5027,14 +5066,26 @@ async function relay(res, upstreamRes, stream, backendId, started, callId, idleT
         // the caller for the upstream's failure.
         const source = Readable.fromWeb(upstreamRes.body, { signal: idle.controller.signal });
         source.on("error", onSourceError);
-        await pipeline(
-          source,
-          idle.reset,
-          usageTransform(collector),
-          pv,
-          reasoningNormalizeTransform(),
-          res
-        );
+        // The response is deliberately NOT the pipeline destination. pipeline() DESTROYS
+        // its destination when a source errors, which is why a cut relay reached the caller
+        // as a bare connection reset with nothing after it: no status could be corrected and
+        // no frame could be written. A PassThrough in the middle keeps `res` writable, so the
+        // cut can be reported as the failure it is (review finding 7).
+        const out = new PassThrough();
+        out.pipe(res, { end: false });
+        // A caller who leaves must still tear the upstream down - that is what stops a
+        // prefill in flight - so a closed response destroys the middle and pipeline carries
+        // the destruction back to the source.
+        const onDownClose = () => {
+          if (!res.writableEnded && !out.destroyed) out.destroy(new Error("client closed"));
+        };
+        res.on("close", onDownClose);
+        try {
+          await pipeline(source, idle.reset, usageTransform(collector), pv, reasoningNormalizeTransform(), out);
+        } finally {
+          res.off("close", onDownClose);
+        }
+        if (!res.writableEnded) res.end();
       } catch (e) {
         // Precedence: the stall watchdog, then the upstream body, then the caller. Deciding
         // from the source side first is what keeps an upstream cut from being written off as
@@ -5141,10 +5192,37 @@ async function relay(res, upstreamRes, stream, backendId, started, callId, idleT
       idleAborted,
       error: relayError || String((e && e.message) || e),
     });
-    try {
-      if (!res.writableEnded) res.end();
-    } catch {
-      /* ignore */
+    // A cut relay must never look like a clean 200 carrying a short answer. Two shapes:
+    //  - nothing on the wire yet: the status line is still ours, so answer with a real
+    //    failure the client can act on (502 cut / 504 stall), not a truncated 200
+    //  - bytes already out: the status is gone, so append a terminal SSE error frame,
+    //    which an OpenAI-compatible client parses as an error instead of a finished turn
+    if (cause !== "client") {
+      const cutMessage = relayError || String((e && e.message) || e) || "upstream stream failed";
+      const cutCode = cause === "idle" ? "upstream_idle_timeout" : "upstream_stream_cut";
+      const frame = JSON.stringify({ error: { message: cutMessage, type: "upstream_stream_cut", code: cutCode, callId: callId || null, backend: backendId || null } });
+      try {
+        if (!res.headersSent) {
+          const cutHeaders = { "content-type": "application/json", "x-router-backend": backendId || "unknown" };
+          if (callId) cutHeaders["x-router-call"] = callId;
+          deliveredStatus = cause === "idle" ? 504 : 502;
+          res.writeHead(deliveredStatus, cutHeaders);
+          res.end(frame);
+        } else if (stream && !res.writableEnded) {
+          res.write("data: " + frame + "\n\n");
+          res.end();
+        } else if (!res.writableEnded) {
+          res.end();
+        }
+      } catch {
+        /* the caller may already be gone; the log line above still records the cut */
+      }
+    } else {
+      try {
+        if (!res.writableEnded) res.end();
+      } catch {
+        /* ignore */
+      }
     }
   }
   res.off("close", onClientClose);
@@ -5152,7 +5230,7 @@ async function relay(res, upstreamRes, stream, backendId, started, callId, idleT
   // A clean, usable completion is content, reasoning or a tool call actually
   // parsed out of the upstream body - not merely a 200 status line.
   const usable = !relayError && !clientCancelled && (hasContent || hasReasoning || hasToolCalls);
-  return { ttftMs, cacheHit, cacheHitPct, promptCacheHitTokens, promptCacheMissTokens, promptTokens, completionTokens, reasoningTokens, genMs, preview, relayError, hasContent, hasReasoning, hasToolCalls, clientCancelled, usable };
+  return { ttftMs, cacheHit, cacheHitPct, promptCacheHitTokens, promptCacheMissTokens, promptTokens, completionTokens, reasoningTokens, genMs, preview, relayError, hasContent, hasReasoning, hasToolCalls, clientCancelled, usable, deliveredStatus };
 }
 
 // Read and JSON-parse a request body. Returns { value } or { error } (a
@@ -6260,6 +6338,6 @@ if (isMain) {
   });
 }
 
-export { claimAttempt, releaseAttempt, ineligibility, health, ROUTES };
+export { claimAttempt, releaseAttempt, ineligibility, health, ROUTES, probeWaitMs, nearestRecoveryMs };
 export { structuralViewForValidation as validationSubjectOf };
 export { backoffFor, sessionSourcesFor, buildSessionSources, resolveSessionIdentity, resolveSessionWire, sessionKeyOf, sessionScopeOf, sessionExclusionKey, parseSessionField, sessionValueHash, noteAccountOutage, markSuccess, ACCOUNT_OUTAGE_ROUTES, classify, readUpstreamError, terminalChatError, redactSecrets, capAttemptsSummary, attemptOutcome, candidates, touchSessionPreference, evictSessionPreferences, SESSION_PREFS, normalizeConfig, buildPayload, cacheHitPctOf, buildAlert, noteCacheMiss, resetAlertCooldowns, computeCost, writeConfigAtomic, routeKey, routeBackoffMs, authScopeOf, sessionPreferenceKey, beginSessionRequest, orderSessionProviders, rememberProvider, sessionPreferenceStats, clearSessionPreferences, validateConfig, convertLegacyConfig };

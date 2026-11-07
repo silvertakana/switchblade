@@ -3465,7 +3465,7 @@ async function main() {
   // zStage2) The mirror image: headers and a chunk already delivered, THEN the relay dies.
   //   That is a property of the ROUTE, so the route cools and the account stays healthy,
   //   and because the caller already holds part of the response the router must NOT
-  //   replay it on the model\u2019s next provider.
+  //   replay it on the model's next provider.
   {
     // Event-held cut: the MOCK does not decide when to die, the test does, so the cut is
     // ordered after the first chunk is provably in the caller's hands (no timing sleep).
@@ -3544,9 +3544,58 @@ async function main() {
           !!cutRow && cutRow.state === "cooling",
         "zStage2) a relay cut after delivered chunks cools only that route, never replays it on the next provider, and leaves the account serving (delivered=" + text.includes("first-chunk") + ", replayed=" + text.includes("ok:uR2") + ", siblingStatus=" + after.status + ", readErr=" + readErr + ", routeState=" + (cutRow ? cutRow.state : "none") + ")"
       );
+      // Finding 7: the caller must LEARN that its answer was cut. By then the status line is
+      // long gone, so the only honest place to say it is a terminal SSE error frame - a silent
+      // short answer is indistinguishable from a complete one for an agent building on it.
+      assert(
+        text.includes(String.fromCharCode(34) + "upstream_stream_cut" + String.fromCharCode(34)) && readErr === null,
+        "zStage2b) a cut mid-stream ends with a terminal SSE error frame instead of a silent short answer (frame=" + text.includes(String.fromCharCode(34) + "upstream_stream_cut" + String.fromCharCode(34)) + ", readErr=" + readErr + ", tail=" + JSON.stringify(text.slice(-120)) + ")"
+      );
     } finally {
       hRc.child.kill(); srvCut.close(); srvAlt.close();
       await rm(hRc.dir, { recursive: true, force: true });
+    }
+  }
+
+  // zCut1) The other half of a cut relay: the upstream answers 200 with SSE headers and dies
+  //   BEFORE a single body byte. Nothing has reached the caller yet, so the status line is
+  //   still the router's to choose - answering 200 with an empty body is the dishonesty
+  //   finding 7 is about, and it leaves the client unable to tell "no answer" from "empty answer".
+  {
+    const srvEarly = http.createServer(async (req, res) => {
+      for await (const c of req) { /* drain, then die before any body byte */ }
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      if (typeof res.flushHeaders === "function") res.flushHeaders();
+      setTimeout(() => res.destroy(), 50);
+    });
+    const portEarly = await listen(srvEarly);
+    const cfgCut = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "zcutE", baseURL: "http://" + HOST + ":" + portEarly, apiKeyEnv: "KEY_ZCUT" }],
+      models: { mCut: { providers: [{ backend: "zcutE", upstream: "uCut" }], affinityPool: 1, retry: { maxRetries: 0 } } },
+      presets: { pCut: { strategy: "affinity", models: ["mCut"] } },
+      backoff: { ...BO, serverBaseMs: 50, serverMaxMs: 200 },
+    };
+    const { child: cCut, base: baseCut, dir: dirCut } = await startRouterCfg(cfgCut, "KEY_ZCUT=k\n");
+    try {
+      const rr = await fetch(baseCut + "/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer local-master" },
+        body: JSON.stringify({ model: "pCut", messages: [], stream: true }),
+        signal: AbortSignal.timeout(8000),
+      });
+      const txt = await rr.text();
+      let cutCode = null;
+      try { cutCode = JSON.parse(txt).error.code; } catch { /* not json */ }
+      const healthCut = await (await api(baseCut, "/health", { method: "GET" })).json();
+      const cutRoute = (healthCut.routes || []).find((x) => x.backend === "zcutE" && x.upstream === "uCut");
+      assert(
+        rr.status === 502 && cutCode === "upstream_stream_cut" && !!cutRoute && cutRoute.state === "cooling",
+        "zCut1) an upstream that dies before the first body byte is a real failure - 502 to the caller, and the route cools (status=" + rr.status + ", code=" + cutCode + ", route=" + (cutRoute ? cutRoute.state : "none") + ", body=" + JSON.stringify(txt.slice(0, 120)) + ")"
+      );
+    } finally {
+      cCut.kill(); srvEarly.close();
+      await rm(dirCut, { recursive: true, force: true });
     }
   }
 
@@ -5592,6 +5641,78 @@ async function main() {
       badSrv.close(); goodSrv.srv.close();
       await rm(dirZ22, { recursive: true, force: true });
     }
+  }
+
+  // zBudget1) totalMs caps the WHOLE retry loop, so an attempt's own duration has to count
+  //   against it. Charging only the sleeps let a request burn 45 s inside one attempt, sleep
+  //   through the rest of the budget, and still read as "inside budget" while the caller had
+  //   been waiting for minutes (review finding 4).
+  {
+    let slowHits = 0;
+    const slowSrv = http.createServer(async (req, res) => {
+      for await (const c of req) { /* drain */ }
+      slowHits++;
+      await new Promise((r) => setTimeout(r, 450));
+      res.writeHead(503, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "overloaded", type: "overloaded_error" } }));
+    });
+    const portSlow = await listen(slowSrv);
+    const cfgZ22b = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "z22bslow", baseURL: "http://" + HOST + ":" + portSlow, apiKeyEnv: "KEY_Z22B", timeoutMs: 30000 }],
+      models: {
+        m22b: {
+          providers: [{ backend: "z22bslow", upstream: "u22b" }], affinityPool: 1,
+          // The attempt alone eats 450 ms of a 500 ms budget, so the 100 ms backoff that
+          // follows it cannot fit. Retrying here would mean the budget only ever limited sleep.
+          retry: { maxRetries: 5, baseMs: 100, maxMs: 100, multiplier: 1, totalMs: 500 },
+        },
+      },
+      presets: { p22b: { strategy: "affinity", models: ["m22b"] } },
+      backoff: BO,
+    };
+    const { child: childZ22b, base: baseZ22b, dir: dirZ22b } = await startRouterCfg(cfgZ22b, "KEY_Z22B=k\n");
+    try {
+      const rr = await fetch(baseZ22b + "/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer local-master" },
+        body: JSON.stringify({ model: "p22b", messages: [] }),
+        signal: AbortSignal.timeout(15000),
+      });
+      assert(
+        rr.status === 503 && slowHits === 1,
+        "zBudget1) the retry budget charges the ATTEMPT's own duration, not just the sleeps: a 450 ms attempt leaves no room in a 500 ms budget (status=" + rr.status + ", slowHits=" + slowHits + ")"
+      );
+    } finally {
+      childZ22b.kill();
+      slowSrv.close();
+      await rm(dirZ22b, { recursive: true, force: true });
+    }
+  }
+
+  // zProbeWait1) A recovery probe holds its account/route until that attempt's own connect
+  //   deadline fires, so that is the wait Retry-After must advertise. The old flat second
+  //   sent every client straight back into the held row, one 503 at a time, while the probe
+  //   was still inside a 45-120 s connect budget (review finding 9).
+  {
+    const nowProbe = Date.now();
+    const cfgProbe = { backends: [{ id: "z22cacct", connectTimeoutMs: 45000 }, { id: "z22cfresh", connectTimeoutMs: 120000 }, { id: "z22cplain" }] };
+    SRV.health.set("z22cacct", { state: "cooling", fails: 1, nextAvailableAt: 0, probeInFlight: true, probeStartedAt: nowProbe - 2000, generation: 1 });
+    SRV.health.set("z22cfresh", { state: "cooling", fails: 1, nextAvailableAt: 0, probeInFlight: true, generation: 1 });
+    let held = 0, fresh = 0, plain = 0, notProbing = 0;
+    try {
+      held = SRV.probeWaitMs({ backend: "z22cacct", upstream: "u" }, cfgProbe, nowProbe);
+      fresh = SRV.probeWaitMs({ backend: "z22cfresh", upstream: "u" }, cfgProbe, nowProbe);
+      plain = SRV.probeWaitMs({ backend: "z22cplain", upstream: "u" }, cfgProbe, nowProbe);
+      notProbing = SRV.probeWaitMs({ backend: "z22cacct", upstream: "u" }, cfgProbe, nowProbe);
+    } finally {
+      SRV.health.delete("z22cacct");
+      SRV.health.delete("z22cfresh");
+    }
+    assert(
+      held > 40000 && held <= 45000 && fresh === 120000 && plain === 45000 && notProbing > 0,
+      "zProbeWait1) Retry-After for a probe in flight advertises the probe's own remaining connect budget, never a flat second (held=" + held + ", fresh=" + fresh + ", default=" + plain + ")"
+    );
   }
 
   // z40) Our OWN connect/header deadline must never feed the route's failure streak. A

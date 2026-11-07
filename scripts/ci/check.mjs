@@ -27,7 +27,7 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 // main's cache_miss escalation merging in (z35a-z35q) on top of that, and 830 -> 893 is the
 // resilience work (z40a-b, z41a-b, z42a-b ship with it) plus zFence2d restated against the new
 // header-timeout contract.
-const SUITE_FLOOR = 895;
+const SUITE_FLOOR = 899;
 
 // Sanity floor for the S5 id scan: the suite carries far more ids than this,
 // so a count below the floor means the extractor broke, not that the ids went
