@@ -4850,13 +4850,17 @@ async function main() {
         "zFence2c) the held failure does NOT charge the route a targeted uncool cleared (" + JSON.stringify(after) + ")"
       );
       // ...while a request dispatched AFTER the uncool is free to find the provider broken and
-      // cool it for real, which is what keeps the epoch half from fencing live evidence.
+      // cool it for real, which is what keeps the epoch half from fencing live evidence. The
+      // provider here holds the response forever, so the evidence this later request records is
+      // our OWN header deadline: it cools the route for the short probe floor and charges no
+      // streak (a slow turn is not proof the route is broken - see markRouteTimeout).
       const reopen = await api(hF2.base, "/v1/chat/completions", { body: { model: "pf", messages: [{ role: "user", content: "again" }] } });
       await reopen.text();
       const served = await routeOf();
       assert(
-        fb2Hits.length === 2 && served && served.state === "cooling" && served.fails === 1,
-        "zFence2d) a later request still reaches the provider and cools it (hits=" + fb2Hits.length + ", row=" + JSON.stringify(served && { state: served.state, fails: served.fails }) + ")"
+        fb2Hits.length === 2 && served && served.state === "cooling" &&
+          served.lastErrorKind === "timeout" && served.fails === 0,
+        "zFence2d) a later request still reaches the provider and its own header timeout cools the route, charging no streak (hits=" + fb2Hits.length + ", row=" + JSON.stringify(served && { state: served.state, fails: served.fails, kind: served.lastErrorKind }) + ")"
       );
     } finally {
       hF2.child.kill(); fb.close();
@@ -5574,6 +5578,146 @@ async function main() {
       childZ22.kill();
       badSrv.close(); goodSrv.srv.close();
       await rm(dirZ22, { recursive: true, force: true });
+    }
+  }
+
+  // z40) Our OWN connect/header deadline must never feed the route's failure streak. A
+  //      route's streak escalates its cooldown (30 s, 60 s, 120 s ... 5 min) and only a real
+  //      success clears it, so charging a slow turn to it turns ONE abort into minutes of
+  //      refusals for everybody (measured 2026-11-07: a 45 s abort escalated a route into a
+  //      41-minute blackout). The deadline is latency evidence: a fixed short floor, no
+  //      streak, and no account charge either.
+  {
+    const z40srv = http.createServer(() => { /* accept the request, never answer: no headers ever */ });
+    const z40port = await listen(z40srv);
+    const cfgZ40 = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "z40hang", baseURL: `http://${HOST}:${z40port}`, apiKeyEnv: "KEY_Z40", timeoutMs: 300 }],
+      models: { m40: { providers: [{ backend: "z40hang", upstream: "u40" }], affinityPool: 1 } },
+      presets: { p40: { strategy: "affinity", models: ["m40"] } },
+      backoff: BO,
+    };
+    const hZ40 = await startRouterCfg(cfgZ40, "KEY_Z40=k\n");
+    try {
+      const rr = await api(hZ40.base, "/v1/chat/completions", { body: { model: "p40", messages: [] } });
+      await rr.text();
+      const hh = await (await api(hZ40.base, "/health", { method: "GET" })).json();
+      const row = (hh.routes || []).find((x) => x.backend === "z40hang" && x.upstream === "u40");
+      const acct = hh.backends.find((b) => b.id === "z40hang");
+      assert(
+        rr.status >= 500 && !!row && row.state === "cooling" && row.fails === 0 &&
+          row.lastErrorKind === "timeout" && row.retryInMs > 0 && row.retryInMs <= 6000,
+        "z40a) our own header timeout floors the route briefly and charges NO streak (status=" + rr.status + ", row=" + JSON.stringify(row && { state: row.state, fails: row.fails, kind: row.lastErrorKind, retryInMs: row.retryInMs }) + ")"
+      );
+      assert(
+        !!acct && acct.state === "healthy",
+        "z40b) our own header timeout is not an account fault (state=" + (acct && acct.state) + ")"
+      );
+    } finally {
+      hZ40.child.kill();
+      z40srv.closeAllConnections();
+      z40srv.close();
+      await rm(hZ40.dir, { recursive: true, force: true });
+    }
+  }
+
+  // z41) Liveness guard: a cooldown must never fence a model's LAST usable route. Measured
+  //      2026-11-07: two accounts weekly-pinned, one server cool on the only remaining route,
+  //      and no provider at all for dsh. The same failure on a route that still has a healthy
+  //      sibling keeps the full policy backoff - the guard is about being the last path, not
+  //      about weakening route health.
+  {
+    const z41bad = http.createServer((req, res) => {
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "route down" } }));
+    });
+    const z41good = mockBackend("z41good", {});
+    const z41ports = await Promise.all([listen(z41bad), listen(z41good.srv)]);
+    z41good.port = z41ports[1];
+    const cfgZ41 = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "z41only", baseURL: `http://${HOST}:${z41ports[0]}`, apiKeyEnv: "KEY_Z41A" },
+        { id: "z41pair", baseURL: `http://${HOST}:${z41ports[0]}`, apiKeyEnv: "KEY_Z41B" },
+        { id: "z41good", baseURL: `http://${HOST}:${z41good.port}`, apiKeyEnv: "KEY_Z41C" },
+      ],
+      models: {
+        m41only: { providers: [{ backend: "z41only", upstream: "uOnly" }], affinityPool: 1 },
+        m41pair: { providers: [{ backend: "z41pair", upstream: "uPair" }, { backend: "z41good", upstream: "uPairGood" }], affinityPool: 1 },
+      },
+      presets: {
+        p41only: { strategy: "affinity", models: ["m41only"] },
+        p41pair: { strategy: "affinity", models: ["m41pair"] },
+      },
+      backoff: { ...BO, serverBaseMs: 120000, serverMaxMs: 300000 },
+    };
+    const hZ41 = await startRouterCfg(cfgZ41, "KEY_Z41A=k\nKEY_Z41B=k\nKEY_Z41C=k\n");
+    try {
+      const onlyRes = await api(hZ41.base, "/v1/chat/completions", { body: { model: "p41only", messages: [] } });
+      await onlyRes.text();
+      const pairRes = await api(hZ41.base, "/v1/chat/completions", { body: { model: "p41pair", messages: [] } });
+      const pairBody = await pairRes.json();
+      const hh = await (await api(hZ41.base, "/health", { method: "GET" })).json();
+      const lastRow = (hh.routes || []).find((x) => x.backend === "z41only" && x.upstream === "uOnly");
+      const siblingRow = (hh.routes || []).find((x) => x.backend === "z41pair" && x.upstream === "uPair");
+      assert(
+        !!lastRow && lastRow.state === "cooling" && lastRow.fails === 1 && lastRow.retryInMs > 0 && lastRow.retryInMs <= 6000,
+        "z41a) the last usable route of a model is cooled only for the short probe floor (row=" + JSON.stringify(lastRow && { state: lastRow.state, fails: lastRow.fails, retryInMs: lastRow.retryInMs }) + ")"
+      );
+      assert(
+        pairRes.status === 200 && pairBody.choices[0].message.content === "mock:z41good" &&
+          !!siblingRow && siblingRow.state === "cooling" && siblingRow.fails === 1 && siblingRow.retryInMs > 60000,
+        "z41b) a route that still has a healthy sibling keeps the full policy backoff (status=" + pairRes.status + ", row=" + JSON.stringify(siblingRow && { state: siblingRow.state, fails: siblingRow.fails, retryInMs: siblingRow.retryInMs }) + ")"
+      );
+    } finally {
+      hZ41.child.kill();
+      z41bad.close(); z41good.srv.close();
+      await rm(hZ41.dir, { recursive: true, force: true });
+    }
+  }
+
+  // z42) A busy provider is not a sick one: an "[overloaded]" refusal cools NOTHING. It was
+  //      classified "rate", so one saturated cell parked the whole account for 30 s and every
+  //      caller got an instant 503 with backend: none (2026-11-07, 41 consecutive rows). The
+  //      capacity family is a failover, not a cooldown - the account keeps answering the next
+  //      request, which is exactly what a busy cell needs.
+  {
+    let z42hits = 0;
+    const z42srv = http.createServer((req, res) => {
+      z42hits++;
+      res.writeHead(503, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "[overloaded]", type: "overloaded_error" } }));
+    });
+    const z42port = await listen(z42srv);
+    const cfgZ42 = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "z42ovl", baseURL: `http://${HOST}:${z42port}`, apiKeyEnv: "KEY_Z42" }],
+      models: { m42: { providers: [{ backend: "z42ovl", upstream: "u42" }], affinityPool: 1 } },
+      presets: { p42: { strategy: "affinity", models: ["m42"] } },
+      backoff: BO,
+    };
+    const hZ42 = await startRouterCfg(cfgZ42, "KEY_Z42=k\n");
+    try {
+      const first = await api(hZ42.base, "/v1/chat/completions", { body: { model: "p42", messages: [] } });
+      await first.text();
+      const hh = await (await api(hZ42.base, "/health", { method: "GET" })).json();
+      const acct = hh.backends.find((b) => b.id === "z42ovl");
+      const row = (hh.routes || []).find((x) => x.backend === "z42ovl" && x.upstream === "u42");
+      assert(
+        first.status === 503 && !!acct && acct.state === "healthy" &&
+          !!row && row.state === "healthy" && row.fails === 0,
+        "z42a) an [overloaded] refusal cools neither the account nor the route (status=" + first.status + ", acct=" + (acct && acct.state) + ", row=" + JSON.stringify(row && { state: row.state, fails: row.fails }) + ")"
+      );
+      const second = await api(hZ42.base, "/v1/chat/completions", { body: { model: "p42", messages: [] } });
+      await second.text();
+      assert(
+        second.status === 503 && z42hits === 2,
+        "z42b) the busy account is tried again on the next request instead of being refused locally (hits=" + z42hits + ", status=" + second.status + ")"
+      );
+    } finally {
+      hZ42.child.kill();
+      z42srv.close();
+      await rm(hZ42.dir, { recursive: true, force: true });
     }
   }
 

@@ -24,8 +24,10 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 // never lowered. Each raise counts only assertions this line added and deleted
 // none: 779 -> 809 is the combined release work plus the assertions the
 // independent whole-branch review produced (zFence3a-e, u9s4), and 809 -> 830 is
-// main's cache_miss escalation merging in (z35a-z35q) on top of that.
-const SUITE_FLOOR = 830;
+// main's cache_miss escalation merging in (z35a-z35q) on top of that, and 830 -> 893 is the
+// resilience work (z40a-b, z41a-b, z42a-b ship with it) plus zFence2d restated against the new
+// header-timeout contract.
+const SUITE_FLOOR = 893;
 
 // Sanity floor for the S5 id scan: the suite carries far more ids than this,
 // so a count below the floor means the extractor broke, not that the ids went

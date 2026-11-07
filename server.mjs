@@ -876,6 +876,24 @@ function isAdmissionRefusal(status, bodyText) {
   return ADMISSION_REFUSAL.test(bodyText || "");
 }
 
+// The wider "the provider is BUSY" family, which is a CAPACITY fact and never a reason to park
+// an account: the same credential serves other requests, and the identical turn usually lands
+// seconds later. Deliberately broader than ADMISSION_REFUSAL, because that one also carries a
+// retry BUDGET of its own (a handful of fast attempts); this one only answers "may this failure
+// cool anything?", so the model's configured retry policy keeps applying unchanged.
+//
+// "overloaded" is the Go gateway's word for a saturated cell and arrives as 429 or 503. It was
+// classified "rate" and cooled the ACCOUNT for 30 s: measured 2026-11-07, one synthetic
+// 96k-token probe came back "[overloaded]", go-alt2 was parked, and dsh failed 41 consecutive
+// requests with backend: none until the timer lapsed. That is the whole 503 incident in one line.
+const TRANSIENT_OVERLOAD = /\boverloaded\b/i;
+function isTransientCapacity(status, bodyText) {
+  if (status === 401 || status === 402 || status === 403) return false; // account is dead, not busy
+  const body = bodyText || "";
+  if (/GoUsageLimitError/i.test(body)) return false; // weekly pin: capacity has nothing to do with it
+  return ADMISSION_REFUSAL.test(body) || TRANSIENT_OVERLOAD.test(body);
+}
+
 function classify(status, bodyText, errorBodyState = "present") {
   if (status === 429) {
     if (/GoUsageLimitError/i.test(bodyText || "")) return "weekly";
@@ -990,7 +1008,14 @@ function markFailure(cfg, id, status, bodyText) {
     h.fails = 100; // effectively pinned until reset
     fireAlert(cfg, "weekly_limit", { backend: id, days: m ? parseInt(m[1], 10) : null });
   } else {
-    h.backoffMs = backoffFor(kind, cfg, h.fails);
+    const policyMs = backoffFor(kind, cfg, h.fails);
+    // Liveness guard: cooling the account that carries a model's LAST usable route is not a
+    // health decision, it is an outage - there is no other path to protect, so the cooldown
+    // only guarantees failure for every caller until it lapses, and probing one path at a
+    // time is strictly better than refusing all of them. Transient classes only: a weekly
+    // pin or a dead credential is not made servable by a shorter timer.
+    const stranded = (kind === "rate" || kind === "server") && coolingWouldStrand(cfg, { backend: id });
+    h.backoffMs = stranded ? Math.min(policyMs, PROBE_FLOOR_MS) : policyMs;
     nextMs = h.backoffMs;
   }
   h.state = "cooling";
@@ -1075,7 +1100,7 @@ function isUsableCurrently(id, now) {
 // limit, network) still cool the account itself. An unexplained rejection is
 // evidence of neither, so it excludes the route for the session that saw it and
 // nothing else.
-const ROUTES = new Map(); // routeKey -> {generation, fails, nextAvailableAt, probeInFlight, lastErrorKind, lastStatus, lastError}
+const ROUTES = new Map(); // routeKey -> {generation, fails, timeoutHits, nextAvailableAt, probeInFlight, lastErrorKind, lastStatus, lastError}
 const SESSION_EXCLUSIONS = new Map(); // "sessionKey routeKey" -> {blockedUntil, generation}
 const OPAQUE_EXCLUSION_MS = 30000;
 
@@ -1232,6 +1257,85 @@ function isSessionExcluded(exclScope, attempt, now) {
   return true;
 }
 
+// A route row can carry failure history two ways: a STREAK of genuine route faults
+// (5xx, a cut relay, an unusable 200) that escalates, or a short self-imposed floor after
+// our own deadline fired - latency evidence that must NOT inflate the streak.
+const routeHasHistory = (r) => !!r && ((r.fails || 0) > 0 || (r.timeoutHits || 0) > 0);
+
+// The shortest cooldown this router ever writes: long enough to shed a thundering herd off a
+// path that just failed, short enough that a probe follows before a caller gives up. Used for
+// our own header timeouts and as the clamp that keeps the router routable.
+const PROBE_FLOOR_MS = 5000;
+
+// Is this deployment able to serve right now, ignoring per-caller exclusions? Per-caller
+// state (session exclusion, a session preference) must not count: liveness is about the
+// provider, not about who is asking.
+function routeUsableForLiveness(dep, now) {
+  const h = health.get(dep.backend);
+  if (h && h.state === "cooling" && h.nextAvailableAt > now) return false;
+  if (manualRouteBlocked(dep, now)) return false;
+  const r = ROUTES.get(routeKey(dep));
+  if (routeHasHistory(r) && r.nextAvailableAt > now) return false;
+  return true;
+}
+
+// Would cooling `pending` leave some model with NO usable route at all? `pending` names the
+// row about to be cooled: {routeKey} for one route, {backend} for a whole account.
+//
+// This is the guard for the failure that is not a provider problem but a router self-inflicted
+// outage: cooling the last path does not protect anything - there is nothing left to protect -
+// it just turns one sick path into a guarantee that every caller fails, and the only thing that
+// can restore service is the cooldown we are writing. Measured 2026-11-07 03:23Z: two accounts
+// weekly-pinned, one slow turn cooled the only remaining route, and dsh got 41 instant 503s
+// over ~100 s with no provider to fall back to.
+//
+// A model that is ALREADY unroutable is not this write's doing, so it never triggers the guard:
+// only removing the last thing that still works does.
+function coolingWouldStrand(cfg, pending, now = Date.now()) {
+  const byId = backendsById(cfg);
+  const isPending = (dep) => (pending.routeKey ? routeKey(dep) === pending.routeKey : dep.backend === pending.backend);
+  for (const [id, m] of Object.entries(cfg.models || {})) {
+    const deps = modelDeployments(m, id, byId);
+    if (!deps.length) continue;
+    const mine = deps.filter(isPending);
+    if (!mine.length) continue; // this write does not touch the model
+    if (!mine.some((d) => routeUsableForLiveness(d, now))) continue; // already stranded without us
+    if (deps.some((d) => !isPending(d) && routeUsableForLiveness(d, now))) continue; // a path survives
+    return true;
+  }
+  return false;
+}
+
+// Our OWN connect/header deadline fired. That says the relay was slower than this request
+// could afford - a latency fact about the turn, not proof the route is broken - and it must
+// never feed the route's fault streak. The streak is what escalates the cooldown (30 s, 60 s,
+// 120 s, ... 5 min) and only a real success resets it, so charging our own impatience to it
+// turns ONE slow turn into minutes of refusals for everybody (measured 2026-11-07: a 45 s
+// abort escalated a route to a 41-minute blackout).
+//
+// The route is still asked to stand aside briefly: the same large prefill should not be sent
+// straight back at a relay that just timed out on it. A fixed PROBE_FLOOR_MS, never
+// escalating, and one probe at a time once it lapses.
+function markRouteTimeout(attempt, status, bodyText) {
+  const key = routeKey(attempt);
+  // Same deletion fence as a real failure: a route deleted while this attempt was in flight
+  // must not be resurrected by our late deadline.
+  if (fenceBlocks(key, attempt)) return null;
+  const r = ROUTES.get(key) || { generation: nextGeneration(), fails: 0, nextAvailableAt: 0, probeInFlight: false, lastErrorKind: null, lastStatus: null, lastError: null };
+  const now = Date.now();
+  const wasCooling = (r.nextAvailableAt || 0) > now;
+  r.timeoutHits = (r.timeoutHits || 0) + 1;
+  r.nextAvailableAt = Math.max(r.nextAvailableAt || 0, now + PROBE_FLOOR_MS);
+  r.lastErrorKind = "timeout";
+  r.lastStatus = status;
+  r.lastError = { status, kind: "timeout", body: (bodyText || "").slice(0, 300) };
+  r.generation = nextGeneration();
+  r.probeInFlight = false;
+  ROUTES.set(key, r);
+  if (!wasCooling) recordCoolingEvent({ backend: attempt.backend, action: "cool", kind: "timeout", manual: false, scope: "route" });
+  return r;
+}
+
 // A server-class failure is a property of the ROUTE, not the account: the streak is
 // preserved across timer expiry (only a real success resets it), so a flapping
 // route backs off further each time instead of restarting at the base delay.
@@ -1241,15 +1345,22 @@ function markRouteFailure(cfg, attempt, status, bodyText, kind) {
   // it would recreate the row the deletion just removed (see ROUTE_FENCES).
   if (fenceBlocks(key, attempt)) return null;
   const r = ROUTES.get(key) || { generation: nextGeneration(), fails: 0, nextAvailableAt: 0, probeInFlight: false, lastErrorKind: null, lastStatus: null, lastError: null };
+  // Only a transition INTO cooling lands on the dashboard timeline; a re-cool of a row that
+  // is already cooling (the all-cooling fallback retrying the soonest route) is not a new
+  // failure episode. Same rule as markFailure, and without it a flapping route floods it.
+  const wasCoolingActive = (r.nextAvailableAt || 0) > Date.now();
   r.fails = (r.fails || 0) + 1;
-  r.nextAvailableAt = Date.now() + routeBackoffMs(r.fails, cfg);
+  const policyMs = routeBackoffMs(r.fails, cfg);
+  // Liveness guard, same rule as markFailure: never fence a model's last usable route.
+  const stranded = coolingWouldStrand(cfg, { routeKey: key });
+  r.nextAvailableAt = Date.now() + (stranded ? Math.min(policyMs, PROBE_FLOOR_MS) : policyMs);
   r.lastErrorKind = kind;
   r.lastStatus = status;
   r.lastError = { status, kind, body: (bodyText || "").slice(0, 300) };
   r.generation = nextGeneration();
   r.probeInFlight = false;
   ROUTES.set(key, r);
-  recordCoolingEvent({ backend: attempt.backend, action: "cool", kind, manual: false, scope: "route" });
+  if (!wasCoolingActive) recordCoolingEvent({ backend: attempt.backend, action: "cool", kind, manual: false, scope: "route" });
   // Only a real HTTP 5xx is evidence about the ACCOUNT. A relay cut, a stalled or empty
   // 200 cools this route - the relay really is unfit - but it says nothing about the
   // account's other routes, so feeding it to the distinct-route heuristic declares an
@@ -1264,6 +1375,7 @@ function markRouteSuccess(attempt) {
   const r = ROUTES.get(key);
   if (!r) return;
   r.fails = 0;
+  r.timeoutHits = 0; // latency history is not failure history: a served turn retires both
   r.nextAvailableAt = 0;
   r.probeInFlight = false;
   r.generation = nextGeneration();
@@ -1332,7 +1444,7 @@ function ineligibility(attempt, exclScope, now, lease = null) {
   // answer: a manual cool means "do not use this route", and a sticky one never expires.
   if (manualRouteBlocked(attempt, now)) return "manual";
   const r = ROUTES.get(routeKey(attempt));
-  if (r && (r.fails || 0) > 0) {
+  if (routeHasHistory(r)) {
     if (r.nextAvailableAt > now) return "route_cooling";
     if (r.probeInFlight && !leaseHolds(lease, "route", r)) return "probe_in_flight";
   }
@@ -1375,6 +1487,9 @@ function noteAttemptFailure(cfg, attempt, exclScope, status, bodyText, errorBody
   // exclusion (review finding 14). The ownership guards keep a late settlement from
   // resurrecting health that a newer attempt already replaced.
   const kind = classify(status, bodyText, errorBodyState);
+  // A busy provider is not a sick one. Nothing is charged - no account cool, no route cool, no
+  // session exclusion - so a saturated cell cannot empty the pool for every other caller.
+  if (isTransientCapacity(status, bodyText)) return kind;
   if (kind === "client") return kind;
   if (kind === "upstream_rejection") {
     excludeRouteForSession(exclScope, attempt);
@@ -1391,6 +1506,14 @@ function noteAttemptFailure(cfg, attempt, exclScope, status, bodyText, errorBody
     // headers (stage "connect") is a property of the ACCOUNT - the endpoint itself was
     // unreachable - and charging a single route would make every sibling route rediscover
     // the same dead endpoint one request at a time.
+    //
+    // Our OWN header deadline is a third thing entirely: the relay accepted the connection and
+    // was merely slower than this turn could afford, which is what markRouteTimeout records -
+    // a short fixed floor and no streak, so impatience can never escalate into a blackout.
+    if (stage === "header_timeout") {
+      if (ownsRouteSettlement(attempt)) markRouteTimeout(attempt, status, bodyText);
+      return kind;
+    }
     if (stage === "connect") {
       if (ownsAccountSettlement(attempt)) markFailure(cfg, attempt.backend, status, bodyText);
       return kind;
@@ -1417,7 +1540,7 @@ function claimAttempt(attempt, now) {
     token.accountGeneration = h.generation ?? null;
   }
   const r = ROUTES.get(token.routeKey);
-  if (r && (r.fails || 0) > 0 && r.nextAvailableAt <= now) {
+  if (routeHasHistory(r) && r.nextAvailableAt <= now) {
     if (r.probeInFlight) {
       releaseAttempt(token);
       return null;
@@ -4047,10 +4170,13 @@ async function handleChat(req, res, cfg, bodyText) {
       // parking it for the usual 30 s would turn one busy cell into an empty
       // pool for every caller. Retries above are the backoff.
       const admissionRefusal = !callerAborted && isAdmissionRefusal(result.err.status, result.err.body);
+      // Capacity refusals ("[overloaded]", admission refusal) are reported as a failover with
+      // no cooldown at all: the attempt summary must not claim a scope the router never took.
+      const capacityRefusal = !callerAborted && isTransientCapacity(result.err.status, result.err.body);
       failedAttempts++;
       if (errKind === "upstream_rejection") opaqueFailures++;
-      if (!callerAborted && !admissionRefusal) noteAttemptFailure(cfg, attempt, exclScope, result.err.status, result.err.body, result.err.errorBodyState, result.err.stage || null);
-      const scope = callerAborted || admissionRefusal ? { cooldownScope: null, nextAvailableAt: null } : cooldownScopeOf(attempt, errKind);
+      if (!callerAborted && !capacityRefusal) noteAttemptFailure(cfg, attempt, exclScope, result.err.status, result.err.body, result.err.errorBodyState, result.err.stage || null);
+      const scope = callerAborted || capacityRefusal ? { cooldownScope: null, nextAvailableAt: null } : cooldownScopeOf(attempt, errKind);
       attemptsSummary.push(attemptOutcome({
         attempt,
         status: result.err.status,
