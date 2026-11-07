@@ -5715,6 +5715,106 @@ async function main() {
     );
   }
 
+  // zClass4xx) A 4xx the router had no arm for used to fall through to "server" and cool the
+  //   route, so a payload problem and a wrong path each took a provider out for 60 s. A 413 is
+  //   the caller's to fix and a 404 is this path's problem - neither is evidence about the
+  //   account (audit cluster 2: 404 x109, 413 x34, and 102 empty-pool rows behind them).
+  {
+    const srvClass = http.createServer(async (req, res) => {
+      // The upstream MODEL name is in the BODY, never in the path: reading req.url here
+      // made every request look like the 413 arm and hid the 404 arm entirely.
+      const parts = [];
+      for await (const c of req) parts.push(c);
+      const notFound = Buffer.concat(parts).toString("utf8").includes("u404");
+      res.writeHead(notFound ? 404 : 413, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: notFound ? "model not found on this provider" : "request entity too large", type: "invalid_request_error" } }));
+    });
+    const portClass = await listen(srvClass);
+    const cfgClass = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [{ id: "zcls", baseURL: "http://" + HOST + ":" + portClass, apiKeyEnv: "KEY_ZCLS" }],
+      models: {
+        m404: { providers: [{ backend: "zcls", upstream: "u404" }], affinityPool: 1, retry: { maxRetries: 0 } },
+        m413: { providers: [{ backend: "zcls", upstream: "u413" }], affinityPool: 1, retry: { maxRetries: 0 } },
+      },
+      presets: { p404: { strategy: "affinity", models: ["m404"] }, p413: { strategy: "affinity", models: ["m413"] } },
+      backoff: { ...BO, serverBaseMs: 60000, serverMaxMs: 300000 },
+    };
+    const { child: cClass, base: baseClass, dir: dirClass } = await startRouterCfg(cfgClass, "KEY_ZCLS=k\n");
+    try {
+      const post = (model) => fetch(baseClass + "/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer local-master" },
+        body: JSON.stringify({ model, messages: [] }),
+        signal: AbortSignal.timeout(8000),
+      });
+      await post("p404");
+      const h404 = await (await api(baseClass, "/api/history?limit=1", { method: "GET" })).json();
+      await post("p413");
+      const h413 = await (await api(baseClass, "/api/history?limit=1", { method: "GET" })).json();
+      const healthCls = await (await api(baseClass, "/health", { method: "GET" })).json();
+      const routesCls = healthCls.routes || [];
+      const r404row = routesCls.find((x) => x.backend === "zcls" && x.upstream === "u404");
+      const r413row = routesCls.find((x) => x.backend === "zcls" && x.upstream === "u413");
+      const k404 = h404.entries && h404.entries[0] ? h404.entries[0].errorKind : null;
+      const k413 = h413.entries && h413.entries[0] ? h413.entries[0].errorKind : null;
+      assert(
+        (!r404row || r404row.state !== "cooling") && (!r413row || r413row.state !== "cooling") &&
+          k404 === "upstream_rejection" && k413 === "client",
+        "zClass4xx) a 404 and a 413 are the path and the payload talking, not the account: neither cools the route (404=" + (r404row ? r404row.state : "absent") + ", 413=" + (r413row ? r413row.state : "absent") + ", kinds=" + k404 + "/" + k413 + ")"
+      );
+    } finally {
+      cClass.kill();
+      srvClass.close();
+      await rm(dirClass, { recursive: true, force: true });
+    }
+  }
+
+  // zStrand2) The liveness clamp must ALSO fire for a model that is already stranded. That is
+  //   the case the old guard skipped as "not this write's doing", and it is exactly where the
+  //   damage is: one path is left, it fails, and the full backoff turns one sick path into an
+  //   empty pool for minutes. Audit cluster 1 is this shape - 630 rows, 55% of all failures.
+  {
+    const srvSt = http.createServer(async (req, res) => {
+      for await (const c of req) { /* drain */ }
+      res.writeHead(500, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "upstream exploded", type: "server_error" } }));
+    });
+    const portSt = await listen(srvSt);
+    const cfgSt = {
+      port: 0, prefix: "/v1", masterKeyEnv: null,
+      backends: [
+        { id: "zstA", baseURL: "http://" + HOST + ":" + portSt, apiKeyEnv: "KEY_ZSTA" },
+        { id: "zstB", baseURL: "http://" + HOST + ":" + portSt, apiKeyEnv: "KEY_ZSTB" },
+      ],
+      models: { mSt: { providers: [{ backend: "zstA", upstream: "uS" }, { backend: "zstB", upstream: "uS" }], affinityPool: 1, retry: { maxRetries: 0 } } },
+      presets: { pSt: { strategy: "failover", models: ["mSt"] } },
+      backoff: { ...BO, serverBaseMs: 60000, serverMaxMs: 300000 },
+    };
+    const { child: cSt, base: baseSt, dir: dirSt } = await startRouterCfg(cfgSt, "KEY_ZSTA=k\nKEY_ZSTB=k\n");
+    try {
+      await fetch(baseSt + "/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: "Bearer local-master" },
+        body: JSON.stringify({ model: "pSt", messages: [] }),
+        signal: AbortSignal.timeout(8000),
+      });
+      const healthSt = await (await api(baseSt, "/health", { method: "GET" })).json();
+      const routesSt = healthSt.routes || [];
+      const rowA = routesSt.find((x) => x.backend === "zstA" && x.upstream === "uS");
+      const rowB = routesSt.find((x) => x.backend === "zstB" && x.upstream === "uS");
+      assert(
+        !!rowA && rowA.state === "cooling" && rowA.retryInMs > 30000 &&
+          !!rowB && rowB.state === "cooling" && rowB.retryInMs <= 5555,
+        "zStrand2) the first route takes its full policy cooldown while a path survives, but the route that leaves the model with NOTHING is clamped to the probe floor (A=" + (rowA ? rowA.retryInMs : "none") + ", B=" + (rowB ? rowB.retryInMs : "none") + ")"
+      );
+    } finally {
+      cSt.kill();
+      srvSt.close();
+      await rm(dirSt, { recursive: true, force: true });
+    }
+  }
+
   // z40) Our OWN connect/header deadline must never feed the route's failure streak. A
   //      route's streak escalates its cooldown (30 s, 60 s, 120 s ... 5 min) and only a real
   //      success clears it, so charging a slow turn to it turns ONE abort into minutes of

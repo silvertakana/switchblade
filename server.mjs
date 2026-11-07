@@ -925,6 +925,14 @@ function classify(status, bodyText, errorBodyState = "present") {
     if (explained && errorBodyState === "present") return "client";
     return "upstream_rejection";
   }
+  // A 4xx the router does not otherwise understand is the PAYLOAD or the PATH talking,
+  // never the account. Without these arms every one of them fell through to "server" and
+  // cooled the route: a payload-too-large 413 and a model-not-found 404 each wrote a
+  // 60 s cooldown, and 102 empty-pool 503s traced back to those cooldowns (measured
+  // 2026-11-07: 404 x109 and 413 x34 on one backend alone - cluster 2 of the audit).
+  if (status === 413 || status === 415 || status === 416) return "client"; // too big / wrong media: the caller can fix it
+  if (status === 404 || status === 409) return "upstream_rejection"; // this path cannot serve it: fail over, do not cool
+  if (status === 408) return "server"; // the upstream read the request and gave up waiting for the rest
   return "server";
 }
 
@@ -1384,8 +1392,13 @@ function routeUsableForLiveness(dep, now) {
 // weekly-pinned, one slow turn cooled the only remaining route, and dsh got 41 instant 503s
 // over ~100 s with no provider to fall back to.
 //
-// A model that is ALREADY unroutable is not this write's doing, so it never triggers the guard:
-// only removing the last thing that still works does.
+// A model that is ALREADY unroutable is still clamped, which is the part that was missing.
+// The harm does not depend on who caused the stranding: the cooldown being written is the
+// only thing between the next caller and an empty pool, and a 240 s one keeps that pool
+// empty for 240 s. Skipping the guard there is what let a prior bad cooldown (a 404
+// misclassified as a server fault) turn the NEXT failure into a full-length account fence:
+// 630 rows, 55% of all failures in 14 days, and 180 of them had the same model serving a
+// 200 inside 60 s. Clamping keeps the pool probeable instead of dead until expiry.
 function coolingWouldStrand(cfg, pending, now = Date.now()) {
   const byId = backendsById(cfg);
   const isPending = (dep) => (pending.routeKey ? routeKey(dep) === pending.routeKey : dep.backend === pending.backend);
@@ -1394,8 +1407,9 @@ function coolingWouldStrand(cfg, pending, now = Date.now()) {
     if (!deps.length) continue;
     const mine = deps.filter(isPending);
     if (!mine.length) continue; // this write does not touch the model
-    if (!mine.some((d) => routeUsableForLiveness(d, now))) continue; // already stranded without us
-    if (deps.some((d) => !isPending(d) && routeUsableForLiveness(d, now))) continue; // a path survives
+    // Does any deployment OUTSIDE this write still work? Then nothing is stranded.
+    if (deps.some((d) => !isPending(d) && routeUsableForLiveness(d, now))) continue;
+    // Nothing survives either way, so clamp - whether or not it was stranded before us.
     return true;
   }
   return false;
